@@ -97,8 +97,9 @@ npm run tauri build  # 生成安装包
 
 ## 开发规范（硬性）
 
-以下规则随仓库分发，由 `npm run check:size` 与 CI 强制执行。规范只约束代码；
-`docs/` 下的计划/设计文档、锁文件与生成物不计入。
+以下规则随仓库分发，由 `npm run check:size` / `npm run check:org` 与 CI 强制执行。
+完整规则见 [`docs/engineering/project-conventions.md`](docs/engineering/project-conventions.md)；
+规范只约束代码与文档落位，锁文件与生成物不计。
 
 - **UI 组件 ≤ 500 行**：`src/` 下的 `.tsx` 文件不得超过 500 行。
 - **单文件 ≤ 1500 行**：`.ts` / `.tsx` / `.js` / `.mjs` / `.rs` / `.css` / `.html`
@@ -106,6 +107,11 @@ npm run tauri build  # 生成安装包
 - **公共子组件必须复用**：新增 UI 前先检查 `src/components/` 是否已有可复用实现；
   重复的公共子组件（按钮、开关、列表行、表单等）必须抽成共享组件，不得复制重写。
   该条为评审硬要求，无法完全自动检测。
+- **文档必须分层**：所有 `.md` / `.rst` / `.adoc` 文档必须放在 `docs/<分类>/` 下
+  （分类见规范文档），`docs/` 根目录禁止裸放；仓库根目录只允许 `README.md` 与
+  `CHANGELOG.md`。
+- **前端落位**：`src/` 顶层只允许入口文件；页面放 `src/views/`，共享 UI 放
+  `src/components/`；页面之间不得互相引用（`npm run check:org` 检查）。
 
 ## 测试
 
@@ -152,9 +158,10 @@ push 与 PR 双触发 `.github/workflows/ci.yml`，任一 job 红不可合并：
 ## 项目结构
 
 ```
-src/          React 前端
+src/          React 前端（views 页面、components 共享 UI、api、jobs）
 src-tauri/    Rust 后端（命令层、网络、部署、服务、测速）
-scripts/      打包资源获取与仓库检查脚本
+scripts/      打包资源获取与仓库检查脚本（随仓库分发）
+docs/         项目文档，按分类存放（product / engineering / design / guides / audits / superpowers）
 tests/        本地测试源码（.gitignore，不随仓库分发）
 ```
 

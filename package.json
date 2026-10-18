@@ -14,6 +14,7 @@
     "fetch:tor": "node scripts/fetch-tor.mjs",
     "check:package": "node scripts/check-package.mjs",
     "check:sensitive": "node scripts/check-sensitive.mjs",
+    "check:org": "node scripts/check-organization.mjs",
     "check:size": "node scripts/check-code-size.mjs",
     "check:updater-pubkey": "node scripts/check-updater-pubkey.mjs",
     "tauri": "tauri"

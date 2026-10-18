@@ -62,6 +62,10 @@ jobs:
       # 代码规模硬规范：UI 组件 ≤500 行、单文件 ≤1500 行（docs/ 与生成物不计）。
       - name: code size check
         run: npm run check:size
+      # 项目组织规范：文档必须分层进 docs/<分类>/、src/ 顶层只放入口、
+      # views 不得互相引用（scripts/check-organization.mjs）。
+      - name: organization check
+        run: npm run check:org
       # 只检查 src：tsconfig.json 不含 tests/frontend（测试源码不随源码上传），
       # 本地要连测试一起检查时用 npm run test:typecheck。
       - name: tsc
