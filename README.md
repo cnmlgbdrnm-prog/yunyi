@@ -1,11 +1,11 @@
-# 云驿（vpn-ctl）
+# 云驿（YunYi）
 
 Windows 桌面端 VPN 订阅与节点管理工具：导入机场订阅、管理节点、生成 Clash / sing-box
 配置，并提供服务器管理、一键部署、WireGuard 中转链、测速与自动更新等能力。
 
 - 技术栈：Tauri 2 + Rust + React 19 + TypeScript
 - 平台：Windows 10/11（WebView2）
-- 命名：安装包 productName 为 `YunYi`；仓库名与应用标识保持中性（`vpn-ctl` / `com.vpnctl.app`）
+- 命名：安装包 productName 为 `YunYi`；应用标识保持中性（`com.vpnctl.app`）
 
 ## 功能
 
