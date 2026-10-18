@@ -85,6 +85,10 @@ jobs:
   # PR 校验 base..head 的全部提交；push 只校验最新一条。合并提交默认忽略。
   commitlint:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # PR 标题校验需要读取 PR；仓库默认 token 是只读内容权限，必须显式声明。
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
