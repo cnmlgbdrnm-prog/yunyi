@@ -95,6 +95,18 @@ npm run tauri build  # 生成安装包
 `npm run build` 会先执行 `fetch:sidecar` 与 `fetch:tor`，下载并校验 mihomo 与 Tor
 资源；二进制不提交仓库（`src-tauri/binaries/` 已被忽略）。
 
+## 开发规范（硬性）
+
+以下规则随仓库分发，由 `npm run check:size` 与 CI 强制执行。规范只约束代码；
+`docs/` 下的计划/设计文档、锁文件与生成物不计入。
+
+- **UI 组件 ≤ 500 行**：`src/` 下的 `.tsx` 文件不得超过 500 行。
+- **单文件 ≤ 1500 行**：`.ts` / `.tsx` / `.js` / `.mjs` / `.rs` / `.css` / `.html`
+  等代码文件不得超过 1500 行。
+- **公共子组件必须复用**：新增 UI 前先检查 `src/components/` 是否已有可复用实现；
+  重复的公共子组件（按钮、开关、列表行、表单等）必须抽成共享组件，不得复制重写。
+  该条为评审硬要求，无法完全自动检测。
+
 ## 测试
 
 测试源码集中放在仓库根 `tests/`（`tests/frontend` 前端、`tests/rust` Rust），

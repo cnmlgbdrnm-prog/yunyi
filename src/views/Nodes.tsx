@@ -31,10 +31,7 @@ import {
   useTrackedJobs,
 } from '../jobs/registry'
 import LinkWizard from '../components/LinkWizard'
-import NodeLatencyCell from '../components/NodeLatencyCell'
-import NodePrivacyCell from '../components/NodePrivacyCell'
-import { formatCheckedAt } from '../utils/checkedAtFormat'
-import { formatBandwidth } from '../utils/format'
+import NodeRow from './nodes/NodeRow'
 
 const CONCURRENCY_OPTIONS = [1, 3, 5]
 
@@ -291,6 +288,18 @@ export default function Nodes() {
     void refresh()
   })
 
+  const completeRelay = (n: Node) => {
+    const landing = landingOf(n)
+    if (!landing) return
+    // 中转机预填：这台落地机已有链路用的那台；没有就用第一台
+    const known = relayRules.find((r) => r.landing_server_id === landing.id)
+    setCompleting({
+      landingId: landing.id,
+      relayId:
+        known?.relay_server_id ?? servers.find((s) => s.kind === 'relay')?.id ?? null,
+    })
+  }
+
   return (
     <div className="space-y-4">
       <h2 className="text-xl font-semibold">节点管理</h2>
@@ -391,179 +400,39 @@ export default function Nodes() {
           </thead>
           <tbody>
             {filtered.map((n) => {
-              const live = targetResult(speedJobs, n.id)
+              const landing = landingOf(n)
               return (
-                <tr key={n.id} className="border-b border-neutral-900">
-                  <td className="px-3 py-2">
-                    <input
-                      type="checkbox"
-                      aria-label={`勾选 ${n.name}`}
-                      checked={selected.has(n.id)}
-                      onChange={() => toggleSelect(n.id)}
-                      className="accent-indigo-600"
-                    />
-                  </td>
-                  <td className="px-3 py-2">
-                    {editingName?.id === n.id ? (
-                      <input
-                        autoFocus
-                        aria-label={`新名称 ${n.name}`}
-                        value={editingName.draft}
-                        onChange={(e) => setEditingName({ id: n.id, draft: e.target.value })}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') void handleRenameSave(n.id)
-                          if (e.key === 'Escape') setEditingName(null)
-                        }}
-                        className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm"
-                      />
-                    ) : (
-                      n.name
-                    )}
-                  </td>
-                  <td className="px-3 py-2 text-neutral-400">{n.protocol}</td>
-                  <td className="px-3 py-2 text-neutral-400">
-                    {n.addr}:{n.port}
-                  </td>
-                  <td className="px-3 py-2 text-neutral-400">{n.group_name}</td>
-                  <NodeLatencyCell node={n} />
-                  <td className="px-3 py-2 text-neutral-400">
-                    {n.bandwidth != null ? formatBandwidth(n.bandwidth) : '—'}
-                  </td>
-                  <td className="px-3 py-2 text-neutral-400">
-                    {formatCheckedAt(n.last_checked_at)}
-                  </td>
-                  <td className="px-3 py-2 text-sm">
-                    {live && !live.error ? (
-                      <span className="text-emerald-400">已完成</span>
-                    ) : (live?.error ?? n.last_check_error) ? (
-                      <span className="text-red-400">{live?.error ?? n.last_check_error}</span>
-                    ) : (
-                      <span className="text-neutral-500">—</span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={n.enabled}
-                      onClick={() => handleToggle(n.id, !n.enabled)}
-                      className={`relative h-5 w-9 shrink-0 align-middle rounded-full transition-colors ${
-                        n.enabled ? 'bg-emerald-600' : 'bg-neutral-700'
-                      }`}
-                    >
-                      <span
-                        className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
-                          n.enabled ? 'translate-x-4' : 'translate-x-0'
-                        }`}
-                      />
-                    </button>
-                  </td>
-                  <td className="px-3 py-2">
-                    <NodePrivacyCell
-                      privacy={privacyOf(n)}
-                      busy={isTargetBusy(privacyJobs, n.id)}
-                      onToggle={() => void handleTogglePrivacy(n)}
-                    />
-                  </td>
-                  {showRelayCol && (
-                    <td className="px-3 py-2">
-                      {needsCompletion(n) ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const landing = landingOf(n)
-                            if (!landing) return
-                            // 中转机预填：这台落地机已有链路用的那台；没有就用第一台
-                            const known = relayRules.find((r) => r.landing_server_id === landing.id)
-                            setCompleting({
-                              landingId: landing.id,
-                              relayId:
-                                known?.relay_server_id ??
-                                servers.find((s) => s.kind === 'relay')?.id ??
-                                null,
-                            })
-                          }}
-                          title={`${landingOf(n)?.name ?? '该落地机'} 上还没有可用的转发链路，点这里建一条覆盖整机端口的`}
-                          className="rounded bg-amber-900 px-2 py-1 text-xs text-amber-200 hover:bg-amber-800"
-                        >
-                          补全中转
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => void handleToggleRelay(n.id)}
-                          disabled={isSpeedBusy(n.id)}
-                          title={
-                            n.relay_rule_id != null
-                              ? '经中转机转发（关=直连）'
-                              : '直连（开=经中转机转发）'
-                          }
-                          className={`rounded px-2 py-1 text-xs hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50 ${
-                            n.relay_rule_id != null
-                              ? 'bg-sky-900 text-sky-300'
-                              : 'bg-neutral-800 text-neutral-400'
-                          }`}
-                        >
-                          {n.relay_rule_id != null ? '中转✓' : '中转'}
-                        </button>
-                      )}
-                    </td>
-                  )}
-                  <td className="px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      {editingName?.id === n.id ? (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => void handleRenameSave(n.id)}
-                            disabled={savingName || editingName.draft.trim() === ''}
-                            className="rounded bg-blue-600 px-2 py-1 text-xs font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            {savingName ? '保存中…' : '保存'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setEditingName(null)}
-                            disabled={savingName}
-                            className="rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            取消
-                          </button>
-                        </>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => setEditingName({ id: n.id, draft: n.name })}
-                          className="rounded bg-neutral-800 px-2 py-1 text-xs text-amber-300 hover:bg-neutral-700"
-                        >
-                          改名
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => handleSpeedTestOne(n.id)}
-                        disabled={isSpeedBusy(n.id)}
-                        className="rounded bg-neutral-800 px-2 py-1 text-xs text-sky-300 hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {isSpeedBusy(n.id) ? '测速中…' : '测速'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleDelete(n.id)}
-                        className="rounded bg-neutral-800 px-2 py-1 text-xs text-red-300 hover:bg-neutral-700"
-                      >
-                        删除
-                      </button>
-                    </div>
-                  </td>
-                </tr>
+                <NodeRow
+                  key={n.id}
+                  node={n}
+                  selected={selected.has(n.id)}
+                  onToggleSelect={() => toggleSelect(n.id)}
+                  editingDraft={editingName?.id === n.id ? editingName.draft : null}
+                  onEditingDraftChange={(draft) => setEditingName({ id: n.id, draft })}
+                  onRenameSave={() => void handleRenameSave(n.id)}
+                  onRenameCancel={() => setEditingName(null)}
+                  savingName={savingName}
+                  live={targetResult(speedJobs, n.id)}
+                  privacy={privacyOf(n)}
+                  privacyBusy={isTargetBusy(privacyJobs, n.id)}
+                  onTogglePrivacy={() => void handleTogglePrivacy(n)}
+                  showRelayCol={showRelayCol}
+                  needsCompletion={needsCompletion(n)}
+                  completionTitle={`${landing?.name ?? '该落地机'} 上还没有可用的转发链路，点这里建一条覆盖整机端口的`}
+                  onCompleteRelay={() => completeRelay(n)}
+                  relayOn={n.relay_rule_id != null}
+                  onToggleRelay={() => void handleToggleRelay(n.id)}
+                  speedBusy={isSpeedBusy(n.id)}
+                  onSpeedTest={() => handleSpeedTestOne(n.id)}
+                  onRenameStart={() => setEditingName({ id: n.id, draft: n.name })}
+                  onDelete={() => void handleDelete(n.id)}
+                  onToggleEnabled={() => handleToggle(n.id, !n.enabled)}
+                />
               )
             })}
           </tbody>
         </table>
-        {filtered.length === 0 && (
-          <p className="p-4 text-sm text-neutral-500">没有匹配的节点。</p>
-        )}
+        {filtered.length === 0 && <p className="p-4 text-sm text-neutral-500">没有匹配的节点。</p>}
       </div>
     </div>
   )

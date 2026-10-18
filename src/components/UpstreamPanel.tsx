@@ -17,11 +17,22 @@ import {
 import type { Upstream } from '../api/types'
 import { bindJob, jobForTarget, progressView, release, reserveJob, useJobTerminal, useTrackedJobs } from '../jobs/registry'
 import JobProgressPanel from './JobProgressPanel'
+import UpstreamForm, { type UpstreamFormValues } from './upstream/UpstreamForm'
+import UpstreamRow from './upstream/UpstreamRow'
 import { nodesToVerify } from '../utils/postDeployVerify'
-import { DEFAULT_REALITY_DEST, REALITY_DEST_GROUPS, findRealityDest } from '../utils/realityDest'
+import { DEFAULT_REALITY_DEST } from '../utils/realityDest'
 
-const PROTO_OPTIONS = ['socks5', 'http']
 const DEFAULT_LISTEN_PORT = '443'
+const EMPTY_FORM: UpstreamFormValues = {
+  name: '',
+  proto: 'socks5',
+  host: '',
+  port: '',
+  username: '',
+  password: '',
+  listenPort: DEFAULT_LISTEN_PORT,
+  realityDest: DEFAULT_REALITY_DEST,
+}
 
 export default function UpstreamPanel({
   serverId,
@@ -43,15 +54,7 @@ export default function UpstreamPanel({
   const [editingId, setEditingId] = useState<number | null>(null)
   // 改过但还没重新部署的出口——远端仍是老配置，行上要留痕
   const [staleEdits, setStaleEdits] = useState<Set<number>>(new Set())
-  // 表单：监听端口必填（默认 443），伪装域名可留空走默认
-  const [name, setName] = useState('')
-  const [proto, setProto] = useState('socks5')
-  const [host, setHost] = useState('')
-  const [port, setPort] = useState('')
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [listenPort, setListenPort] = useState(DEFAULT_LISTEN_PORT)
-  const [realityDest, setRealityDest] = useState(DEFAULT_REALITY_DEST)
+  const [form, setForm] = useState<UpstreamFormValues>(EMPTY_FORM)
   // 部署任务与「部署后自动验证」的进度。此前上游部署在 UI 上完全不可见：
   // 出口行一落库就显示，任务若失败只表现为「节点一直不出现」，没有第二处线索。
   // 两个任务都用本面板的 server id 作目标——同一页展开多个面板时不会互相串进度。
@@ -60,6 +63,9 @@ export default function UpstreamPanel({
   const deployJob = jobForTarget(upstreamJobs, String(serverId))
   const verifyJob = jobForTarget(verifyJobs, String(serverId))
   const [verifyFailures, setVerifyFailures] = useState<string[]>([])
+
+  const setField = <K extends keyof UpstreamFormValues>(key: K, value: UpstreamFormValues[K]) =>
+    setForm((f) => ({ ...f, [key]: value }))
 
   const refresh = useCallback(async () => {
     try {
@@ -151,29 +157,29 @@ export default function UpstreamPanel({
     }
   }
 
+  const resetForm = () => {
+    setEditingId(null)
+    setForm(EMPTY_FORM)
+  }
+
   const handleAdd = async () => {
     setError(null)
     setAdding(true)
     try {
       await addUpstream({
         serverId,
-        name: name.trim(),
-        proto,
-        host: host.trim(),
-        port: Number(port),
-        username: username.trim(),
-        password,
-        listenPort: Number(listenPort),
-        realityDest: realityDest.trim() || undefined,
+        name: form.name.trim(),
+        proto: form.proto,
+        host: form.host.trim(),
+        port: Number(form.port),
+        username: form.username.trim(),
+        password: form.password,
+        listenPort: Number(form.listenPort),
+        realityDest: form.realityDest.trim() || undefined,
       })
       // 落库成功即触发部署：否则用户会看到一条「存在但服务器上还没有」的出口
       await watchJob(startUpstreamJob(serverId))
-      setName('')
-      setHost('')
-      setPort('')
-      setUsername('')
-      setPassword('')
-      setListenPort(DEFAULT_LISTEN_PORT)
+      resetForm()
       setShowForm(false)
       await refresh()
     } catch (e) {
@@ -202,9 +208,8 @@ export default function UpstreamPanel({
       await refresh()
     })
 
-  /** 保存端口。后端撞车时会自动改用空闲端口，所以**按返回值回显**：
-   *  与用户填的不同就说明被占了，得说清楚换成了哪个。 */
-  /** 行内改监听端口：其余字段按行上的原值原样带过去（**密码不带** = 不改） */
+  /** 行内改监听端口：其余字段按行上的原值原样带过去（**密码不带** = 不改）。
+   *  后端撞车时会自动改用空闲端口，所以按返回值回显：与用户填的不同就说明被占了。 */
   const handleSavePort = (u: Upstream, raw: string) =>
     withBusy(u.id, async () => {
       const port = Number(raw)
@@ -224,7 +229,7 @@ export default function UpstreamPanel({
       setNotice(
         saved.listen_port === port
           ? `监听端口已改为 ${port}，点「重新部署」后在远端生效`
-          : `端口 ${port} 已被占用，已自动改用 ${saved.listen_port}，点「重新部署」后在远端生效`
+          : `端口 ${port} 已被占用，已自动改用 ${saved.listen_port}，点「重新部署」后在远端生效`,
       )
       // 改了但还没重部署：远端还是老配置，行上要留痕（重部署后清掉）
       setStaleEdits((s) => new Set(s).add(u.id))
@@ -236,27 +241,17 @@ export default function UpstreamPanel({
     setError(null)
     setNotice(null)
     setEditingId(u.id)
-    setName(u.name)
-    setProto(u.proto)
-    setHost(u.host)
-    setPort(String(u.port))
-    setUsername(u.username)
-    setPassword('')
-    setListenPort(String(u.listen_port))
-    setRealityDest(u.reality_dest)
+    setForm({
+      name: u.name,
+      proto: u.proto,
+      host: u.host,
+      port: String(u.port),
+      username: u.username,
+      password: '',
+      listenPort: String(u.listen_port),
+      realityDest: u.reality_dest,
+    })
     setShowForm(true)
-  }
-
-  const resetForm = () => {
-    setEditingId(null)
-    setName('')
-    setProto('socks5')
-    setHost('')
-    setPort('')
-    setUsername('')
-    setPassword('')
-    setListenPort(DEFAULT_LISTEN_PORT)
-    setRealityDest(DEFAULT_REALITY_DEST)
   }
 
   /** 保存编辑。**只写库**，远端要等「重新部署」——与行内改端口同一套语义 */
@@ -264,8 +259,8 @@ export default function UpstreamPanel({
     const id = editingId
     if (id == null) return
     return withBusy(id, async () => {
-      const p = Number(port)
-      const lp = Number(listenPort)
+      const p = Number(form.port)
+      const lp = Number(form.listenPort)
       if (!Number.isInteger(p) || p < 1 || p > 65535) {
         setError('上游端口必须是 1-65535 之间的整数')
         return
@@ -275,19 +270,19 @@ export default function UpstreamPanel({
         return
       }
       const saved = await updateUpstream(id, {
-        proto,
-        host: host.trim(),
+        proto: form.proto,
+        host: form.host.trim(),
         port: p,
-        username: username.trim(),
+        username: form.username.trim(),
         // 留空 = 不改：凭据不回显，把空串发下去等于把已存口令擦掉
-        password: password.trim() ? password : undefined,
+        password: form.password.trim() ? form.password : undefined,
         listenPort: lp,
-        realityDest: realityDest.trim(),
+        realityDest: form.realityDest.trim(),
       })
       setNotice(
         saved.listen_port === lp
           ? '改动已保存，点「重新部署」后在远端生效'
-          : `监听端口 ${lp} 已被占用，已自动改用 ${saved.listen_port}，点「重新部署」后在远端生效`
+          : `监听端口 ${lp} 已被占用，已自动改用 ${saved.listen_port}，点「重新部署」后在远端生效`,
       )
       setEditingId(null)
       setShowForm(false)
@@ -302,8 +297,6 @@ export default function UpstreamPanel({
       await probeEgressIp(id)
       await refresh()
     })
-
-  const field = 'mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm'
 
   return (
     <div className="mt-2 rounded border border-neutral-800 bg-neutral-900/60 p-3">
@@ -328,108 +321,23 @@ export default function UpstreamPanel({
       {rows.length > 0 && (
         <ul className="mt-2 space-y-1">
           {rows.map((u) => (
-            <li key={u.id} className="rounded bg-neutral-900 px-2 py-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <p className="truncate text-sm">
-                  {u.name}{' '}
-                  <span className="text-xs text-neutral-500">
-                    {u.proto} {u.host}:{u.port} ·{' '}
-                    {editing?.id === u.id ? (
-                      <>
-                        监听{' '}
-                        <input
-                          aria-label="监听端口"
-                          className="w-20 rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-xs"
-                          value={editing.value}
-                          onChange={(e) =>
-                            setEditing({ id: u.id, value: e.target.value })
-                          }
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') void handleSavePort(u, editing.value)
-                            if (e.key === 'Escape') setEditing(null)
-                          }}
-                        />
-                        <button
-                          type="button"
-                          disabled={busy.has(u.id)}
-                          onClick={() => void handleSavePort(u, editing.value)}
-                          className="ml-1 rounded bg-neutral-800 px-1.5 py-0.5 text-emerald-300 hover:bg-neutral-700 disabled:opacity-50"
-                        >
-                          保存
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setEditing(null)}
-                          className="ml-1 text-neutral-400 hover:text-neutral-200"
-                        >
-                          取消
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        监听{' '}
-                        <button
-                          type="button"
-                          aria-label={`改监听端口 ${u.listen_port}`}
-                          onClick={() =>
-                            setEditing({ id: u.id, value: String(u.listen_port) })
-                          }
-                          className="underline decoration-dotted hover:text-neutral-300"
-                        >
-                          {u.listen_port}
-                        </button>
-                        {staleEdits.has(u.id) && (
-                          <span className="ml-1 text-amber-400">
-                            （已改，重新部署后生效）
-                          </span>
-                        )}
-                      </>
-                    )}
-                  </span>
-                </p>
-                <div className="flex shrink-0 items-center gap-2">
-                  <button
-                    type="button"
-                    aria-label={`编辑 ${u.name}`}
-                    disabled={busy.has(u.id)}
-                    onClick={() => startEdit(u)}
-                    className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-200 hover:bg-neutral-700 disabled:opacity-50"
-                  >
-                    编辑
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy.has(u.id)}
-                    onClick={() => void handleProbe(u.id)}
-                    className="rounded bg-neutral-800 px-2 py-1 text-xs text-emerald-300 hover:bg-neutral-700 disabled:opacity-50"
-                  >
-                    探测出口 IP
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy.has(u.id)}
-                    onClick={() => void handleRedeploy(u.id)}
-                    className="rounded bg-neutral-800 px-2 py-1 text-xs text-sky-300 hover:bg-neutral-700 disabled:opacity-50"
-                  >
-                    重新部署
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy.has(u.id)}
-                    onClick={() => void handleRemove(u.id)}
-                    className="rounded bg-neutral-800 px-2 py-1 text-xs text-red-400 hover:bg-neutral-700 disabled:opacity-50"
-                  >
-                    删除
-                  </button>
-                </div>
-              </div>
-              {u.egress_ip && (
-                <p className="mt-0.5 text-xs text-emerald-400">出口 IP {u.egress_ip}</p>
-              )}
-              {u.last_check_error && (
-                <p className="mt-0.5 text-xs text-red-400">{u.last_check_error}</p>
-              )}
-            </li>
+            <UpstreamRow
+              key={u.id}
+              u={u}
+              editingValue={editing?.id === u.id ? editing.value : null}
+              busy={busy.has(u.id)}
+              stale={staleEdits.has(u.id)}
+              onEditingValueChange={(value) => setEditing({ id: u.id, value })}
+              onSavePort={() => {
+                if (editing?.id === u.id) void handleSavePort(u, editing.value)
+              }}
+              onStartEditPort={() => setEditing({ id: u.id, value: String(u.listen_port) })}
+              onCancelEditPort={() => setEditing(null)}
+              onEdit={() => startEdit(u)}
+              onProbe={() => void handleProbe(u.id)}
+              onRedeploy={() => void handleRedeploy(u.id)}
+              onRemove={() => void handleRemove(u.id)}
+            />
           ))}
         </ul>
       )}
@@ -449,142 +357,17 @@ export default function UpstreamPanel({
       </div>
 
       {showForm && (
-        <div className="mt-2 grid grid-cols-2 gap-2">
-          <label className="text-xs text-neutral-400">
-            出口名称
-            <input
-              aria-label="出口名称"
-              className={field}
-              value={name}
-              // 名称参与写回节点的命名（<服务器>-<出口名>），改名要连带改远端节点，
-              // 不在这次编辑面内——只读展示，免得用户以为改了却没生效
-              disabled={editingId != null}
-              onChange={(e) => setName(e.target.value)}
-            />
-            {editingId != null && (
-              <span className="text-neutral-500">名称暂不可改（改名要连带改远端节点）</span>
-            )}
-          </label>
-          <label className="text-xs text-neutral-400">
-            上游协议
-            <select
-              aria-label="上游协议"
-              className={field}
-              value={proto}
-              onChange={(e) => setProto(e.target.value)}
-            >
-              {PROTO_OPTIONS.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="text-xs text-neutral-400">
-            上游地址
-            <input aria-label="上游地址" className={field} value={host} onChange={(e) => setHost(e.target.value)} />
-          </label>
-          <label className="text-xs text-neutral-400">
-            上游端口
-            <input aria-label="上游端口" className={field} value={port} onChange={(e) => setPort(e.target.value)} />
-          </label>
-          <label className="text-xs text-neutral-400">
-            用户名
-            <input aria-label="用户名" className={field} value={username} onChange={(e) => setUsername(e.target.value)} />
-          </label>
-          <label className="text-xs text-neutral-400">
-            密码
-            <input
-              aria-label="密码"
-              type="password"
-              className={field}
-              value={password}
-              placeholder={editingId != null ? '留空＝不改' : ''}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </label>
-          <label className="text-xs text-neutral-400">
-            监听端口
-            <input
-              aria-label="监听端口"
-              className={field}
-              value={listenPort}
-              onChange={(e) => setListenPort(e.target.value)}
-            />
-          </label>
-          <div className="col-span-2 text-xs text-neutral-400">
-            伪装域名（专用实例的 REALITY 镜像目标，留默认即可）
-            {/* 下拉只是「快捷填入」：输入框始终是事实源，两者都改得 */}
-            <select
-              aria-label="伪装域名预设"
-              className={field}
-              /* 手填了清单外的域名时回落到占位项，避免下拉显示与输入框不一致 */
-              value={findRealityDest(realityDest) ? realityDest.trim() : ''}
-              onChange={(e) => {
-                if (e.target.value !== '') setRealityDest(e.target.value)
-              }}
-            >
-              <option value="">— 选择常用域名 —</option>
-              {REALITY_DEST_GROUPS.map((g) => (
-                <optgroup key={g.label} label={g.label}>
-                  {g.options.map((o) => (
-                    <option key={o.domain} value={o.domain}>
-                      {`${o.ok ? '✓' : '✗'} ${o.domain}`}
-                      {o.note ? ` — ${o.note}` : ''}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-            <input
-              aria-label="伪装域名"
-              className={field}
-              value={realityDest}
-              onChange={(e) => setRealityDest(e.target.value)}
-            />
-            {/* 选中项的标注：下拉里每个域名都带了实测结论，这里把当前这条展开说清楚 */}
-            {findRealityDest(realityDest)?.note && (
-              <p
-                className={`mt-1 ${
-                  findRealityDest(realityDest)?.warn ? 'text-amber-400' : 'text-neutral-500'
-                }`}
-              >
-                {findRealityDest(realityDest)?.note}
-              </p>
-            )}
-          </div>
-          {proto === 'http' && (
-            <p className="col-span-2 text-xs text-amber-400">
-              HTTP 上游不支持 UDP（CONNECT 只能承载 TCP）——要 UDP 请选 socks5。
-            </p>
-          )}
-          <div className="col-span-2 flex gap-2">
-            <button
-              type="button"
-              disabled={adding}
-              onClick={() => void (editingId != null ? handleSaveEdit() : handleAdd())}
-              className="rounded bg-sky-800 px-3 py-1 text-xs text-sky-100 hover:bg-sky-700 disabled:opacity-50"
-            >
-              {editingId != null
-                ? '保存改动'
-                : adding
-                  ? '部署中…'
-                  : '保存并部署'}
-            </button>
-            {editingId != null && (
-              <button
-                type="button"
-                onClick={() => {
-                  resetForm()
-                  setShowForm(false)
-                }}
-                className="rounded bg-neutral-800 px-3 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
-              >
-                取消
-              </button>
-            )}
-          </div>
-        </div>
+        <UpstreamForm
+          values={form}
+          onChange={setField}
+          editing={editingId != null}
+          adding={adding}
+          onSubmit={() => void (editingId != null ? handleSaveEdit() : handleAdd())}
+          onCancel={() => {
+            resetForm()
+            setShowForm(false)
+          }}
+        />
       )}
 
       {/* 部署进度：以前上游部署在界面上完全不可见——出口行一落库就显示，
