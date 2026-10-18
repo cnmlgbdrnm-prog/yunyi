@@ -67,7 +67,12 @@ async function run() {
 
     const extracted = join(temp, 'extracted')
     mkdirSync(extracted)
-    const tar = spawnSync('tar', ['-xzf', archive, '-C', extracted], { stdio: 'inherit' })
+    // 以 temp 为工作目录并传相对文件名：Git Bash 下 Node 解析到的是 GNU tar，
+    // 它会把 Windows 盘符路径里的 `C:` 当成远程主机（Cannot connect to C）。
+    const tar = spawnSync('tar', ['-xzf', ARCHIVE, '-C', 'extracted'], {
+      cwd: temp,
+      stdio: 'inherit',
+    })
     if (tar.status !== 0) throw new Error(`解压 Tor 归档失败（tar 退出码 ${tar.status}）`)
     const exe = findExe(extracted)
     if (!exe || sha256(exe) !== EXE_SHA256) throw new Error('归档内 tor.exe 缺失或 SHA256 不匹配')
