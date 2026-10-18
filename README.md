@@ -136,8 +136,11 @@ push 与 PR 双触发 `.github/workflows/ci.yml`，任一 job 红不可合并：
 
 - **rust**（windows-latest）：`fetch:sidecar` → `fetch:tor` → `check:package` →
   `cargo fmt --check` → `cargo clippy --all-targets -- -D warnings`
-- **frontend**（ubuntu-latest）：`npm ci` → `npx tsc --noEmit` →
-  `check:updater-pubkey`
+- **frontend**（ubuntu-latest）：`npm ci` → `check:sensitive` → `check:size` →
+  `check:org` → `npx tsc --noEmit` → `check:updater-pubkey`
+
+PR 上任一检查失败时，`ci-notice` job 会在 PR 中 @ 作者并列出失败步骤；修复后同一
+条评论更新为通过。
 
 测试只在本地执行：CI 检出中没有 `tests/`，且不作测试门禁。
 
