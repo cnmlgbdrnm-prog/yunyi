@@ -36,6 +36,13 @@ pub enum Request {
     ReloadNet { config_yaml: String },
     /// 杀 mihomo（幂等：未运行也算成功）
     StopNet,
+    /// 保留 mihomo 进程与端口，只把它切到直连模式。
+    ///
+    /// 退出/关闭网络时不能直接把端口停掉：用户级代理环境变量是进程启动那一刻的
+    /// 死快照，已经跑着的程序改不了；端口一消失，它们就会整片 `ECONNREFUSED`
+    /// （见 `net/runtime.rs` 里 `pinned_mixed_port` 的实测注释）。切直连后这些
+    /// 程序仍有一个活着的本地代理，而新进程按已还原的系统代理设置走直连。
+    Detach,
     /// 开/关 TUN：改配置的 tun 块，再 PUT /configs 热重载（dns 块两种模式都在，不动）
     SetTun { enable: bool },
     /// 查询服务与 mihomo 的存活状态
@@ -87,6 +94,8 @@ pub enum Response {
     Reloaded,
     Recovered,
     ShuttingDown,
+    /// `Detach` 的响应：mihomo 已切到直连（进程与端口保留）。
+    Detached,
     /// mixed_port 回显服务刚才用的端口，供主程序核对
     Stopped {
         mixed_port: Option<u16>,
