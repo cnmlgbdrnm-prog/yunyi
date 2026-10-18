@@ -77,8 +77,13 @@ Windows 桌面端 VPN 订阅与节点管理工具：导入机场订阅、管理�
 
 ```powershell
 npm install
+npm run fetch:sidecar   # mihomo 与 geo 数据
+npm run fetch:tor       # Tor Expert Bundle
 npm run tauri dev
 ```
+
+`tauri-build` 会在编译期校验 `bundle.resources`，缺少上述资源时 cargo 构建会失败；
+脚本幂等，已下载且哈希匹配时直接跳过。
 
 ### 构建
 
