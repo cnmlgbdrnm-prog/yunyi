@@ -1,0 +1,2 @@
+# Husky 钩子由 sh 执行：Windows 检出也必须保持 LF，否则行尾 \r 会污染参数。
+.husky/* text eol=lf

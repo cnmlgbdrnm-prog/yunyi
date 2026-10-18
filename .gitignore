@@ -43,3 +43,6 @@ src-tauri/binaries/
 
 # SDD/subagent-driven-development 工作区（ledger、diff 包等临时产物）
 .superpowers/
+
+# husky 生成的 hook 运行时代码（.husky/commit-msg 本身入库）
+.husky/_/

@@ -1,5 +1,5 @@
-# CI 门禁：rust job——fetch:sidecar → fmt → clippy；frontend job——npm ci → tsc。
-# push 与 PR 双触发，任一红不可合并。
+# CI 门禁：rust job——fetch:sidecar → fmt → clippy；frontend job——npm ci → 各项检查；
+# commitlint job——提交信息与 PR 标题规范。push 与 PR 双触发，任一红不可合并。
 # 测试源码集中放在仓库根 tests/（前端 tests/frontend、Rust tests/rust），已加入
 # .gitignore，不随源码上传；CI 检出里没有这些文件，故 CI 不再运行 cargo test / vitest，
 # 测试只在本地执行（见 README「测试」节）。
@@ -62,8 +62,8 @@ jobs:
       # 代码规模硬规范：UI 组件 ≤500 行、单文件 ≤1500 行（docs/ 与生成物不计）。
       - name: code size check
         run: npm run check:size
-      # 项目组织规范：文档必须分层进 docs/<分类>/、src/ 顶层只放入口、
-      # views 不得互相引用（scripts/check-organization.mjs）。
+      # 项目组织规范：文档必须分层进 docs/<分类>/、根目录白名单、文档死链、
+      # src/ 顶层只放入口、views 不得互相引用（scripts/check-organization.mjs）。
       - name: organization check
         run: npm run check:org
       # 只检查 src：tsconfig.json 不含 tests/frontend（测试源码不随源码上传），
@@ -80,12 +80,44 @@ jobs:
       - name: updater 发布配置检查
         run: npm run check:updater-pubkey
 
+  # 提交信息规范：首行必须是 Conventional Commits（type(scope): 描述）；
+  # 正文/脚注是自由纯文本，不要求 Markdown（规则见 commitlint.config.mjs）。
+  # PR 校验 base..head 的全部提交；push 只校验最新一条。合并提交默认忽略。
+  commitlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: npm ci
+        run: npm ci
+      - name: 校验 PR 提交信息
+        if: github.event_name == 'pull_request'
+        run: >-
+          npx commitlint
+          --from "${{ github.event.pull_request.base.sha }}"
+          --to "${{ github.event.pull_request.head.sha }}"
+          --verbose
+      - name: 校验 push 提交信息
+        if: github.event_name == 'push'
+        run: git log -1 --pretty=%B | npx commitlint --verbose
+      # squash 合并使用 PR 标题作为提交信息，标题也必须符合规范。
+      - name: 校验 PR 标题
+        if: github.event_name == 'pull_request'
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # PR 失败提醒：CI 红了就在 PR 里 @ 作者并列出失败步骤；变绿后把同一条评论更新为通过。
   # 只在 PR 上运行（直接 push 到 master 由 GitHub Actions 自身通知触发者）。
   # 评论失败（如 fork PR 的只读 token）不改变门禁结果。
   ci-notice:
     name: ci notice
-    needs: [rust, frontend]
+    needs: [rust, frontend, commitlint]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -99,6 +131,7 @@ jobs:
         env:
           RUST_RESULT: ${{ needs.rust.result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
+          COMMITLINT_RESULT: ${{ needs.commitlint.result }}
         with:
           script: |
             const marker = '<!-- ci-notice -->'
@@ -106,8 +139,11 @@ jobs:
             const repo = context.repo.repo
             const issue_number = context.issue.number
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`
-            const allPassed = [process.env.RUST_RESULT, process.env.FRONTEND_RESULT]
-              .every((r) => r === 'success')
+            const allPassed = [
+              process.env.RUST_RESULT,
+              process.env.FRONTEND_RESULT,
+              process.env.COMMITLINT_RESULT,
+            ].every((r) => r === 'success')
 
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number, per_page: 100,

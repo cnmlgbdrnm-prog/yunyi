@@ -8,7 +8,7 @@
 
 | 位置 | 职责 | 约束 |
 |---|---|---|
-| 根目录 | 仓库级配置、`README.md`、`CHANGELOG.md`、`LICENSE` | 不得新增其它文档；新文档进 `docs/<分类>/` |
+| 根目录 | 仓库级配置、`README.md`、`CHANGELOG.md`、`LICENSE` | 只允许白名单文件/目录（`ROOT_FILES` / `ROOT_DIRS`）；新增必须登记 |
 | `src/` | React 前端 | 顶层只允许 `App.tsx`、`main.tsx`、`styles.css`、`vite-env.d.ts` |
 | `src-tauri/src/` | Rust 后端 | 按领域分模块；IPC 壳与业务分离；单文件 ≤1500 行 |
 | `scripts/` | 随仓库分发的构建/检查脚本 | 必须可重复执行、失败退出非 0；检查脚本纳入 CI |
@@ -42,10 +42,12 @@
 - **新增分类**：必须同时修改 `scripts/check-organization.mjs` 的
   `DOC_CATEGORIES` 与本文件表格，否则 CI 拒绝。
 
-### 2.2 链接
+### 2.2 链接（CI 强制）
 
-文档内引用其它文档一律使用**仓库根相对路径**（如
-`docs/product/strategy.md`），便于跨目录移动时统一替换与被 CI 检索。
+文档内引用其它文档优先使用**仓库根相对路径**（如
+`docs/product/strategy.md`），也允许相对当前文件的路径（如 `../specs/xxx.md`）。
+CI 会解析 Markdown 的行内链接/图片、引用定义与 HTML 的 `href`，检查仓库内目标
+是否存在；外部 URL、锚点、`mailto:` 等跳过。死链即 CI 失败。
 
 ## 3. 前端落位与复用
 
@@ -92,11 +94,31 @@
   与 CI 的 sensitive check 执行白名单校验（`scripts/sensitive-allowlist.txt`）。
 - 测试源码只留在本机 `tests/`，CI 不运行测试门禁。
 
-## 6. 检查命令
+## 6. Git 提交与 PR
+
+### 6.1 提交信息（commitlint，CI 强制）
+
+- 首行使用 Conventional Commits：`type(scope): 描述`，例如
+  `fix(net): 修复 TUN 启动失败`。
+- 常用 type：`feat`、`fix`、`refactor`、`perf`、`test`、`docs`、`build`、
+  `ci`、`chore`、`style`、`revert`；scope 可选。
+- **正文与脚注是自由纯文本**：不要求 Markdown，不限制行宽；中文长句按自然语言
+  书写即可，不必手动折行。规范只约束首行的类型前缀。
+- 本机 `npm install` 会通过 husky 安装 `commit-msg` 钩子，提交时自动校验；
+  CI 对 PR 校验 `base..head` 的全部提交，对 push 校验最新一条（合并提交默认忽略）。
+- PR 标题同样要符合上述格式——squash 合并时标题就是最终提交信息。
+
+### 6.2 PR
+
+- 使用 `.github/pull_request_template.md` 的检查清单。
+- `.github/CODEOWNERS` 指定默认审查人，作为评审提示，不阻塞合并（未启用
+  required code owner review：唯一所有者无法批准自己的 PR）。
+
+## 7. 检查命令
 
 | 命令 | 覆盖内容 | CI |
 |---|---|---|
-| `npm run check:org` | 文档分层/命名、`src/` 顶层入口、views 互引 | 是 |
+| `npm run check:org` | 文档分层/命名/死链、根目录白名单、`src/` 顶层入口、views 互引 | 是 |
 | `npm run check:size` | UI 组件 ≤500 行、单文件 ≤1500 行 | 是 |
 | `npm run check:sensitive` | 真实 IP / 凭据不入库 | 是 |
 | `npx tsc --noEmit` | 前端类型 | 是 |
@@ -107,7 +129,7 @@ PR 上 CI 失败时，`ci-notice` job 会在 PR 里 @ 作者并列出失败 job 
 修复后同一条评论会更新为「CI 已通过」，不会重复刷屏。直接 push 到 master 的失败
 由 GitHub Actions 对触发者的默认通知负责。
 
-## 7. 变更本规范
+## 8. 变更本规范
 
 修改规则时按以下顺序：
 

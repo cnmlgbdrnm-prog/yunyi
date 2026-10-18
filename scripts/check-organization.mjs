@@ -3,7 +3,9 @@
 //      docs/ 根目录不允许裸放文件；
 //   2. docs 下文档名使用 ASCII 小写 kebab-case；
 //   3. src/ 顶层只允许入口文件，其余按职责进子目录；
-//   4. src/views 下的页面不得互相引用，共享 UI 必须放 src/components。
+//   4. 仓库根目录只允许白名单内的文件与目录；
+//   5. 文档内的仓库相对链接不得指向不存在的文件（死链）；
+//   6. src/views 下的页面不得互相引用，共享 UI 必须放 src/components。
 // 规范全文见 docs/engineering/project-conventions.md。
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -25,6 +27,23 @@ const DOC_CATEGORIES = new Set([
 ])
 // src/ 顶层只允许入口文件；页面、组件、工具分别进 views/components/utils。
 const SRC_ROOT_ALLOW = new Set(['src/App.tsx', 'src/main.tsx', 'src/styles.css', 'src/vite-env.d.ts'])
+// 仓库根目录白名单：新增顶层文件/目录必须先在这里登记，防止根目录重新长草。
+const ROOT_FILES = new Set([
+  '.gitattributes',
+  '.gitignore',
+  'CHANGELOG.md',
+  'LICENSE',
+  'README.md',
+  'commitlint.config.mjs',
+  'index.html',
+  'package-lock.json',
+  'package.json',
+  'tsconfig.json',
+  'tsconfig.node.json',
+  'tsconfig.test.json',
+  'vite.config.ts',
+])
+const ROOT_DIRS = new Set(['.github', '.husky', '.vscode', 'docs', 'scripts', 'src', 'src-tauri'])
 const DOC_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/
 const IMPORT_RE = /(?:from\s+|import\s*\(\s*|import\s+)['"]([^'"]+)['"]/g
 
@@ -77,7 +96,71 @@ for (const path of files) {
   }
 }
 
-// ---------- 4. views 不得互相引用 ----------
+// ---------- 4. 仓库根目录白名单 ----------
+for (const path of files) {
+  const top = path.split('/')[0]
+  if (path.includes('/')) {
+    if (!ROOT_DIRS.has(top)) {
+      violations.push(`${path}: 根目录不允许出现 ${top}/（顶层目录白名单：${[...ROOT_DIRS].join(' / ')}）`)
+    }
+  } else if (!ROOT_FILES.has(path)) {
+    violations.push(`${path}: 根目录不允许裸放该文件（白名单见 scripts/check-organization.mjs）`)
+  }
+}
+
+// ---------- 5. 文档死链 ----------
+// 只检查仓库内相对链接；外部 URL、锚点与 mailto 等跳过。
+const SKIP_LINK_RE = /^(?:#|[a-z][a-z0-9+.-]*:)/i
+const MD_LINK_RE = /!?\[[^\]]*\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g
+const MD_REF_RE = /^\s*\[[^\]]+\]:\s*(\S+)/gm
+const HTML_HREF_RE = /\bhref\s*=\s*["']([^"']+)["']/gi
+
+const checkLinks = (path, text) => {
+  const ext = extOf(path)
+  const stripped = text.replace(/```[\s\S]*?```/g, '')
+  const targets = []
+  if (ext === '.md' || ext === '.rst' || ext === '.adoc') {
+    for (const re of [MD_LINK_RE, MD_REF_RE]) {
+      for (const m of stripped.matchAll(re)) targets.push(m[1])
+    }
+  } else if (ext === '.html') {
+    for (const m of stripped.matchAll(HTML_HREF_RE)) targets.push(m[1])
+  }
+  for (const raw of targets) {
+    if (SKIP_LINK_RE.test(raw)) continue
+    let target = raw.split('#')[0].split('?')[0]
+    if (!target) continue
+    try {
+      target = decodeURIComponent(target)
+    } catch {
+      // 非法转义按原样处理，交给下面的存在性检查。
+    }
+    let resolved
+    if (target.startsWith('/')) {
+      resolved = posix.normalize(target.slice(1))
+    } else {
+      resolved = posix.normalize(posix.join(posix.dirname(path), target))
+    }
+    if (resolved.startsWith('..')) {
+      violations.push(`${path}: 链接 ${raw} 指向仓库外`)
+      continue
+    }
+    const exists =
+      tracked.has(resolved) ||
+      resolved === '' ||
+      files.some((f) => f.startsWith(resolved.endsWith('/') ? resolved : `${resolved}/`))
+    if (!exists) violations.push(`${path}: 链接 ${raw} 指向的文件不存在（解析为 ${resolved}）`)
+  }
+}
+
+for (const path of files) {
+  const ext = extOf(path)
+  if (!(DOC_EXTS.has(ext) || path.endsWith('.html'))) continue
+  if (!(ROOT_DOC_ALLOW.has(path) || path.startsWith('docs/') || path.startsWith('.github/'))) continue
+  checkLinks(path, readFileSync(path, 'utf8'))
+}
+
+// ---------- 6. views 不得互相引用 ----------
 // 把相对导入解析为仓库内路径；未命中的候选返回规范化路径即可。
 const resolveImport = (importer, spec) => {
   if (!spec.startsWith('.')) return null
@@ -105,11 +188,11 @@ if (violations.length > 0) {
   console.error('[check-organization] 未通过：')
   for (const v of violations) console.error(`  - ${v}`)
   console.error(
-    '\n规范：文档必须进 docs/<分类>/；src/ 顶层只放入口文件；views 不得互相引用，共享 UI 放 src/components。',
+    '\n规范：文档必须进 docs/<分类>/、根目录只放白名单文件、文档相对链接不得断；src/ 顶层只放入口文件；views 不得互相引用，共享 UI 放 src/components。',
   )
   process.exit(1)
 }
 
 console.log(
-  `[check-organization] 通过：${files.length} 个已跟踪文件；文档分层与命名、src 入口、views 依赖均符合规范。`,
+  `[check-organization] 通过：${files.length} 个已跟踪文件；文档分层/命名/链接、根目录白名单、src 入口、views 依赖均符合规范。`,
 )

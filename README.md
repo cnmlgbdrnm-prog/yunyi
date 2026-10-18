@@ -110,6 +110,14 @@ npm run tauri build  # 生成安装包
 - **文档必须分层**：所有 `.md` / `.rst` / `.adoc` 文档必须放在 `docs/<分类>/` 下
   （分类见规范文档），`docs/` 根目录禁止裸放；仓库根目录只允许 `README.md` 与
   `CHANGELOG.md`。
+- **根目录白名单**：根目录只允许构建配置与仓库级文件（`package.json`、
+  `tsconfig*.json`、`vite.config.ts`、`LICENSE` 等）及白名单目录；新增顶层
+  文件/目录必须先登记到 `scripts/check-organization.mjs`。
+- **文档链接不得失效**：文档中的仓库内相对链接由 `check:org` 解析校验，死链即失败。
+- **提交信息**：首行使用 `type(scope): 描述`（Conventional Commits，commitlint
+  本地与 CI 校验）；正文与脚注是自由纯文本，**不要求 Markdown**、不限行宽。
+  PR 标题同样适用（squash 合并时作为提交信息）。`npm install` 会自动安装
+  husky 的 `commit-msg` 钩子。
 - **前端落位**：`src/` 顶层只允许入口文件；页面放 `src/views/`，共享 UI 放
   `src/components/`；页面之间不得互相引用（`npm run check:org` 检查）。
 
@@ -138,9 +146,12 @@ push 与 PR 双触发 `.github/workflows/ci.yml`，任一 job 红不可合并：
   `cargo fmt --check` → `cargo clippy --all-targets -- -D warnings`
 - **frontend**（ubuntu-latest）：`npm ci` → `check:sensitive` → `check:size` →
   `check:org` → `npx tsc --noEmit` → `check:updater-pubkey`
+- **commitlint**（ubuntu-latest）：校验 PR 的全部提交与 PR 标题；push 只校验
+  最新一条提交。规则见 `commitlint.config.mjs`
 
 PR 上任一检查失败时，`ci-notice` job 会在 PR 中 @ 作者并列出失败步骤；修复后同一
-条评论更新为通过。
+条评论更新为通过。PR 模板与默认审查人见 `.github/pull_request_template.md` 与
+`.github/CODEOWNERS`。
 
 测试只在本地执行：CI 检出中没有 `tests/`，且不作测试门禁。
 
