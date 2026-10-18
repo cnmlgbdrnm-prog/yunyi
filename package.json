@@ -17,7 +17,8 @@
     "check:org": "node scripts/check-organization.mjs",
     "check:size": "node scripts/check-code-size.mjs",
     "check:updater-pubkey": "node scripts/check-updater-pubkey.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "prepare": "husky"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
@@ -28,6 +29,8 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^6.9.1",
@@ -37,6 +40,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "husky": "^9.1.7",
     "jsdom": "^30.0.1",
     "tailwindcss": "^4.3.3",
     "typescript": "~5.8.3",

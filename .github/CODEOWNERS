@@ -1,0 +1,3 @@
+# 默认审查人：仓库所有者。
+# 这是评审提示，不是合并门槛——未启用 required code owner review。
+* @cnmlgbdrnm-prog
