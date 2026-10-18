@@ -9,6 +9,7 @@ pub mod local_proxy;
 pub mod mmdb;
 pub mod orphan;
 pub mod runtime;
+pub mod runtime_conns;
 pub mod sysproxy_set;
 pub mod takeover;
 pub mod winprobe;

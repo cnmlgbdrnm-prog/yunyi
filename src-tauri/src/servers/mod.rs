@@ -5,6 +5,7 @@
 
 pub mod channels;
 pub mod deploy;
+pub mod deploy_spec;
 pub mod privacy;
 pub mod reality_dest;
 pub mod upstream;

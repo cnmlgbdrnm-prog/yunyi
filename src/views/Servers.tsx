@@ -31,15 +31,12 @@ import {
   isTargetBusy,
   release,
   reserveJob,
-  targetResult,
   useJobTerminal,
   useTrackedJobs,
 } from '../jobs/registry'
-import DeployWizard from '../components/DeployWizard'
 import ServerFormPanel, { EMPTY_SERVER_FORM, type ServerFormState } from '../components/ServerFormPanel'
-import ServerRow from '../components/ServerRow'
-import ServerSpeedPanel from '../components/ServerSpeedPanel'
-import ServerThroughputPanel from '../components/ServerThroughputPanel'
+import ServerList from './servers/ServerList'
+import ServerTools from './servers/ServerTools'
 
 /** Set<number> 型开关状态：新增/移除一个 id。展开态有三处（更多/通道/上游出口），
  *  原先各写一份七行；一份就够，行为也只有一个定义。 */
@@ -244,9 +241,6 @@ export default function Servers() {
     }
   }
 
-  // 指定服务器是否在任一在跟踪测速任务中（行内按钮忙态与禁用判定）
-  const isSpeedBusy = (id: number) => isTargetBusy(speedJobs, String(id))
-
   const handleSpeedTestOne = (id: number) => {
     void startSpeedTest([id])
   }
@@ -358,6 +352,21 @@ export default function Servers() {
     }
   }
 
+  const startEdit = (s: Server) => {
+    setEditingId(s.id)
+    setForm({
+      name: s.name,
+      host: s.host,
+      port: s.port,
+      user: s.user,
+      authKind: s.auth_kind,
+      kind: s.kind,
+      notes: s.notes,
+      credential: '',
+    })
+    setExpand({ type: 'edit', id: s.id })
+  }
+
   // 终态处置：测速终结刷新服务器列表（持久化结果上屏），对测终结另刷吞吐列表。
   // 事件丢失由注册表那个唯一的 5s 对账兜底，这里不再各起一个定时器。
   // 部署任务也在这里收：向导可能已经收起或用户已经切页，卡片上的「已部署协议」
@@ -393,46 +402,31 @@ export default function Servers() {
         </p>
       )}
 
-      <section className="rounded-lg border border-neutral-800 bg-neutral-900/50">
-        <button
-          type="button"
-          onClick={() => setToolsOpen((v) => !v)}
-          aria-expanded={toolsOpen}
-          className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-neutral-200 hover:bg-neutral-800/50"
-        >
-          <span>工具</span>
-          <span className="text-xs text-neutral-500">{toolsOpen ? '收起' : '展开'}</span>
-        </button>
-        {toolsOpen && (
-          <div className="space-y-3 px-4 pb-4">
-            <ServerSpeedPanel
-              concurrency={concurrency}
-              onConcurrencyChange={setConcurrency}
-              serverCount={servers.length}
-              runningCount={speedJobs.size}
-              onBatch={handleBatchSpeedTest}
-              onCancel={() => void handleCancelSpeed()}
-            />
-            <ServerThroughputPanel
-              servers={servers}
-              fromId={fromId}
-              toId={toId}
-              seconds={seconds}
-              onFromChange={setFromId}
-              onToChange={setToId}
-              onSecondsChange={setSeconds}
-              running={throughputJob != null}
-              progressMessage={throughputJob?.message ?? ''}
-              onStart={handleThroughputStart}
-              onCancel={() => void handleCancelThroughput()}
-              installBusy={installBusy}
-              installMsg={installMsg}
-              onInstall={() => void handleInstallIperf3()}
-              results={throughputResults}
-            />
-          </div>
-        )}
-      </section>
+      <ServerTools
+        open={toolsOpen}
+        onToggle={() => setToolsOpen((v) => !v)}
+        concurrency={concurrency}
+        onConcurrencyChange={setConcurrency}
+        serverCount={servers.length}
+        runningCount={speedJobs.size}
+        onBatch={handleBatchSpeedTest}
+        onCancelSpeed={() => void handleCancelSpeed()}
+        servers={servers}
+        fromId={fromId}
+        toId={toId}
+        seconds={seconds}
+        onFromChange={setFromId}
+        onToChange={setToId}
+        onSecondsChange={setSeconds}
+        throughputRunning={throughputJob != null}
+        progressMessage={throughputJob?.message ?? ''}
+        onThroughputStart={handleThroughputStart}
+        onThroughputCancel={() => void handleCancelThroughput()}
+        installBusy={installBusy}
+        installMsg={installMsg}
+        onInstall={() => void handleInstallIperf3()}
+        results={throughputResults}
+      />
 
       {form && editingId == null && (
         <div className="space-y-2 rounded-lg border border-neutral-800 bg-neutral-900/50 p-4">
@@ -446,89 +440,50 @@ export default function Servers() {
         </div>
       )}
 
-      <ul className="space-y-2">
-        {servers.map((s) => {
-          const live = targetResult(speedJobs, String(s.id))
-          return (
-            <ServerRow
-              key={s.id}
-              server={s}
-              speed={{
-                busy: isSpeedBusy(s.id),
-                // 行内失败原因优先于库里上次的：任务刚跑完时这才是新的那份
-                error: live?.error ?? s.last_check_error,
-                done: live != null,
-              }}
-              testing={testing.has(s.id)}
-              passwordlessBusy={pwBusy.has(s.id)}
-              passwordless={pwDone[s.id] || s.auth_kind === 'key'}
-              passwordlessJustDone={pwDone[s.id] === true}
-              bbr={{
-                algo: bbrAlgo[s.id],
-                checking: bbrChecking.has(s.id),
-                enabling: bbrEnabling.has(s.id),
-                msg: bbrMsg[s.id],
-              }}
-              deployedProtos={deployedProtos[s.id]}
-              test={tests[s.id]}
-              linkSummary={linkSummary(s)}
-              open={{
-                more: moreOpen.has(s.id),
-                channels: channelsOpen.has(s.id),
-                upstreams: upstreamsOpen.has(s.id),
-              }}
-              expanded={expand?.id === s.id}
-              onToggleMore={() => toggleSet(setMoreOpen, s.id)}
-              onToggleChannels={() => toggleSet(setChannelsOpen, s.id)}
-              onToggleUpstreams={() => toggleSet(setUpstreamsOpen, s.id)}
-              onSpeedTest={() => handleSpeedTestOne(s.id)}
-              onTest={() => void handleTest(s.id)}
-              onPasswordless={() => void handlePasswordless(s.id)}
-              onBbrEnable={() => void handleEnableBbr(s.id)}
-              onBbrCheck={() => void handleCheckBbr(s.id)}
-              onDeploy={() => setExpand({ type: 'deploy', id: s.id })}
-              onEdit={() => {
-                setEditingId(s.id)
-                setForm({ name: s.name, host: s.host, port: s.port, user: s.user, authKind: s.auth_kind, kind: s.kind, notes: s.notes, credential: '' })
-                setExpand({ type: 'edit', id: s.id })
-              }}
-              onDelete={() => void handleDelete(s.id)}
-              onClose={() => setExpand(null)}
-            >
-              {expand?.id === s.id && expand.type === 'deploy' && (
-                <div className="px-4 pb-4">
-                  <DeployWizard
-                    server={s}
-                    onClose={() => setExpand(null)}
-                    onDone={() => {
-                      // 部署终态：重读后端摘要（徽章不再由回调携带的协议清单镜像）
-                      setExpand(null)
-                      void refresh()
-                      void loadDeployed([s.id])
-                    }}
-                  />
-                </div>
-              )}
-              {expand?.id === s.id && expand.type === 'edit' && form != null && (
-                <div className="space-y-2 px-4 pb-4">
-                  <ServerFormPanel
-                    form={form}
-                    editing
-                    onChange={setForm}
-                    onSave={handleSave}
-                    onCancel={() => {
-                      setForm(null)
-                      setEditingId(null)
-                      setExpand(null)
-                    }}
-                  />
-                </div>
-              )}
-            </ServerRow>
-          )
-        })}
-        {servers.length === 0 && <p className="text-sm text-neutral-500">还没有服务器，点击"新建服务器"添加。</p>}
-      </ul>
+      <ServerList
+        servers={servers}
+        speedJobs={speedJobs}
+        testing={testing}
+        pwBusy={pwBusy}
+        pwDone={pwDone}
+        bbrAlgo={bbrAlgo}
+        bbrChecking={bbrChecking}
+        bbrEnabling={bbrEnabling}
+        bbrMsg={bbrMsg}
+        deployedProtos={deployedProtos}
+        tests={tests}
+        linkSummary={linkSummary}
+        moreOpen={moreOpen}
+        channelsOpen={channelsOpen}
+        upstreamsOpen={upstreamsOpen}
+        expand={expand}
+        form={form}
+        setForm={setForm}
+        onToggleMore={(id) => toggleSet(setMoreOpen, id)}
+        onToggleChannels={(id) => toggleSet(setChannelsOpen, id)}
+        onToggleUpstreams={(id) => toggleSet(setUpstreamsOpen, id)}
+        onSpeedTest={handleSpeedTestOne}
+        onTest={(id) => void handleTest(id)}
+        onPasswordless={(id) => void handlePasswordless(id)}
+        onBbrEnable={(id) => void handleEnableBbr(id)}
+        onBbrCheck={(id) => void handleCheckBbr(id)}
+        onDeploy={(id) => setExpand({ type: 'deploy', id })}
+        onEdit={startEdit}
+        onDelete={(id) => void handleDelete(id)}
+        onClose={() => setExpand(null)}
+        onSave={handleSave}
+        onCancelEdit={() => {
+          setForm(null)
+          setEditingId(null)
+          setExpand(null)
+        }}
+        onDeployDone={(s) => {
+          // 部署终态：重读后端摘要（徽章不再由回调携带的协议清单镜像）
+          setExpand(null)
+          void refresh()
+          void loadDeployed([s.id])
+        }}
+      />
     </div>
   )
 }
