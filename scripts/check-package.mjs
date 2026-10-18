@@ -12,7 +12,7 @@ const TOR_DIR = join(ROOT, 'src-tauri', 'binaries', 'tor')
 const TOR_EXE = join(TOR_DIR, 'tor.exe')
 // 与 src-tauri/src/speed/sidecar.rs SIDECAR_EXE_SHA256 同值
 const EXE_SHA256 = 'a4feef7e4f8cbaf19e2079b3caa3e23821dfe419ad2e39e0539b843bd2d4d1be'
-const TOR_EXE_SHA256 = '60c45b01938c799862e511a9a5bab12f959a819c6264a24502edc342165f570c'
+const TOR_EXE_SHA256 = '8c38513b3c4584154158e7c584f4144849dc679a64cd679553d72dad28230c54'
 const MIN_BYTES = 1024 * 1024
 
 const sha256File = (p) => createHash('sha256').update(readFileSync(p)).digest('hex')

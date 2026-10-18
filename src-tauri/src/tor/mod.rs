@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 pub const TOR_DIR: &str = "tor";
 /// tor.exe 文件名。
 pub const TOR_EXE: &str = "tor.exe";
-/// Tor Expert Bundle 15.0.23 里 `tor.exe` 的 sha256（2026-09-22 官方归档下载后本机
+/// Tor Expert Bundle 15.0.25 里 `tor.exe` 的 sha256（2026-10-18 官方归档下载后本机
 /// 计算，与 `scripts/fetch-tor.mjs` 的校验链同值）。换版本时两处必须人工同步。
-pub const TOR_EXE_SHA256: &str = "60c45b01938c799862e511a9a5bab12f959a819c6264a24502edc342165f570c";
+pub const TOR_EXE_SHA256: &str = "8c38513b3c4584154158e7c584f4144849dc679a64cd679553d72dad28230c54";
 
 /// 内置二进制的候选路径（按序取第一个存在的文件）：打包资源 → dev 下的 binaries/。
 pub fn candidate_paths(resource: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {

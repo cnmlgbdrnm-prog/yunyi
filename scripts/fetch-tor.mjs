@@ -20,15 +20,15 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DEST = join(ROOT, 'src-tauri', 'binaries', 'tor')
-const VERSION = '15.0.23'
+const VERSION = '15.0.25'
 const ARCHIVE = `tor-expert-bundle-windows-x86_64-${VERSION}.tar.gz`
 const URL = `https://dist.torproject.org/torbrowser/${VERSION}/${ARCHIVE}`
 // 网络受限时可指定完整镜像 URL；归档哈希始终按官方值校验。
 const DOWNLOAD_URL = process.env.TOR_ARCHIVE_URL ?? URL
-// https://dist.torproject.org/torbrowser/15.0.23/sha256sums-signed-build.txt
-const ARCHIVE_SHA256 = '231dad6b9cb401a54c260db7046965ef04e4f72ff071b140d423fb5da281ab1e'
+// https://dist.torproject.org/torbrowser/15.0.25/sha256sums-signed-build.txt
+const ARCHIVE_SHA256 = 'c1988c701de2f24f7d098d1d6d7f507b58f27740d097f29c246e0524d639b252'
 // 与 src-tauri/src/tor/mod.rs 的 TOR_EXE_SHA256 同值。
-const EXE_SHA256 = '60c45b01938c799862e511a9a5bab12f959a819c6264a24502edc342165f570c'
+const EXE_SHA256 = '8c38513b3c4584154158e7c584f4144849dc679a64cd679553d72dad28230c54'
 
 const sha256 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex')
 
@@ -72,7 +72,7 @@ async function run() {
     const exe = findExe(extracted)
     if (!exe || sha256(exe) !== EXE_SHA256) throw new Error('归档内 tor.exe 缺失或 SHA256 不匹配')
     const source = dirname(exe)
-    // 15.0.23 的 Windows Expert Bundle 无独立 DLL；保留官方目录布局。
+    // Windows Expert Bundle 无独立 DLL；保留官方目录布局。
     mkdirSync(DEST, { recursive: true })
     cpSync(source, DEST, { recursive: true, force: true })
     if (!statSync(join(DEST, 'tor.exe')).isFile()) throw new Error('Tor 资源目录不完整')
