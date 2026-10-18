@@ -103,6 +103,10 @@
 | `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` | Rust 格式与静态检查 | 是 |
 | `npm test`、`cargo test --features local-tests` | 本地测试（不随仓库分发） | 否 |
 
+PR 上 CI 失败时，`ci-notice` job 会在 PR 里 @ 作者并列出失败 job 与具体失败步骤；
+修复后同一条评论会更新为「CI 已通过」，不会重复刷屏。直接 push 到 master 的失败
+由 GitHub Actions 对触发者的默认通知负责。
+
 ## 7. 变更本规范
 
 修改规则时按以下顺序：
