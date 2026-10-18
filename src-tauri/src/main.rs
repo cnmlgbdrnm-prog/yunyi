@@ -304,6 +304,7 @@ fn main() {
             commands::scan_server_ports_cmd,
             commands::start_deploy_cmd,
             commands::deployed_protocols_cmd,
+            commands::deployed_protocol_details_cmd,
             commands::install_supplement_cmd,
             commands::remove_protocol_cmd,
             commands::net_status_cmd,

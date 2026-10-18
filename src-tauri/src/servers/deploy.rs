@@ -11,6 +11,7 @@ use crate::jobs::{DeployRequest, EmitFn, JobRequest, JobRunner};
 use crate::servers::{load_auth_parts, CONNECT_TIMEOUT, PROBE_TIMEOUT};
 use crate::ssh::SshSession;
 use crate::state::AppState;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -31,14 +32,62 @@ const SS_UNIT_PATH: &str = "/etc/systemd/system/ssserver.service";
 // 路径经此重导出保持不变（测试与 relay 等模块按旧路径引用）。
 pub use crate::servers::deploy_spec::*;
 
-/// 查看某台服务器已部署协议：依据最新一次部署摘要（无记录 → 空列表）。
+/// 查看某台服务器**当前可用的**已部署协议，以 `nodes` 里的自建节点为准。
+///
+/// 为什么不再读最新部署摘要：摘要只记录最后一次 job 写回的协议，既会漏掉更早部署、
+/// 仍在使用的协议（先补装 SS，再重部署三件套），也会把「配置已写、服务已起，但 job
+/// 在写回前被取消」的协议当成没部署。节点行才是客户端真正能拨通的那份事实。
 pub fn deployed_protocols(state: &Arc<AppState>, server_id: i64) -> Result<Vec<String>, String> {
+    Ok(deployed_protocol_details(state, server_id)?
+        .into_iter()
+        .map(|d| d.protocol)
+        .collect())
+}
+
+/// 已部署协议详情：白名单协议名 + 端口 + 完整变体（传输层/安全层/流控）。
+///
+/// 节点行里混着两类 `source=self-built`：
+/// 1. 落地协议（本函数要返回的）；
+/// 2. 上游住宅出口（同一台机器上的第二条 Xray 实例），它们也写成 self-built，
+///    必须按 `upstreams.node_id` 排除，否则会把“上游出口”误报成“已部署 vless”。
+///
+/// 中转改写过 `addr` 的节点用 [`crate::domain::direct_addr`] 还原真实落地地址。
+pub fn deployed_protocol_details(
+    state: &Arc<AppState>,
+    server_id: i64,
+) -> Result<Vec<DeployedProtocolDetail>, String> {
     let conn = state.db.lock();
-    match repos::deploys::latest_summary(&conn, server_id) {
-        Ok(Some(s)) => Ok(parse_deployed_protocols(&s)),
-        Ok(None) => Ok(vec![]),
-        Err(e) => Err(e.to_string()),
-    }
+    let Some(server) = repos::servers::get(&conn, server_id).map_err(|e| e.to_string())? else {
+        return Ok(vec![]);
+    };
+    let upstream_nodes: HashSet<String> = repos::upstreams::list_by_server(&conn, server_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|u| u.node_id)
+        .collect();
+    let mut details: Vec<DeployedProtocolDetail> = repos::nodes::list(&conn, &state.creds)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|n| n.source == "self-built")
+        .filter(|n| is_supported_protocol(&n.protocol))
+        .filter(|n| !upstream_nodes.contains(&n.id))
+        .filter(|n| crate::domain::direct_addr(n) == server.host)
+        .map(|n| {
+            describe_deployed_protocol(
+                &n.protocol,
+                u16::try_from(n.port).unwrap_or_default(),
+                &n.params_json,
+            )
+        })
+        .collect();
+    details.sort_by(|a, b| {
+        protocol_order(&a.protocol)
+            .cmp(&protocol_order(&b.protocol))
+            .then(a.port.cmp(&b.port))
+    });
+    // 同一协议只保留端口最小的那条（重复部署会清旧行，这里只是防御历史脏数据）。
+    details.dedup_by(|a, b| a.protocol == b.protocol);
+    Ok(details)
 }
 
 /// 端口占用检查：true=端口已被监听（占用），false=空闲可部署。
@@ -1344,8 +1393,8 @@ impl ProdRunner {
                     "node": a.node, "attached": a.attached, "detail": a.detail
                 })).collect::<Vec<_>>()
             });
-            // BBR 结果（有才写）：parse_deployed_protocols 只读 protocols、容忍额外字段，
-            // 不影响既有摘要解析
+            // BBR 结果（有才写）：摘要只作部署历史记录，协议列表以节点行为准，
+            // 因此附加字段不会影响 UI 的已部署协议展示
             if let Some(note) = &bbr_note {
                 summary["bbr"] = serde_json::Value::from(note.clone());
             }

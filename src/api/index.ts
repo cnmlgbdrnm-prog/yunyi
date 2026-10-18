@@ -7,6 +7,7 @@ import type {
   ChannelStatus,
   ConnectionTest,
   ConnLogSnapshot,
+  DeployedProtocolDetail,
   DeployInput,
   DeployProtocol,
   DevicePeer,
@@ -394,9 +395,16 @@ export function startDeploy(input: DeployInput): Promise<number> {
   return invoke('start_deploy_cmd', { ...input })
 }
 
-/** 服务器已部署协议（最新部署摘要）。协议管理 P2 里程碑的前置只读接口 */
+/** 服务器已部署协议（以本地自建节点为准）。协议管理 P2 里程碑的前置只读接口 */
 export function listDeployedProtocols(serverId: number): Promise<string[]> {
   return invoke('deployed_protocols_cmd', { serverId })
+}
+
+/** 服务器已部署协议详情：完整变体 + 端口（UI 用这个，不再显示裸协议名） */
+export function listDeployedProtocolDetails(
+  serverId: number,
+): Promise<DeployedProtocolDetail[]> {
+  return invoke('deployed_protocol_details_cmd', { serverId })
 }
 
 /** 补装协议：现有 ∪ 勾选 提交一次部署任务，返回 jobId */

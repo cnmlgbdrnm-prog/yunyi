@@ -305,6 +305,16 @@ export interface ThroughputTest {
 /** 部署协议白名单(与后端 servers::deploy::PROTOCOLS 一致) */
 export type DeployProtocol = 'vless' | 'trojan' | 'vmess' | 'ss' | 'hysteria2' | 'tuic'
 
+/** 已部署协议详情：label 是完整变体名（如 VLESS + REALITY + Vision），不是裸协议名 */
+export interface DeployedProtocolDetail {
+  protocol: DeployProtocol
+  port: number
+  label: string
+  transport: string
+  security: string
+  flow: string | null
+}
+
 export interface DeployInput {
   serverId: number
   protocols: DeployProtocol[]
