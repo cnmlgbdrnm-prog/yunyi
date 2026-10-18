@@ -1,0 +1,74 @@
+# CI 门禁：rust job——fetch:sidecar → fmt → clippy；frontend job——npm ci → tsc。
+# push 与 PR 双触发，任一红不可合并。
+# 测试源码集中放在仓库根 tests/（前端 tests/frontend、Rust tests/rust），已加入
+# .gitignore，不随源码上传；CI 检出里没有这些文件，故 CI 不再运行 cargo test / vitest，
+# 测试只在本地执行（见 README「测试」节）。
+# 详见 docs/superpowers/specs/2026-08-14-vpn-ctl-p6-ci-design.md。
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # mihomo sidecar：tauri-build 校验 bundle.resources 存在性，cargo 命令必须先行落盘。
+      # 脚本幂等（已存在且哈希匹配即跳过），windows runner 上 powershell 解压路径可用。
+      - name: 获取 mihomo sidecar
+        run: npm run fetch:sidecar
+        working-directory: .
+      - name: 获取 Tor Expert Bundle
+        run: npm run fetch:tor
+        working-directory: .
+      - name: 校验打包资源
+        run: npm run check:package
+        working-directory: .
+      - name: cargo fmt
+        run: cargo fmt --check
+      # 不带 local-tests 特性：测试源码不在仓库里，cfg 门控会把所有测试模块剥离。
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: npm ci
+        run: npm ci
+      # 敏感信息护栏：真实主机 IP 与凭据不得进入版本库（白名单见
+      # scripts/sensitive-allowlist.txt）。
+      - name: sensitive check
+        run: npm run check:sensitive
+      # 只检查 src：tsconfig.json 不含 tests/frontend（测试源码不随源码上传），
+      # 本地要连测试一起检查时用 npm run test:typecheck。
+      - name: tsc
+        run: npx tsc --noEmit -p tsconfig.json
+      # updater 发布配置回归护栏（scripts/check-updater-pubkey.mjs）：
+      # 1. pubkey 须为公钥盒全文的 base64（CLI 与插件的 decode 链要求），
+      #    裸密钥行会让 tauri build 报「failed to decode base64 pubkey」
+      #    （2026-08-14 release 首次暴露）
+      # 2. bundle.createUpdaterArtifacts 必须为 true——误改 false 后安装包
+      #    不生成 .sig，发布会缺 latest.json，客户端检查更新停在旧版
+      #    （2026-08-15 0.2.2 首轮构建实际发生）
+      - name: updater 发布配置检查
+        run: npm run check:updater-pubkey

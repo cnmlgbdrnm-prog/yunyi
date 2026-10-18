@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# 测试源码（本地保留，不随源码上传）
+/tests/
+
+# Cargo build artifacts
+/src-tauri/target
+
+# mihomo sidecar binary (fetched by scripts/fetch-sidecar.mjs)
+src-tauri/binaries/
+
+# updater 签名密钥目录（私钥不入库；签名在 CI 用 TAURI_SIGNING_PRIVATE_KEY 完成）
+.signing/
+
+# Git worktrees (multi-session parallel development)
+.worktrees/
+# Claude Code 的 worktree 落在 .claude/worktrees/（同一问题的新位置，两者都要）
+# 只忽略 worktrees 子目录而非整个 .claude/，以便将来共享 .claude/settings.json 等项目配置
+.claude/worktrees/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# SDD/subagent-driven-development 工作区（ledger、diff 包等临时产物）
+.superpowers/

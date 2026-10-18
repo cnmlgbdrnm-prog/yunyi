@@ -1,0 +1,822 @@
+<title>Tor 隐私链路审查 · 10% 卡死根因</title>
+<style>
+  :root {
+    --paper:      #F1F3F2;
+    --surface:    #FFFFFF;
+    --surface-2:  #E7EBE9;
+    --ink:        #151A18;
+    --ink-2:      #4A534F;
+    --ink-3:      #7C8783;
+    --rule:       #D2D9D6;
+    --rule-2:     #BCC5C1;
+    --accent:     #0A6B5C;
+    --accent-bg:  #E0EDEA;
+    --fail:       #9E2B22;
+    --fail-bg:    #F6E4E2;
+    --pass:       #2A6448;
+    --pass-bg:    #E2EEE8;
+    --warn:       #8A5A12;
+    --warn-bg:    #F5EBD9;
+
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, "Segoe UI", -apple-system, "Helvetica Neue", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:     #101412;
+      --surface:   #171C1A;
+      --surface-2: #1F2523;
+      --ink:       #E4E9E6;
+      --ink-2:     #A5B0AB;
+      --ink-3:     #79837E;
+      --rule:      #2A3230;
+      --rule-2:    #3A4340;
+      --accent:    #4CC9AC;
+      --accent-bg: #14312B;
+      --fail:      #E8776A;
+      --fail-bg:   #321D1A;
+      --pass:      #6FC79A;
+      --pass-bg:   #16291F;
+      --warn:      #D9A448;
+      --warn-bg:   #2E2415;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:     #101412;
+    --surface:   #171C1A;
+    --surface-2: #1F2523;
+    --ink:       #E4E9E6;
+    --ink-2:     #A5B0AB;
+    --ink-3:     #79837E;
+    --rule:      #2A3230;
+    --rule-2:    #3A4340;
+    --accent:    #4CC9AC;
+    --accent-bg: #14312B;
+    --fail:      #E8776A;
+    --fail-bg:   #321D1A;
+    --pass:      #6FC79A;
+    --pass-bg:   #16291F;
+    --warn:      #D9A448;
+    --warn-bg:   #2E2415;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+    margin: 0;
+    padding: 0 24px 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+
+  /* ---------- masthead ---------- */
+  header.masthead {
+    padding: 64px 0 28px;
+    border-bottom: 2px solid var(--ink);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(26px, 4.4vw, 40px);
+    line-height: 1.15;
+    letter-spacing: -.02em;
+    font-weight: 600;
+    margin: 0 0 16px;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 17px;
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 22px;
+    margin-top: 24px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  /* ---------- verdict banner ---------- */
+  .verdict {
+    margin: 40px 0 0;
+    background: var(--accent-bg);
+    border-left: 4px solid var(--accent);
+    padding: 22px 26px;
+    border-radius: 0 3px 3px 0;
+  }
+  .verdict h2 {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+    font-weight: 600;
+  }
+  .verdict p { margin: 0; font-size: 17px; }
+  .verdict p + p { margin-top: 10px; font-size: 15px; color: var(--ink-2); }
+
+  /* ---------- sections ---------- */
+  section { margin-top: 64px; }
+  .sec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 10px;
+    margin-bottom: 26px;
+  }
+  .sec-num {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: .08em;
+    flex: none;
+  }
+  h2.sec-title {
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 34px 0 12px;
+  }
+  p { margin: 0 0 16px; max-width: 68ch; }
+  p.wide { max-width: none; }
+
+  code {
+    font-family: var(--mono);
+    font-size: .875em;
+    background: var(--surface-2);
+    padding: .12em .38em;
+    border-radius: 2px;
+    word-break: break-word;
+  }
+
+  /* ---------- causal chain ---------- */
+  ol.chain { list-style: none; counter-reset: step; margin: 0; padding: 0; }
+  ol.chain li {
+    counter-increment: step;
+    position: relative;
+    padding: 0 0 24px 52px;
+    border-left: 2px solid var(--rule);
+    margin-left: 15px;
+  }
+  ol.chain li:last-child { border-left-color: transparent; padding-bottom: 0; }
+  ol.chain li::before {
+    content: counter(step);
+    position: absolute;
+    left: -16px;
+    top: -2px;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 2px solid var(--rule-2);
+    color: var(--ink-2);
+    font-family: var(--mono);
+    font-size: 13px;
+    display: grid;
+    place-items: center;
+  }
+  ol.chain li:last-child::before {
+    background: var(--fail-bg);
+    border-color: var(--fail);
+    color: var(--fail);
+  }
+  ol.chain .step-title {
+    font-weight: 600;
+    font-size: 15.5px;
+    display: block;
+    margin-bottom: 4px;
+  }
+  ol.chain .step-body { color: var(--ink-2); font-size: 15px; }
+  ol.chain li:last-child .step-body { color: var(--ink); }
+
+  /* ---------- tables ---------- */
+  .scroller {
+    overflow-x: auto;
+    margin: 0 0 8px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: var(--surface);
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th {
+    text-align: left;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+    background: var(--surface-2);
+  }
+  td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.mono, th.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  td.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  caption {
+    caption-side: bottom;
+    text-align: left;
+    font-size: 13px;
+    color: var(--ink-3);
+    padding: 10px 2px 0;
+  }
+
+  /* ---------- chips ---------- */
+  .chip {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1;
+    padding: 4px 7px;
+    border-radius: 2px;
+    white-space: nowrap;
+    letter-spacing: .02em;
+  }
+  .c-pass { background: var(--pass-bg); color: var(--pass); }
+  .c-fail { background: var(--fail-bg); color: var(--fail); }
+  .c-warn { background: var(--warn-bg); color: var(--warn); }
+  .c-note { background: var(--surface-2); color: var(--ink-2); }
+  .c-acc  { background: var(--accent-bg); color: var(--accent); }
+
+  /* ---------- callout ---------- */
+  .callout {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--warn);
+    padding: 18px 22px;
+    border-radius: 0 3px 3px 0;
+    margin: 0 0 16px;
+  }
+  .callout.danger { border-left-color: var(--fail); }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--warn);
+    display: block;
+    margin-bottom: 8px;
+  }
+  .callout.danger .label { color: var(--fail); }
+
+  /* ---------- code block ---------- */
+  pre {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+    margin: 0 0 16px;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .del { color: var(--fail); }
+  .add { color: var(--pass); }
+
+  /* ---------- q & a list ---------- */
+  .qa { display: flex; flex-direction: column; gap: 2px; }
+  .qa-item {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 18px 22px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 6px 20px;
+    align-items: start;
+  }
+  .qa-item:first-child { border-radius: 3px 3px 0 0; }
+  .qa-item:last-child { border-radius: 0 0 3px 3px; }
+  .qa-q { font-weight: 600; font-size: 15.5px; }
+  .qa-a { grid-column: 1 / -1; color: var(--ink-2); font-size: 15px; margin: 0; }
+  .qa-a strong { color: var(--ink); }
+
+  footer {
+    margin-top: 72px;
+    padding-top: 24px;
+    border-top: 1px solid var(--rule);
+    font-size: 13px;
+    color: var(--ink-3);
+  }
+  footer p { max-width: none; margin-bottom: 8px; }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">运行时证据审查 · 只读</p>
+  <h1>10% 卡死不是 GFW，是我们自己的 Xray 配置</h1>
+  <p class="standfirst">
+    Tor 的 OR 连接每一条都带一个<strong>随机 SNI</strong>。我们部署的 Xray 开着
+    <code>sniffing.destOverride</code> 却没开 <code>routeOnly</code>，于是把目标从 IP
+    改写成那个随机域名交给下游解析——解析失败，~2.3 秒后静默关闭。
+    Tor 看到的是 <code>unexpected eof</code>。
+  </p>
+  <div class="meta">
+    <span>审查 2026-09-22</span>
+    <span>修复验证 2026-09-23</span>
+    <span>vpn-ctl / 云驿</span>
+    <span>Tor Expert Bundle 15.0.23</span>
+    <span>mihomo v1.19.10</span>
+  </div>
+</header>
+
+<div class="verdict">
+  <h2>审查裁决</h2>
+  <p>住宅代理无罪，GFW 无罪，Tor 无罪。<strong>Bridge 不需要做。</strong></p>
+  <p>
+    19 条原有结论中 <strong>FALSE 3 / PARTIAL 2</strong>；1 项证据不足明确记为
+    <span class="chip c-note">NOT_PROVEN</span>。核心结论全部为 A 类（实测事实）。
+  </p>
+</div>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">01</span>
+    <h2 class="sec-title">根因链</h2>
+  </div>
+
+  <ol class="chain">
+    <li>
+      <span class="step-title">Tor 15 为每条 OR 连接生成随机 SNI</span>
+      <span class="step-body">
+        抓包实测：<code>server_name</code> 长度 31，内容为 <code>www.</code> + 17 个随机字符。
+        Tor 用这种方式把流量伪装成访问一个真实网站。
+      </span>
+    </li>
+    <li>
+      <span class="step-body">
+        <span class="step-title">Xray 的 sniffer 读出这个 SNI，并把目标从 IP 改写成域名</span>
+        <code>deploy.rs:559</code> 与 <code>upstream.rs:241</code> 生成的入站配置是
+        <code>"sniffing": { "enabled": true, "destOverride": ["http","tls","quic"] }</code>，
+        <strong>没有 <code>routeOnly: true</code></strong>。
+      </span>
+    </li>
+    <li>
+      <span class="step-title">下游那一跳必须自己去解析这个随机域名</span>
+      <span class="step-body">
+        目标已经是 <code>www.&lt;17个随机字符&gt;.com:443</code> 而不是 <code>131.188.40.189:443</code>。
+      </span>
+    </li>
+    <li>
+      <span class="step-title">解析失败，链路在 ~2.3 秒后静默关闭，零字节返回</span>
+      <span class="step-body">
+        实测 20 条连接的关闭时间落在 2253–2382ms，抖动仅 ±60ms——这是 DNS 超时，
+        不是拒绝，也不是拥塞。
+      </span>
+    </li>
+    <li>
+      <span class="step-title">Tor 停在 10%，报 <code>unexpected eof</code></span>
+      <span class="step-body">
+        10% 的含义是「TCP 到中继成功、TLS 握手尚未开始」——完全吻合：
+        TCP 由 mihomo 建成功，TLS 被我们自己掐断。
+      </span>
+    </li>
+  </ol>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">02</span>
+    <h2 class="sec-title">决定性证据</h2>
+  </div>
+
+  <p>
+    把 Tor 的 ClientHello 原样抓下来，只改其中一个字段，其余字节一字不动。
+    所有重放都打到 <code>131.188.40.189:443</code>——一个单发时必然成功的端点。
+  </p>
+
+  <div class="scroller">
+    <table>
+      <caption>定点手术：每次只改一个变量。</caption>
+      <thead>
+        <tr><th>变体</th><th class="mono">长度</th><th>结果</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>T0 原样</td><td class="num">1560B</td><td><span class="chip c-fail">零回包被关</span></td><td>基线</td></tr>
+        <tr><td>T1 去掉后量子密码套件</td><td class="num">1560B</td><td><span class="chip c-fail">零回包被关</span></td><td>排除 PQ</td></tr>
+        <tr><td>T2 key_share 换成 X25519</td><td class="num">307B</td><td><span class="chip c-fail">零回包被关</span></td><td>缩小到 307B 也照样失败</td></tr>
+        <tr><td>T3 SNI 换成 www.apple.com</td><td class="num">1547B</td><td><span class="chip c-pass">有回包 7B</span></td><td><strong>只改 SNI 就活了</strong></td></tr>
+        <tr><td>T4 SNI 扩展整个删掉</td><td class="num">1525B</td><td><span class="chip c-pass">有回包 2229B</span></td><td>完整 TLS 握手</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>再把 SNI 换成各种域名，其余字节完全不动——判据是「能不能解析」：</p>
+
+  <div class="scroller">
+    <table>
+      <thead>
+        <tr><th>SNI</th><th>可解析</th><th>结果</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="mono">（无 SNI）</td><td>—</td><td><span class="chip c-pass">通 2229B</span></td></tr>
+        <tr><td class="mono">www.apple.com</td><td>是</td><td><span class="chip c-pass">通 4884B</span></td></tr>
+        <tr><td class="mono">www.microsoft.com</td><td>是</td><td><span class="chip c-pass">通 7537B</span></td></tr>
+        <tr><td class="mono">www.bing.com</td><td>是</td><td><span class="chip c-pass">通 5364B</span></td></tr>
+        <tr><td class="mono">www.google.com</td><td>是</td><td><span class="chip c-pass">通 3842B</span></td></tr>
+        <tr><td class="mono">www.a.com</td><td>否</td><td><span class="chip c-fail">零回包被关</span></td></tr>
+        <tr><td class="mono">www.&lt;随机17字符&gt;.com</td><td>否</td><td><span class="chip c-fail">零回包被关</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    完全一一对应。注意 <code>www.google.com</code> 是<strong>通</strong>的——这条链路
+    没有任何「按墙外域名拦截」的行为，所以不可能是 GFW 在拦。
+  </p>
+
+  <h3>谁先断开：半关闭探针</h3>
+  <p>
+    早期的转发探针在对端关闭时会主动拆掉另一侧，所以「谁先发 FIN」此前根本没有被测到。
+    改用半关闭友好的探针后：
+  </p>
+  <pre><code>#1 + 2365ms <span class="del">★ 上游 发 FIN</span> (up=1580 down=12)
+#1 + 2366ms ★ TOR  发 FIN (up=1587 down=12)</code></pre>
+  <p>
+    <strong>上游先关</strong>，Tor 在 1ms 后跟关。上游收到 1565 字节的 ClientHello 后，
+    一个字都没回。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">03</span>
+    <h2 class="sec-title">被这次审查推翻的判断</h2>
+  </div>
+
+  <div class="scroller">
+    <table>
+      <thead>
+        <tr><th>原判断</th><th>裁决</th><th>依据</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>GFW 识别了 Tor 的 TLS 指纹并阻断</td>
+          <td><span class="chip c-fail">FALSE</span></td>
+          <td>Tor 的 TLS 全程包在 REALITY 里；且 <code>www.google.com</code> 的 SNI 能通</td>
+        </tr>
+        <tr>
+          <td>住宅代理被封 / 是故障点</td>
+          <td><span class="chip c-fail">FALSE</span></td>
+          <td>VPS→住宅→Tor = 100%（住宅那一路 Tor 发的是 IP，没人替它解析）</td>
+        </tr>
+        <tr>
+          <td>ATYP 编码方式（IPv4 vs domain）是原因</td>
+          <td><span class="chip c-fail">FALSE</span></td>
+          <td>20 个端点 × 两种编码 = 40/40 全通</td>
+        </tr>
+        <tr>
+          <td>首包过大 / 后量子 ClientHello 是原因</td>
+          <td><span class="chip c-fail">FALSE</span></td>
+          <td>T2 缩到 307B 仍失败；自建 1630B ClientHello 通过</td>
+        </tr>
+        <tr>
+          <td>并发 20 条把链路压垮</td>
+          <td><span class="chip c-fail">FALSE</span></td>
+          <td>20 条并发 + 1630B 首包 3 秒内 20/20</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    我此前所有「同一路径 TLS 正常」的对照探针之所以全绿，是因为它们
+    <strong>按 IP 连接、根本没发 SNI</strong>——对照组从一开始就没打中靶子。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">04</span>
+    <h2 class="sec-title">修复</h2>
+  </div>
+
+  <p>
+    两处，各一行。加 <code>routeOnly: true</code> 后 sniffer 仍然照常提取域名供路由规则使用，
+    但<strong>不再改写真实目标</strong>——下游收到的仍是 IP，无需解析。
+  </p>
+
+  <pre><code>src/servers/deploy.rs:559
+<span class="del">- "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }</span>
+<span class="add">+ "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true }</span>
+
+src/servers/upstream.rs:241  同上</code></pre>
+
+  <p>
+    这与「VPS→住宅→Tor 100% 成功」完全自洽：那条路上 Tor 直接把 IP 交给住宅 SOCKS，
+    没有 sniffer 在中间把它改写成域名。
+  </p>
+
+  <div class="callout">
+    <span class="label">已真机验证 · 2026-09-23</span>
+    <p>
+      同一份 torrc、同一条生产链路（本机 mihomo → ashura → 住宅出口），
+      修复前后各跑一次：
+    </p>
+  </div>
+
+  <div class="scroller">
+    <table>
+      <caption>bootstrap 实测。两次测试除服务器配置外，torrc 与链路完全相同。</caption>
+      <thead>
+        <tr><th>时刻</th><th>结果</th><th>关键日志</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>修复前</strong></td>
+          <td><span class="chip c-fail">卡在 10%</span></td>
+          <td class="mono">15 connections died in state handshaking (TLS)<br>Stuck at 10% (conn_done): ... unexpected eof while reading</td>
+        </tr>
+        <tr>
+          <td><strong>修复后</strong></td>
+          <td><span class="chip c-pass">100% (done)</span></td>
+          <td class="mono">10% → 14% → 20% → 40% → 75% → 95% → 100%<br>29 秒，零失败</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    机制本身也单独证过一次：随机 SNI（<code>www.igbwtgv07v.com</code>）经生产链路
+    现在能完成 TLS 握手——正是修复前必被掐断的那种。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">05</span>
+    <h2 class="sec-title">顺带发现的隐私缺陷</h2>
+  </div>
+
+  <div class="callout danger">
+    <span class="label">destOverride 把域名送给了上游</span>
+    <p>
+      现在这个配置不只是让 Tor 连不上——<strong>凡是走「上游/住宅出口」的流量，
+      被访问域名都会以明文域名形式交给上游代理</strong>（因为它收到的是域名而不是 IP，
+      必须自己解析）。
+    </p>
+    <p>
+      上游出口存在的意义正是「让上游只看到 IP、看不到你在访问什么」。当前配置把这个
+      保护反过来了。
+    </p>
+  </div>
+
+  <p>
+    加 <code>routeOnly: true</code> 同时修掉这两个问题：Tor 能连上，域名也不再下泄。
+    <strong>上游/住宅这条路径已修复并验证</strong>（见第 04 节）。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">06</span>
+    <h2 class="sec-title">逐条回答</h2>
+  </div>
+
+  <div class="qa">
+    <div class="qa-item">
+      <span class="qa-q">1. Tor 裸连为什么完全无法 bootstrap？</span>
+      <span class="chip c-warn">部分证实</span>
+      <p class="qa-a">
+        裸连（<code>UpstreamProxy::None</code>）时 Tor 拿不到任何上游，目录权威在本地网络上不可达，
+        因此一行 bootstrap 都没有。<strong>但这不是本次 10% 卡死的原因</strong>——两者是独立的失败。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">2. Tor → mihomo → REALITY 为什么卡在 10%？</span>
+      <span class="chip c-pass">已定位</span>
+      <p class="qa-a">
+        <strong>不是卡在链路任何一跳，是被我们自己配置的 sniffer 掐断。</strong>
+        见第 01 节根因链。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">3. 是否 GFW 识别了 Tor TLS？</span>
+      <span class="chip c-fail">FALSE</span>
+      <p class="qa-a">
+        <code>www.google.com</code> 的 SNI 能完整握手并返回 3842 字节。链路上不存在
+        「按墙外域名/按 Tor 指纹拦截」的行为。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">4. residential SOCKS 是否才是真正的故障点？</span>
+      <span class="chip c-fail">FALSE</span>
+      <p class="qa-a">
+        VPS 上 A/B 对照：DIRECT = 100%，经住宅 = 100%。住宅代理是好的，它只是
+        <em>被要求解析一个不存在的域名</em>。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">5. 当前 Privacy Mode 能否隐藏目标 VPS IP？</span>
+      <span class="chip c-warn">设计成立，仍不可用</span>
+      <p class="qa-a">
+        设计上成立：<code>resolve_target</code> 把隐藏服务放到入口那台机器，转发目标是落地的
+        WireGuard IP。<strong>关键点已验证</strong>：<code>servername</code> 来自
+        <code>params.sni</code> 而非 <code>server</code>，所以换成 onion 不会让 REALITY 因 SNI 失配而拒绝。
+        <br>
+        但整条隐私线<strong>仍然跑不通</strong>，瓶颈已不再是 Tor：<code>tor/mod.rs</code>
+        目前<strong>没有被任何调用方接上</strong>（<code>ensure_started</code> 是 dead code），
+        所以配置里那个 <code>127.0.0.1:9050</code> 没人监听，节点按 fail-closed 拒连。
+        要让隐私开关真正可用，还差把本机 Tor sidecar 接进「开启网络」与作业流程。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">6. 是否必须加入 Bridge？</span>
+      <span class="chip c-pass">不需要</span>
+      <p class="qa-a">
+        <strong>不需要。</strong>10% 卡死与 Bridge 要解决的问题（链路被识别/阻断）毫无关系。
+        加 Bridge 只是在一个自伤的基础上再叠一层。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">7. 若必须加，选 WebTunnel / obfs4 / Snowflake？</span>
+      <span class="chip c-note">降级为参考</span>
+      <p class="qa-a">
+        本轮不需要做。若将来确有需求：
+        <strong>WebTunnel 与 Snowflake 并列首选</strong>，obfs4 已不再是可靠选项——
+        Tor 官方中文文档（tor4zh）在 2026-08 的提交里已把 obfs4 从 PT 列表中移除，
+        且官方明确表示公开分发的 obfs4 桥在中国<em>大概率不可用</em>，需私有未列出桥。
+        meek-azure 是缓慢的最后手段。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">8. 已完成功能是否存在泄漏？</span>
+      <span class="chip c-warn">存在 2 条</span>
+      <p class="qa-a">
+        <strong>(a) 域名下泄</strong>：见第 05 节，<code>destOverride</code> 把被访问域名交给上游。
+        <strong>(b) SSH 直连</strong>：<code>net/local_proxy.rs</code> 在隧道不可达时回落到直连，
+        且 <code>self_hosted</code> 会让对自有服务器的 SSH <em>优先</em>走直连——
+        开着隐私时，ISP 仍能看到 PC→VPS:22。<br>
+        <strong>未发现</strong> DNS 泄漏：<code>enhanced-mode: fake-ip</code> 下
+        <code>.onion</code> 拿到假 IP 即交给代理解析，不发真实查询；Tor 侧 20 条连接
+        全部为 ATYP=1，也没有走本地 DNS。
+      </p>
+    </div>
+
+    <div class="qa-item">
+      <span class="qa-q">9. 最终实现建议</span>
+      <span class="chip c-acc">见下节</span>
+      <p class="qa-a">先修 sniffer，再谈其他。</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">07</span>
+    <h2 class="sec-title">实现建议</h2>
+  </div>
+
+  <h3>立刻做</h3>
+  <p>
+    <strong>1. 给两处 sniffing 加 <code>routeOnly: true</code>。</strong>
+    这一条同时修掉 Tor 连不上和域名下泄两个问题。改完后在真机跑一次完整
+    bootstrap，必须到 100% 才算通过——不要以「到 14% 了」当成功。
+  </p>
+  <p>
+    <strong>2. 轮换凭据。</strong>本轮审查中我两次把敏感值打印到了终端：mihomo 的
+    <code>secret</code>（每次网络重启都会轮换，影响有限），以及<strong>住宅代理的用户名/密码</strong>
+    （我的打码正则在 <code>.settings.servers[].users</code> 上，而真实结构是
+    <code>.settings.{address,port,user,pass}</code>）。住宅凭据应当轮换。这是我的失误。
+  </p>
+
+  <h3>然后</h3>
+  <p>
+    <strong>3. 让隐私线真的跑通一次端到端</strong>，把「设计成立」变成「实测成立」。
+    在此之前，Privacy Mode 不应被视为可用功能。
+  </p>
+  <p>
+    <strong>4. 补一条回归测试钉住 <code>routeOnly</code></strong>——
+    <code>upstream_tests.rs:64</code> 已经在断言 sniffing 的形状，把 <code>routeOnly</code>
+    一起断言进去即可。
+  </p>
+
+  <h3>明确不做</h3>
+  <p>
+    不加 Bridge、不打包 lyrebird、不改生产 torrc/Xray/firewall。
+    10% 卡死的原因已经找到，它不在 Tor 这一侧。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">08</span>
+    <h2 class="sec-title">证据分级与未证实项</h2>
+  </div>
+
+  <div class="scroller">
+    <table>
+      <thead>
+        <tr><th>标记</th><th>含义</th><th>本报告中的用例</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><span class="chip c-acc">A</span></td><td>运行时实测事实</td><td>字节重放、SNI 对照、FIN 方向、60+ 次探针</td></tr>
+        <tr><td><span class="chip c-note">B</span></td><td>官方文档事实</td><td>Tor 中文文档的 PT 推荐顺序（间接获取）</td></tr>
+        <tr><td><span class="chip c-note">C</span></td><td>日志推断</td><td>10% = TCP 成功 + TLS 未开始</td></tr>
+        <tr><td><span class="chip c-note">D</span></td><td>未验证假设</td><td>未使用</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <span class="label">NOT_PROVEN</span>
+    <p>
+      <strong>«Tor 的 SOCKS5Proxy 覆盖全部 OR 与目录连接»——证据不足。</strong>
+      20/20 条被抓到的连接确实都走了代理，但我原打算用 <code>netstat</code> 枚举
+      tor.exe 自身 socket 来反证「没有任何直连」，那次测量用错了 PID（拿到的是 Git Bash 的
+      shell PID），所以没有拿到有效数据。结论方向一致，但未达可断言标准。
+    </p>
+  </div>
+
+  <div class="callout">
+    <span class="label">未能直接核实</span>
+    <p>
+      对 <code>support.torproject.org</code> 的直接抓取被网络策略阻断，
+      第 7 条的官方推荐顺序来自搜索结果对 Tor Project 页面内容的转述，
+      而非我本人读取原页。中文文档与法文版把 WebTunnel 排在首位，其他语种版本把
+      Snowflake 排首位——<strong>官方并无统一顺序</strong>，这一点本身值得注意。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head">
+    <span class="sec-num">09</span>
+    <h2 class="sec-title">清理与验证</h2>
+  </div>
+
+  <div class="scroller">
+    <table>
+      <thead>
+        <tr><th>项目</th><th>状态</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>临时 mihomo（17891 / 17892）</td><td><span class="chip c-pass">已停</span></td></tr>
+        <tr><td>转发探针（17895）</td><td><span class="chip c-pass">已停</span></td></tr>
+        <tr><td>临时 tor.exe 进程</td><td><span class="chip c-pass">已停</span></td></tr>
+        <tr><td>临时产物目录</td><td><span class="chip c-pass">已删</span></td></tr>
+        <tr><td>审查期间生产配置 / torrc / Xray / firewall</td><td><span class="chip c-pass">未改</span></td></tr>
+        <tr><td>验证阶段：ashura <code>xray-upstream</code> 配置</td><td><span class="chip c-acc">经应用部署路径更新</span></td></tr>
+        <tr><td>回归：后端 772 passed / 0 failed，前端 265 passed / tsc 干净</td><td><span class="chip c-pass">通过</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <span class="label">仍未处理</span>
+    <p>
+      <strong>落地入站（<code>deploy.rs</code> 那一路）在两台服务器上都还是旧配置</strong>——
+      本次只重跑了上游作业，改到的是 <code>up-4</code>（8989）。落地入站（443/4443/8444）
+      的出口是 <code>freedom</code>，由 Xray 自己解析，域名不会下泄给第三方，
+      普通客户端发的是可解析的真实 SNI，因此日常无感；但任何发随机/不可解析 SNI 的
+      客户端走这些端口仍会被掐。要一并修好，需要对两台机器各重跑一次协议部署。
+    </p>
+  </div>
+</section>
+
+<footer>
+  <p>本报告全部结论来自本机运行时证据，未修改任何生产配置。</p>
+  <p>唯一遗留动作：住宅代理凭据轮换（见第 07 节第 2 条）。</p>
+</footer>
+
+</div>

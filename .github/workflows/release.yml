@@ -1,0 +1,114 @@
+# 发布流水线（P8/P8.1）：仅 master 分支可手动触发，构建签名安装包并发布到
+# 公开发布仓库 vpn-ctl-releases（主仓库私有，私有资产匿名 404，更新分发必须走公开仓库）。
+# 流程：写入版本号到 tauri.conf.json → fetch:sidecar → tauri build
+# （TAURI_SIGNING_PRIVATE_KEY 注入，minisign 为各产物生成 .sig）→ tauri-action 在
+# vpn-ctl-releases 创建 Release（tag v<版本号>）并上传安装包与 .sig →
+# 自动生成并上传 latest.json 更新清单（RELEASES_TOKEN 为跨仓库 fine-grained PAT）。
+# 签名公钥已在 src-tauri/tauri.conf.json plugins.updater.pubkey，流水线无需重复配置。
+# 详见 docs/superpowers/specs/2026-08-14-vpn-ctl-p8-brand-updater-design.md。
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 发布版本号（与 CHANGELOG 版本节一致，写入 tauri.conf.json 并打 tag v<版本号>）
+        required: true
+        default: '0.2.1'
+        type: string
+
+jobs:
+  release:
+    runs-on: windows-latest
+    # 发布门禁：仅 master 分支可发布；其他分支手动触发时本 job 直接跳过
+    if: github.ref == 'refs/heads/master'
+    # tauri-action 需要创建 Release 与上传资产的权限
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # beforeBuildCommand（tsc + vite）需要依赖就绪
+      - name: 安装前端依赖
+        run: npm ci
+
+      # 版本号写入本地 tauri.conf.json（只影响本次构建产物，不提交回仓库）；
+      # node 读写 JSON 跨平台稳定；先做格式校验，非法版本第一步即失败，避免打出垃圾 tag。
+      # 注意 package.json 为 "type": "module"，必须显式 --input-type=commonjs。
+      - name: 写入版本号到 tauri.conf.json
+        shell: bash
+        run: |
+          node --input-type=commonjs -e '
+          const fs = require("fs");
+          const v = process.argv[1];
+          if (!/^\d+\.\d+\.\d+$/.test(v)) { console.error("版本号格式非法: " + v); process.exit(1); }
+          const p = "src-tauri/tauri.conf.json";
+          const c = JSON.parse(fs.readFileSync(p, "utf8"));
+          c.version = v;
+          fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
+          ' "${{ inputs.version }}"
+
+      # mihomo sidecar：tauri-build 校验 bundle.resources 存在性，cargo 命令必须先行落盘（同 CI）
+      - name: 获取 mihomo sidecar
+        run: npm run fetch:sidecar
+
+      # 从 CHANGELOG.md 提取本版本节（## [0.x.y] - 日期 至下一个 ##）作为发布说明：
+      # tauri-action 的 uploadVersionJSON 以 releaseBody 为 latest.json 的 notes，
+      # 因此 Release 正文与更新清单 notes 共用同一份 CHANGELOG 节，单一事实源。
+      - name: 提取 CHANGELOG 发布说明
+        id: changelog
+        shell: bash
+        run: |
+          body=$(node --input-type=commonjs -e '
+          const fs = require("fs");
+          const v = process.argv[1];
+          const t = fs.readFileSync("CHANGELOG.md", "utf8");
+          const sec = t.split(/^## /m).find((p) => p.startsWith("[" + v + "]"));
+          if (!sec) { console.error("CHANGELOG.md 缺少版本节: [" + v + "]"); process.exit(1); }
+          process.stdout.write(sec.slice(sec.indexOf("\n") + 1).trim() + "\n");
+          ' "${{ inputs.version }}")
+          {
+            printf '%s\n' "body<<CHANGELOG_BODY_EOF"
+            printf '%s\n' "$body"
+            printf '%s\n' "CHANGELOG_BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 构建并发布：
+      # - TAURI_SIGNING_PRIVATE_KEY（GitHub Secrets，不入仓库）注入 tauri build，
+      #   createUpdaterArtifacts 为 NSIS/MSI 各生成 .sig，随产物一并上传
+      # - includeUpdaterJson（tauri-action 默认即 true，此处显式声明）：读取构建产物
+      #   .sig 生成 latest.json（{version, notes, pub_date, platforms}，含
+      #   windows-x86_64 主键与 -msi/-nsis 变体键）并作为 release asset 上传，
+      #   客户端经 releases/latest/download/latest.json 拉取
+      # - releaseDraft 保持 false：draft release 无法经 /releases/latest/ 访问，会破坏更新端点
+      # - owner/repo 指向公开发布仓库 vpn-ctl-releases：主仓库私有，其 Release 资产
+      #   对匿名请求返回 404（GitHub 私有资产不开放匿名下载），自动更新必须走公开仓库；
+      #   GITHUB_TOKEN 仅限当前仓库，跨仓库发布须用 fine-grained PAT（RELEASES_TOKEN，
+      #   仅授权 vpn-ctl-releases 的 Contents: write）
+      - name: 构建并发布（tauri-action → 公开 releases 仓库）
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          owner: cnmlgbdrnm-prog
+          repo: vpn-ctl-releases
+          # 跨仓库发布必须显式指定公开仓库的 commitish：workflow_dispatch 时
+          # context.sha 是私有主仓库的 SHA，公开仓库无此对象，tag 创建会 422
+          releaseCommitish: main
+          tagName: v${{ inputs.version }}
+          releaseName: v${{ inputs.version }}
+          releaseBody: ${{ steps.changelog.outputs.body }}
+          releaseDraft: false
+          includeUpdaterJson: true
