@@ -549,9 +549,72 @@ pub struct XrayInboundEntry {
     pub ws_path: String,
 }
 
+/// 服务器出站地址族。集中映射三种协议各自控制“解析/建连优先哪一族”的写法，
+/// 避免在三个生成函数里散落字符串字面量。
+///
+/// 语义差异（必须如实反映到 UI/文档）：
+/// - Xray：`UseIPv4`/`UseIPv6` 对**域名目标**是严格的；
+/// - shadowsocks：只能“优先”，无 AAAA/A 时仍会回落另一族；
+/// - sing-box：1.12 起用出站 `domain_resolver`，更早版本用 `domain_strategy`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressFamily {
+    V4,
+    V6,
+}
+
+impl EgressFamily {
+    /// 从数据库值解析：只认 `"v6"`，其余（含历史空串/脏值）一律按默认 v4，
+    /// 保证坏数据不会让已部署服务在重部署时突然换族。
+    pub fn from_db(s: &str) -> Self {
+        if s == "v6" {
+            Self::V6
+        } else {
+            Self::V4
+        }
+    }
+
+    pub fn xray_domain_strategy(self) -> &'static str {
+        match self {
+            Self::V4 => "UseIPv4",
+            Self::V6 => "UseIPv6",
+        }
+    }
+
+    pub fn singbox_strategy(self) -> &'static str {
+        match self {
+            Self::V4 => "ipv4_only",
+            Self::V6 => "ipv6_only",
+        }
+    }
+
+    pub fn ss_ipv6_first(self) -> bool {
+        matches!(self, Self::V6)
+    }
+}
+
+/// 从 `sing-box version 1.x.y...` 解析主/次版本；无法识别返回 None。
+/// None 在生成配置时按 <1.12 的旧写法处理，避免写出旧版不认识的字段把服务打挂。
+pub fn parse_singbox_version(stdout: &str) -> Option<(u32, u32)> {
+    let line = stdout.lines().next()?.trim();
+    let rest = line.strip_prefix("sing-box version ")?;
+    let mut parts = rest.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    // 次版本可能是 "14" 或 "14-rc1"/"14.0-beta"，取前导数字
+    let minor_raw = parts.next()?;
+    let minor_digits: String = minor_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let minor: u32 = minor_digits.parse().ok()?;
+    Some((major, minor))
+}
+
 /// Xray 单进程多入站配置:vless/trojan 走 Reality(tcp),vmess 走 WS(明文 /ray,
 /// 证书体系属后续范围)。金样见 deploy_tests::xray_multi_inbounds_includes_three_protocols。
-pub fn xray_config_json_multi(entries: &[XrayInboundEntry]) -> String {
+///
+/// `egress` 决定 freedom 出站解析域名时限定哪个地址族。只影响 **VPS → 目标域名**；
+/// 客户端发来的字面 IP、客户端侧 DNS/分流都不受它控制。
+pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily) -> String {
     let inbounds: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
@@ -614,10 +677,11 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry]) -> String {
         .collect();
     serde_json::json!({
         "inbounds": inbounds,
-        // 出口钉死 IPv4。默认的 AsIs 把域名交给 Go 的解析器，按 RFC 6724
-        // **优先 IPv6**，而 Google 对机房 IPv6 段的地理判定是坏的：同一个出口 IP，
-        // v6 出去报「Gemini 不支持你所在的地区」，v4 出去正常（2026-09-20 实测，
-        // 并有多例社区同证）。
+        // 出口地址族由服务器行的 egress_family 决定（默认 v4）。默认的 AsIs 把域名
+        // 交给 Go 的解析器，按 RFC 6724 **优先 IPv6**，而 Google 对机房 IPv6 段的
+        // 地理判定是坏的：同一个出口 IP，v6 出去报「Gemini 不支持你所在的地区」，
+        // v4 出去正常（2026-09-20 实测，并有多例社区同证）——所以默认钉 IPv4，
+        // 只有用户显式选择 v6 才写 UseIPv6。对域名目标是严格的；字面 IP 目标不受影响。
         //
         // domainStrategy 必须写在 settings 里：写出站顶层会被 Xray 忽略而**静默失效**。
         // 非 AsIs 会让下游 sockopt 的 domainStrategy/happyEyeballs 失效——这里要的
@@ -625,20 +689,24 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry]) -> String {
         "outbounds": [{
             "protocol": "freedom",
             "tag": "direct",
-            "settings": { "domainStrategy": "UseIPv4" }
+            "settings": { "domainStrategy": egress.xray_domain_strategy() }
         }]
     })
     .to_string()
 }
 
 /// SS 服务端配置（2022-blake3-aes-256-gcm）。
-pub fn ss_config_json(port: u16, password_b64: &str) -> String {
+///
+/// 出口族只能**尽力而为**：`ipv6_first` 仅把 IPv6 排在 DNS 结果的 IPv4 前面，
+/// DNS 没有 AAAA 时仍会回落 IPv4；shadowsocks-rust 没有「只允许某族」的开关。
+pub fn ss_config_json(port: u16, password_b64: &str, egress: EgressFamily) -> String {
     serde_json::json!({
         "servers": [{
             "server": "0.0.0.0", "server_port": port,
             "method": "2022-blake3-aes-256-gcm", "password": password_b64, "mode": "tcp_and_udp"
         }],
-        "locals": []
+        "locals": [],
+        "ipv6_first": egress.ss_ipv6_first()
     })
     .to_string()
 }
@@ -686,7 +754,12 @@ pub fn singbox_cert_cmd() -> String {
 /// 注意：sing-box 两个入站**强制要求显式 tls 块**（无 certificate 直接 FATAL
 /// “TLS required”，实测 h2/tuic 部署失败 exit=3）。部署器先幂等生成自签证书
 /// （/etc/sing-box/self.crt/key），客户端 skip-cert-verify 跳过校验。
-pub fn singbox_config_json(hy2: Option<(u16, &str)>, tuic: Option<(u16, &str, &str)>) -> String {
+pub fn singbox_config_json(
+    hy2: Option<(u16, &str)>,
+    tuic: Option<(u16, &str, &str)>,
+    egress: EgressFamily,
+    version: Option<(u32, u32)>,
+) -> String {
     let mut inbounds = Vec::new();
     if let Some((port, pw)) = hy2 {
         inbounds.push(serde_json::json!({
@@ -710,11 +783,38 @@ pub fn singbox_config_json(hy2: Option<(u16, &str)>, tuic: Option<(u16, &str, &s
             "users": [{ "uuid": uuid, "password": pw }]
         }));
     }
-    serde_json::json!({
+    // 出口族写法按版本分支：
+    // - >=1.12：出站 domain_resolver 指向 dns.servers 里的 local 解析器；
+    // - <1.12：出站 domain_strategy 旧写法；
+    // - 探测失败（None）：**两个都不写**，保持 sing-box 默认行为。
+    //
+    // 最后一条是 2026-10-18 在真实 1.13.20 上用 `sing-box check` 实测修正的：
+    // 新版对 domain_strategy 不是「警告」而是 **FATAL**（要求设置
+    // ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS 才继续）。原先「探测失败
+    // 按旧版处理」会把正在运行的服务打挂——比出口不生效严重得多。探测失败时省略
+    // 整个出口字段，旧版与新版都能加载；本次切换不生效，由调用方在进度里说明。
+    let outbound = match version {
+        Some((major, minor)) if (major, minor) >= (1, 12) => serde_json::json!({
+            "type": "direct",
+            "domain_resolver": { "server": "egress", "strategy": egress.singbox_strategy() }
+        }),
+        Some(_) => serde_json::json!({
+            "type": "direct",
+            "domain_strategy": egress.singbox_strategy()
+        }),
+        None => serde_json::json!({ "type": "direct" }),
+    };
+    let mut root = serde_json::json!({
         "inbounds": inbounds,
-        "outbounds": [{ "type": "direct" }]
-    })
-    .to_string()
+        "outbounds": [outbound]
+    });
+    if version.is_some_and(|(major, minor)| (major, minor) >= (1, 12)) {
+        // 新版 DNS 格式：local 类型解析器按出站策略选族
+        root["dns"] = serde_json::json!({
+            "servers": [{ "type": "local", "tag": "egress" }]
+        });
+    }
+    root.to_string()
 }
 
 /// sing-box 的 systemd unit（工具自写）。

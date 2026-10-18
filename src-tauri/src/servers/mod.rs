@@ -6,8 +6,10 @@
 pub mod channels;
 pub mod deploy;
 pub mod deploy_spec;
+pub mod ipv6_detect;
 pub mod privacy;
 pub mod reality_dest;
+pub mod remote_file;
 pub mod upstream;
 
 use crate::crypto::CredentialService;
@@ -55,10 +57,19 @@ pub fn clean_text(s: &str) -> String {
         .to_string()
 }
 
+/// IPv6 输入净化：去零宽字符/首尾空白，并容忍用户粘贴 `[addr]` 形式。
+/// 数据库只存裸字面量；显示与 URL 拼接时再按需加方括号。
+fn clean_host_v6(s: &str) -> String {
+    clean_text(s)
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_string()
+}
+
 /// 校验输入并返回规整后的 Server 行（不含 id/created_at 的派生字段）。
 fn validate_fields(
     name: &str,
     host: &str,
+    host_v6: &str,
     port: i64,
     user: &str,
     auth_kind: &str,
@@ -69,6 +80,11 @@ fn validate_fields(
     }
     if host.trim().is_empty() {
         return Err(ServersError::Validation("主机地址不能为空".into()));
+    }
+    if !host_v6.is_empty() && host_v6.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(ServersError::Validation(
+            "IPv6 地址格式不正确（只填字面量，不要带方括号）".into(),
+        ));
     }
     if !(1..=65535).contains(&port) {
         return Err(ServersError::Validation("端口必须在 1-65535".into()));
@@ -150,10 +166,12 @@ pub fn create_server(state: &AppState, input: CreateServerInput) -> Result<Serve
     // 输入净化：首尾空白与零宽字符（粘贴/输入法常见）会导致 DNS 解析与 SSH 认证静默失败，入库前统一去除
     let name = clean_text(&input.name);
     let host = clean_text(&input.host);
+    let host_v6 = clean_host_v6(&input.host_v6);
     let user = clean_text(&input.user);
     validate_fields(
         &name,
         &host,
+        &host_v6,
         input.port,
         &user,
         &input.auth_kind,
@@ -171,6 +189,9 @@ pub fn create_server(state: &AppState, input: CreateServerInput) -> Result<Serve
         id: 0,
         name,
         host,
+        host_v6,
+        addr_family: "v4".into(),
+        egress_family: "v4".into(),
         port: input.port,
         user,
         auth_kind: input.auth_kind.clone(),
@@ -198,14 +219,30 @@ pub fn create_server(state: &AppState, input: CreateServerInput) -> Result<Serve
     Ok(Server { id, ..row })
 }
 
+/// 服务器生效地址变化时，把该机名下自建直连节点的 `addr` 一起改。
+/// 只动 `relay_rule_id IS NULL` 的行：中转节点的 `addr` 是入口地址，不能跟着落地机变；
+/// 它们的 `params_json.direct.addr` 由拆链逻辑管理，不在这里改。
+pub(crate) fn sync_nodes_addr(
+    conn: &rusqlite::Connection,
+    old: &str,
+    new: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE nodes SET addr=?2 WHERE addr=?1 AND source='self-built' AND relay_rule_id IS NULL",
+        rusqlite::params![old, new],
+    )
+}
+
 pub fn update_server(state: &AppState, input: UpdateServerInput) -> Result<Server, ServersError> {
     // 同 create_server：首尾空白与零宽字符入库前去除，避免历史行被编辑时重新带入
     let name = clean_text(&input.name);
     let host = clean_text(&input.host);
+    let host_v6 = clean_host_v6(&input.host_v6);
     let user = clean_text(&input.user);
     validate_fields(
         &name,
         &host,
+        &host_v6,
         input.port,
         &user,
         &input.auth_kind,
@@ -221,10 +258,34 @@ pub fn update_server(state: &AppState, input: UpdateServerInput) -> Result<Serve
             "切换认证方式时需提供新凭据".into(),
         ));
     }
+    // 清除 IPv6 登记时不能继续停在 v6：生效地址必须回落到 host。
+    // 用户只改 IPv6 字段、不动族别时，保留当前选择。
+    let addr_family = if host_v6.is_empty() {
+        "v4".to_string()
+    } else {
+        existing.addr_family.clone()
+    };
+    // 出口族与入口族完全独立：这里只决定 VPS→目标域名怎么出站，绝不改 addr_family。
+    // None = 保留原值（其它调用方不必关心这个字段）。
+    let egress_family = match input.egress_family {
+        Some(v) => {
+            if v != "v4" && v != "v6" {
+                return Err(ServersError::Validation("出站地址族必须是 v4 或 v6".into()));
+            }
+            v
+        }
+        None => existing.egress_family.clone(),
+    };
+    // 生效地址可能因这次编辑改变（改 host / host_v6 / 清空 host_v6）：节点必须一起跟。
+    // 必须在把 existing 的字段搬进 row 之前算——否则 last_check_error 已被移走，借用失败。
+    let old_effective = crate::domain::effective_host(&existing).to_string();
     let row = Server {
         id: input.id,
         name,
         host,
+        host_v6,
+        addr_family,
+        egress_family,
         port: input.port,
         user,
         auth_kind: input.auth_kind,
@@ -238,8 +299,10 @@ pub fn update_server(state: &AppState, input: UpdateServerInput) -> Result<Serve
         last_checked_at: existing.last_checked_at,
         last_check_error: existing.last_check_error,
     };
-    match &input.credential {
-        None => repos::servers::update(&conn, &row).map_err(|e| ServersError::Db(e.to_string()))?,
+    let new_effective = crate::domain::effective_host(&row).to_string();
+    // 凭据密文与数据库事务无关，先算好；事务里只做数据库写。
+    let new_cred = match &input.credential {
+        None => None,
         Some(text) => {
             if text.trim().is_empty() {
                 return Err(ServersError::Validation("凭据不能为空".into()));
@@ -249,27 +312,38 @@ pub fn update_server(state: &AppState, input: UpdateServerInput) -> Result<Serve
             } else {
                 AuthMaterial::PrivateKey(text.clone())
             };
-            let (cred_id, b64) = seal_to_b64(&state.creds, &material)?;
-            let old_ref = repos::servers::get_auth_ref(&conn, input.id)
-                .map_err(|e| ServersError::Db(e.to_string()))?
-                .unwrap_or_default();
-            // 换凭据：新凭据行与 auth_ref 切换、旧凭据行删除同事务
-            let tx = conn
-                .transaction()
-                .map_err(|e| ServersError::Db(e.to_string()))?;
-            repos::credentials::insert(&tx, &cred_id, &b64)
-                .map_err(|e| ServersError::Db(e.to_string()))?;
-            tx.execute(
-                "UPDATE servers SET auth_ref=?2 WHERE id=?1",
-                rusqlite::params![input.id, &cred_id],
-            )
-            .map_err(|e| ServersError::Db(e.to_string()))?;
-            repos::servers::update(&tx, &row).map_err(|e| ServersError::Db(e.to_string()))?;
-            repos::credentials::delete(&tx, &old_ref)
-                .map_err(|e| ServersError::Db(e.to_string()))?;
-            tx.commit().map_err(|e| ServersError::Db(e.to_string()))?;
+            Some(seal_to_b64(&state.creds, &material)?)
         }
+    };
+    let old_ref = if new_cred.is_some() {
+        repos::servers::get_auth_ref(&conn, input.id)
+            .map_err(|e| ServersError::Db(e.to_string()))?
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // 服务器行、节点地址与凭据切换同事务：任何一步失败都不会留下「服务器切了、节点没切」
+    let tx = conn
+        .transaction()
+        .map_err(|e| ServersError::Db(e.to_string()))?;
+    if let Some((cred_id, b64)) = &new_cred {
+        repos::credentials::insert(&tx, cred_id, b64)
+            .map_err(|e| ServersError::Db(e.to_string()))?;
+        tx.execute(
+            "UPDATE servers SET auth_ref=?2 WHERE id=?1",
+            rusqlite::params![input.id, cred_id],
+        )
+        .map_err(|e| ServersError::Db(e.to_string()))?;
     }
+    repos::servers::update(&tx, &row).map_err(|e| ServersError::Db(e.to_string()))?;
+    if old_effective != new_effective {
+        sync_nodes_addr(&tx, &old_effective, &new_effective)
+            .map_err(|e| ServersError::Db(e.to_string()))?;
+    }
+    if new_cred.is_some() {
+        repos::credentials::delete(&tx, &old_ref).map_err(|e| ServersError::Db(e.to_string()))?;
+    }
+    tx.commit().map_err(|e| ServersError::Db(e.to_string()))?;
     Ok(row)
 }
 
@@ -306,8 +380,9 @@ pub fn delete_server(state: &AppState, id: i64) -> Result<(), ServersError> {
 
 pub async fn test_connection(state: &AppState, id: i64) -> Result<ConnectionTest, ServersError> {
     let (auth, s) = load_auth(state, id)?;
+    let host = crate::domain::effective_host(&s).to_string();
     let mut sess =
-        match SshSession::connect(&s.host, s.port as u16, &s.user, &auth, CONNECT_TIMEOUT).await {
+        match SshSession::connect(&host, s.port as u16, &s.user, &auth, CONNECT_TIMEOUT).await {
             Ok(sess) => sess,
             Err(e) => {
                 // 连接/认证失败属于"不可达"而非错误：转成可展示的脱敏结果
@@ -536,15 +611,16 @@ pub async fn setup_passwordless(state: &AppState, id: i64) -> Result<(), Servers
             })
         })?
         .to_string();
+    let host = crate::domain::effective_host(&s).to_string();
     let mut sess =
-        SshSession::connect(&s.host, s.port as u16, &s.user, &auth, CONNECT_TIMEOUT).await?;
+        SshSession::connect(&host, s.port as u16, &s.user, &auth, CONNECT_TIMEOUT).await?;
     sess.run_ok("免密", "mkdir -p ~/.ssh && chmod 700 ~/.ssh", PROBE_TIMEOUT)
         .await?;
     sess.run_ok("免密", &append_pub_line(&pub_line), PROBE_TIMEOUT)
         .await?;
     // 验证公钥登录可用后（避免密钥未生效就切库导致失联）再切换
     let mut verify = SshSession::connect(
-        &s.host,
+        &host,
         s.port as u16,
         &s.user,
         &AuthMaterial::PrivateKey(pem.clone()),

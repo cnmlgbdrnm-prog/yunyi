@@ -6,7 +6,7 @@ use crate::domain::{
     AdoptLinkInput, BuildLinkInput, Channel, ChannelStatus, ConnectionTest, CreateServerInput,
     DeployInput, DevicePeer, Job, LinkBuildReq, LinkStatus, LinkTeardownReq, Node, Privacy,
     ProbeResult, RelayRule, Server, ServerSpeedReq, SpeedTestReq, Subscription, ThroughputReq,
-    ThroughputTest, UpdateServerInput, Upstream,
+    ThroughputTest, UpdateServerInput, UpdateServerResult, Upstream,
 };
 use crate::relay;
 use crate::serve;
@@ -535,8 +535,142 @@ pub fn create_server(state: Arc<AppState>, input: CreateServerInput) -> R<Server
     servers::create_server(&state, input).map_err(err)
 }
 
-pub fn update_server(state: Arc<AppState>, input: UpdateServerInput) -> R<Server> {
-    servers::update_server(&state, input).map_err(err)
+/// 更新服务器。出口地址族（`egress_family`）变化且该机已有部署协议时，
+/// 保存成功后**自动排一次重部署**——出口值是写进 VPS 侧配置的，不重部署就只是
+/// 改了库里的一个数字，用户看到的仍是旧出口。
+///
+/// 失败语义：保存成功即成功，部署只是后续动作，提交失败放进 `deploy_error`
+/// 由界面提示，绝不为了一次没排上的部署把用户刚改的资料回滚。
+///
+/// 不用 `install_supplement`：它要求「现有协议 ∪ 勾选协议」产生新增，纯出口
+/// 变更（协议集合不变）会被它以 `merged == existing` 拒绝。
+pub fn update_server(state: Arc<AppState>, input: UpdateServerInput) -> R<UpdateServerResult> {
+    // 必须先读旧值：保存之后库里已是新值，再读就判断不出「出口是否变化」。
+    let old_egress = {
+        let conn = state.db.lock();
+        repos::servers::get(&conn, input.id)
+            .map_err(err)?
+            .ok_or_else(|| AppError::NotFound("服务器不存在".into()))?
+            .egress_family
+    };
+    let server = servers::update_server(&state, input).map_err(err)?;
+    let mut deploy_job_id = None;
+    let mut deploy_error = None;
+    if server.egress_family != old_egress {
+        // 未部署过任何协议时不需要重部署：新值会在首次部署时自然写进配置。
+        match servers::deploy::deployed_protocols(&state, server.id) {
+            Ok(protocols) if !protocols.is_empty() => {
+                let submitted = start_deploy(
+                    state.clone(),
+                    DeployInput {
+                        server_id: server.id,
+                        protocols,
+                        // None = 让 deploy 从既有节点保留用户自定义的 REALITY
+                        // 伪装域名，而不是回落默认值。
+                        reality_dest: None,
+                        enable_bbr: None,
+                    },
+                );
+                match submitted {
+                    Ok(job_id) => deploy_job_id = Some(job_id),
+                    Err(e) => deploy_error = Some(e.to_string()),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => deploy_error = Some(e),
+        }
+    }
+    Ok(UpdateServerResult {
+        server,
+        deploy_job_id,
+        deploy_error,
+    })
+}
+
+/// 切换服务器地址族。整台服务器语义：SSH/测速管理地址与该机所有自建直连节点
+/// 的 `addr` 在同一事务内一起切；中转节点的 `addr` 是入口地址，不在此列。
+/// 切换后立即重建并下发配置，正在运行的上网客户端不用手动重连。
+///
+/// 首次切到 v6 且没有登记地址时自动探测（SSH 走原始 `host`）。探测最长要
+/// 连接+命令两个超时，绝不能持数据库锁等待，所以先探测、后开事务。
+pub async fn set_server_addr_family(state: Arc<AppState>, id: i64, family: String) -> R<Server> {
+    if !matches!(family.as_str(), "v4" | "v6") {
+        return Err(AppError::Validation("地址族只能是 v4 或 v6".into()));
+    }
+    let detected = if family == "v6" {
+        let missing = {
+            let conn = state.db.lock();
+            repos::servers::get(&conn, id)
+                .map_err(err)?
+                .ok_or_else(|| AppError::NotFound("服务器不存在".into()))?
+                .host_v6
+                .is_empty()
+        };
+        if missing {
+            let found = crate::servers::ipv6_detect::detect_ipv6_addresses(&state, id)
+                .await
+                .map_err(|e| {
+                    AppError::Validation(format!(
+                        "自动探测 IPv6 失败：{e}；可在「编辑」里手动填写 IPv6 地址"
+                    ))
+                })?;
+            Some(
+                found
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| AppError::Validation("服务器上没有发现全局 IPv6 地址".into()))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let updated = {
+        let mut conn = state.db.lock();
+        let s = repos::servers::get(&conn, id)
+            .map_err(err)?
+            .ok_or_else(|| AppError::NotFound("服务器不存在".into()))?;
+        let host_v6 = detected.unwrap_or_else(|| s.host_v6.clone());
+        if family == "v6" && host_v6.is_empty() {
+            return Err(AppError::Validation(
+                "这台服务器还没有登记 IPv6 地址".into(),
+            ));
+        }
+        let old = crate::domain::effective_host(&s).to_string();
+        let new = if family == "v6" {
+            host_v6.clone()
+        } else {
+            s.host.clone()
+        };
+        // 已是目标族且生效地址没变 → 不必重建；刚探测到的地址与已登记值相同时同理
+        if s.addr_family == family && old == new {
+            return Ok(s);
+        }
+        let tx = conn.transaction().map_err(err)?;
+        // 探测结果与切换同事务落库：避免「地址已写、族没切」或反过来
+        tx.execute(
+            "UPDATE servers SET addr_family=?2, host_v6=?3 WHERE id=?1",
+            rusqlite::params![id, &family, &host_v6],
+        )
+        .map_err(err)?;
+        if old != new {
+            crate::servers::sync_nodes_addr(&tx, &old, &new).map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+        repos::servers::get(&conn, id)
+            .map_err(err)?
+            .ok_or_else(|| AppError::NotFound("服务器不存在".into()))?
+    };
+    rebuild_and_apply(&state).await?;
+    Ok(updated)
+}
+
+/// 只探测不切换：编辑表单的「自动探测」按钮用，返回候选地址（推荐值在首位）。
+pub async fn detect_server_ipv6(state: Arc<AppState>, id: i64) -> R<Vec<String>> {
+    crate::servers::ipv6_detect::detect_ipv6_addresses(&state, id)
+        .await
+        .map_err(err)
 }
 
 pub fn delete_server(state: Arc<AppState>, id: i64) -> R<()> {
@@ -621,7 +755,7 @@ fn upstream_reserved_ports(state: &AppState, server_id: i64) -> R<Vec<i64>> {
     let nodes: Vec<crate::domain::Node> = repos::nodes::list(&conn, &state.creds)
         .map_err(err)?
         .into_iter()
-        .filter(|n| n.addr == server.host)
+        .filter(|n| crate::domain::server_owns_addr(&server, &n.addr))
         .collect();
     let upstream_node_ids: Vec<String> = repos::upstreams::list_by_server(&conn, server_id)
         .map_err(err)?
@@ -798,7 +932,7 @@ fn privacy_refuse_reason(server: &Server, node: &Node) -> Option<String> {
     if node.source != "self-built" {
         return Some("只有本机部署的线路能开隐私保护：订阅线路的入口不在这台服务器上".into());
     }
-    if node.addr != server.host {
+    if !crate::domain::server_owns_addr(server, &node.addr) {
         return Some(format!(
             "这条线的入口是 {}，不在这台服务器上，开不了隐藏服务",
             node.addr
@@ -1283,7 +1417,7 @@ pub fn list_throughput(state: Arc<AppState>) -> R<Vec<ThroughputTest>> {
 pub async fn check_bbr(state: Arc<AppState>, server_id: i64) -> R<String> {
     let (auth, s) = servers::load_auth(&state, server_id).map_err(err)?;
     let mut sess = crate::ssh::SshSession::connect(
-        &s.host,
+        crate::domain::effective_host(&s),
         s.port as u16,
         &s.user,
         &auth,
@@ -1300,7 +1434,7 @@ pub async fn check_bbr(state: Arc<AppState>, server_id: i64) -> R<String> {
 pub async fn enable_bbr(state: Arc<AppState>, server_id: i64) -> R<String> {
     let (auth, s) = servers::load_auth(&state, server_id).map_err(err)?;
     let mut sess = crate::ssh::SshSession::connect(
-        &s.host,
+        crate::domain::effective_host(&s),
         s.port as u16,
         &s.user,
         &auth,

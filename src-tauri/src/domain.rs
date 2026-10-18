@@ -94,7 +94,18 @@ pub struct NodeSpeed {
 pub struct Server {
     pub id: i64,
     pub name: String,
+    /// IPv4 或域名（主地址，始终保留）。
     pub host: String,
+    /// 可选 IPv6 字面量（不带方括号）；空串表示该服务器没有登记 IPv6。
+    pub host_v6: String,
+    /// 当前选用的地址族：`v4` 用 `host`，`v6` 用 `host_v6`。
+    /// 由 `set_server_addr_family_cmd` 与节点地址在同一事务内切换。
+    /// **只影响入口**（SSH/测速/自建节点 addr），与 `egress_family` 无关。
+    pub addr_family: String,
+    /// 服务器出站地址族：VPS → 目标域名时优先/限定使用的地址族（`v4`/`v6`）。
+    /// 部署时写入 Xray/shadowsocks/sing-box 配置；切换后需重部署生效。
+    /// 不影响入口地址族，也不影响字面 IP 目标与客户端侧分流。
+    pub egress_family: String,
     pub port: i64,
     pub user: String,
     pub auth_kind: String,
@@ -110,6 +121,23 @@ pub struct Server {
     pub last_checked_at: Option<String>,
     /// 最近一次测速失败原因（成功置 NULL；IPC 序列化后前端红字展示）。
     pub last_check_error: Option<String>,
+}
+
+/// 服务器当前用于 SSH、测速与节点写回的地址：只有登记了 IPv6 且选了 v6 才用它，
+/// 否则一律回落到 `host`（IPv4/域名）。
+pub fn effective_host(s: &Server) -> &str {
+    if s.addr_family == "v6" && !s.host_v6.is_empty() {
+        &s.host_v6
+    } else {
+        &s.host
+    }
+}
+
+/// 节点地址是否属于该服务器：IPv4/域名与 IPv6 两个地址都算。
+/// 服务器页「已部署协议」徽章、部署写回与节点归属判断都用它，不能只看 `host`
+/// ——切到 IPv6 后节点 `addr` 是 host_v6，只比 `host` 会全部对不上。
+pub fn server_owns_addr(s: &Server, addr: &str) -> bool {
+    addr == s.host || (!s.host_v6.is_empty() && addr == s.host_v6)
 }
 
 /// 通道：服务器上的端口（防火墙放行/封锁开关），本地 UI 直接管理开关。
@@ -188,6 +216,8 @@ pub struct Job {
 pub struct CreateServerInput {
     pub name: String,
     pub host: String,
+    /// 可选 IPv6 字面量；空串表示不登记。
+    pub host_v6: String,
     pub port: i64,
     pub user: String,
     pub auth_kind: String,
@@ -202,12 +232,26 @@ pub struct UpdateServerInput {
     pub id: i64,
     pub name: String,
     pub host: String,
+    /// 可选 IPv6 字面量；空串表示清除 IPv6 登记。
+    pub host_v6: String,
     pub port: i64,
     pub user: String,
     pub auth_kind: String,
     pub kind: String,
     pub notes: String,
     pub credential: Option<String>,
+    /// 出站地址族；None = 保留原值（兼容只改其它字段的调用方）。
+    pub egress_family: Option<String>,
+}
+
+/// 更新服务器的结果：保存一定成功才返回；出口变化且该服务器已有部署时，
+/// 后端会自动排一次重部署，其结果通过 `deploy_job_id` / `deploy_error` 反馈。
+/// 部署提交失败**不回滚保存**——保存是事实，部署只是让新配置生效的后续动作。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateServerResult {
+    pub server: Server,
+    pub deploy_job_id: Option<i64>,
+    pub deploy_error: Option<String>,
 }
 
 /// 部署任务输入（身份材料由工具生成，无密码项）。

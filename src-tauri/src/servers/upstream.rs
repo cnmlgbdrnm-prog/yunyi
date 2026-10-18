@@ -426,7 +426,7 @@ pub async fn run_upstream_job(
     };
 
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,
@@ -588,7 +588,7 @@ pub async fn run_upstream_job(
             let mut unreachable: Vec<(i64, String)> = Vec::new();
             for u in &rows {
                 if let Err(e) = crate::server_speed::phase1::tcp_latency_ms(
-                    &server.host,
+                    crate::domain::effective_host(&server),
                     u.listen_port as u16,
                     1,
                 )
@@ -599,7 +599,8 @@ pub async fn run_upstream_job(
                         format!(
                             "从本机连不上 {}:{}（{e}）：服务器上实例与配置正常，卡在**入站放行**\
                              ——本工具已尝试在服务器上放行该端口，若仍不通就查云服务商的安全组",
-                            server.host, u.listen_port
+                            crate::domain::effective_host(&server),
+                            u.listen_port
                         ),
                     ));
                 }
@@ -663,7 +664,7 @@ pub async fn run_upstream_job(
                 name: format!("{}-{}", server.name, u.name),
                 source: "self-built".into(),
                 protocol: "vless".into(),
-                addr: server.host.clone(),
+                addr: crate::domain::effective_host(&server).to_string(),
                 port: u.listen_port,
                 params_json: node_params(&material, &u.reality_dest),
                 group_name: "自建".into(),

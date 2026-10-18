@@ -42,9 +42,15 @@ impl SshConnect for RealConnect {
     async fn connect(&self, s: &Server) -> Result<SshSession, String> {
         let (auth, _) = crate::servers::load_auth_parts(&self.db, &self.creds, s.id)
             .map_err(|e| e.to_string())?;
-        SshSession::connect(&s.host, s.port as u16, &s.user, &auth, CONNECT_TIMEOUT)
-            .await
-            .map_err(|e| e.to_string())
+        SshSession::connect(
+            crate::domain::effective_host(s),
+            s.port as u16,
+            &s.user,
+            &auth,
+            CONNECT_TIMEOUT,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -161,7 +167,13 @@ async fn test_server(
     let mut latency: Option<i64> = None;
     let mut bandwidth: Option<i64> = None;
     let mut errors: Vec<String> = Vec::new();
-    match phase1::tcp_latency_ms(&srv.host, srv.port as u16, LATENCY_SAMPLES).await {
+    match phase1::tcp_latency_ms(
+        crate::domain::effective_host(&srv),
+        srv.port as u16,
+        LATENCY_SAMPLES,
+    )
+    .await
+    {
         Ok(ms) => latency = Some(ms),
         Err(e) => errors.push(e),
     }

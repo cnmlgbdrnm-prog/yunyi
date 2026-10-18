@@ -5,38 +5,48 @@
 // 顶部新建时 onCancel 只收起表单，卡片内编辑时还要顺带复位 editingId 与展开态——
 // 那是两份不同的收尾，由父级注入。
 
+import Ipv6DetectButton from './Ipv6DetectButton'
+
 export interface ServerFormState {
   name: string
   host: string
+  /** 可选的 IPv6 字面量（不带方括号）；留空表示这台服务器只走 IPv4。 */
+  hostV6: string
   port: number
   user: string
   authKind: 'password' | 'key'
   kind: 'relay' | 'landing'
   notes: string
   credential: string
+  /** 出口地址族：VPS → 目标域名时优先/限定哪一族。与入口（host/hostV6）独立。 */
+  egressFamily: 'v4' | 'v6'
 }
 
 export const EMPTY_SERVER_FORM: ServerFormState = {
   name: '',
   host: '',
+  hostV6: '',
   port: 22,
   user: 'root',
   authKind: 'password',
   kind: 'landing',
   notes: '',
   credential: '',
+  egressFamily: 'v4',
 }
 
 interface Props {
   form: ServerFormState
   /** 编辑态：凭据留空表示保留原凭据，故要多提示一句 */
   editing: boolean
+  /** 编辑已有服务器时传入：显示「自动探测」，新建尚未入库没有可连的凭据 */
+  serverId?: number
   onChange: (form: ServerFormState) => void
   onSave: () => void
   onCancel: () => void
 }
 
-export default function ServerFormPanel({ form: f, editing, onChange, onSave, onCancel }: Props) {
+export default function ServerFormPanel({ form: f, editing, serverId, onChange, onSave, onCancel }: Props) {
   return (
     <div className="space-y-2">
       <label className="block text-sm">
@@ -52,6 +62,18 @@ export default function ServerFormPanel({ form: f, editing, onChange, onSave, on
           端口
           <input type="number" className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1" value={f.port} onChange={(e) => onChange({ ...f, port: Number(e.target.value) })} />
         </label>
+      </div>
+      <div className="block text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <label htmlFor="server-host-v6">IPv6 地址（可选）</label>
+          {serverId != null && (
+            <Ipv6DetectButton
+              serverId={serverId}
+              onDetected={(address) => onChange({ ...f, hostV6: address })}
+            />
+          )}
+        </div>
+        <input id="server-host-v6" aria-label="IPv6 地址" className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 font-mono text-xs" value={f.hostV6} onChange={(e) => onChange({ ...f, hostV6: e.target.value })} placeholder="2001:db8::1（只填字面量，不带方括号）" />
       </div>
       <div className="flex gap-2">
         <label className="block flex-1 text-sm">
@@ -83,6 +105,26 @@ export default function ServerFormPanel({ form: f, editing, onChange, onSave, on
           私钥 PEM
           <textarea rows={5} className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 font-mono text-xs" value={f.credential} onChange={(e) => onChange({ ...f, credential: e.target.value })} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
         </label>
+      )}
+      {serverId != null && (
+        <div className="block text-sm">
+          <label htmlFor="server-egress-family">出站地址族（VPS 访问目标）</label>
+          <select
+            id="server-egress-family"
+            aria-label="出站地址族"
+            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1"
+            value={f.egressFamily}
+            onChange={(e) => onChange({ ...f, egressFamily: e.target.value as 'v4' | 'v6' })}
+          >
+            <option value="v4">v4（默认，VPS 以 IPv4 访问目标）</option>
+            <option value="v6">v6（VPS 以 IPv6 访问目标，需 VPS 自身有 v6 出口）</option>
+          </select>
+          <p className="mt-1 text-xs text-neutral-500">
+            只影响 VPS → 目标域名的解析与建连；字面 IP 目标与本机分流不受影响。Shadowsocks
+            只能「优先 v6，可能回落 v4」；VPS 没有可用 v6 出口时，域名目标会直接失败。
+            保存后若该机已部署协议会自动重部署，进度显示在服务器行内。
+          </p>
+        </div>
       )}
       {editing && <p className="text-xs text-neutral-500">编辑时凭据留空表示保留原凭据</p>}
       <label className="block text-sm">

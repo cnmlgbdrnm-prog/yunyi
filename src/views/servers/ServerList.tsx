@@ -1,15 +1,18 @@
 // 服务器列表：每行一张 ServerRow 卡片，展开态内嵌部署向导或编辑表单。
 import type { Dispatch, SetStateAction } from 'react'
 import type { ConnectionTest, DeployedProtocolDetail, Server } from '../../api/types'
-import { isTargetBusy, targetResult, type TrackedJob } from '../../jobs/registry'
+import { isTargetBusy, jobForTarget, progressView, targetResult, type TrackedJob } from '../../jobs/registry'
 import DeployWizard from '../../components/DeployWizard'
+import JobProgressPanel from '../../components/JobProgressPanel'
 import ServerFormPanel, { type ServerFormState } from '../../components/ServerFormPanel'
 import ServerRow from '../../components/ServerRow'
 
 export default function ServerList({
   servers,
   speedJobs,
+  deployJobs,
   testing,
+  addrBusy,
   pwBusy,
   pwDone,
   bbrAlgo,
@@ -30,6 +33,7 @@ export default function ServerList({
   onToggleUpstreams,
   onSpeedTest,
   onTest,
+  onAddrFamily,
   onPasswordless,
   onBbrEnable,
   onBbrCheck,
@@ -43,7 +47,9 @@ export default function ServerList({
 }: {
   servers: Server[]
   speedJobs: ReadonlyMap<number, TrackedJob>
+  deployJobs: ReadonlyMap<number, TrackedJob>
   testing: Set<number>
+  addrBusy: Set<number>
   pwBusy: Set<number>
   pwDone: Record<number, boolean>
   bbrAlgo: Record<number, string>
@@ -64,6 +70,7 @@ export default function ServerList({
   onToggleUpstreams: (id: number) => void
   onSpeedTest: (id: number) => void
   onTest: (id: number) => void
+  onAddrFamily: (id: number, family: 'v4' | 'v6') => void
   onPasswordless: (id: number) => void
   onBbrEnable: (id: number) => void
   onBbrCheck: (id: number) => void
@@ -79,6 +86,8 @@ export default function ServerList({
     <ul className="space-y-2">
       {servers.map((s) => {
         const live = targetResult(speedJobs, String(s.id))
+        // 该行的部署任务（含保存出口族后自动排的重部署）：向导没展开时行内显示进度
+        const deployJob = jobForTarget(deployJobs, String(s.id))
         return (
           <ServerRow
             key={s.id}
@@ -90,6 +99,8 @@ export default function ServerList({
               done: live != null,
             }}
             testing={testing.has(s.id)}
+            addrBusy={addrBusy.has(s.id)}
+            onAddrFamily={(family) => onAddrFamily(s.id, family)}
             passwordlessBusy={pwBusy.has(s.id)}
             passwordless={pwDone[s.id] || s.auth_kind === 'key'}
             passwordlessJustDone={pwDone[s.id] === true}
@@ -120,6 +131,11 @@ export default function ServerList({
             onEdit={() => onEdit(s)}
             onDelete={() => onDelete(s.id)}
             onClose={onClose}
+            footer={
+              deployJob != null && !(expand?.id === s.id && expand.type === 'deploy')
+                ? <JobProgressPanel progress={progressView(deployJob)} />
+                : undefined
+            }
           >
             {expand?.id === s.id && expand.type === 'deploy' && (
               <div className="px-4 pb-4">
@@ -135,6 +151,7 @@ export default function ServerList({
                 <ServerFormPanel
                   form={form}
                   editing
+                  serverId={s.id}
                   onChange={setForm}
                   onSave={onSave}
                   onCancel={onCancelEdit}

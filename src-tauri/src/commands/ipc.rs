@@ -246,6 +246,7 @@ pub async fn create_server_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     name: String,
     host: String,
+    host_v6: String,
     port: i64,
     user: String,
     auth_kind: String,
@@ -258,6 +259,7 @@ pub async fn create_server_cmd(
         CreateServerInput {
             name,
             host,
+            host_v6,
             port,
             user,
             auth_kind,
@@ -275,27 +277,48 @@ pub async fn update_server_cmd(
     id: i64,
     name: String,
     host: String,
+    host_v6: String,
     port: i64,
     user: String,
     auth_kind: String,
     kind: String,
     notes: String,
     credential: Option<String>,
-) -> R<Server> {
+    egress_family: Option<String>,
+) -> R<UpdateServerResult> {
     update_server(
         state.inner().clone(),
         UpdateServerInput {
             id,
             name,
             host,
+            host_v6,
             port,
             user,
             auth_kind,
             kind,
             notes,
             credential,
+            egress_family,
         },
     )
+}
+/// 服务器地址族切换：整台服务器（SSH/测速）与该机所有自建直连节点一起切。
+#[tauri::command]
+pub async fn set_server_addr_family_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: i64,
+    family: String,
+) -> R<Server> {
+    set_server_addr_family(state.inner().clone(), id, family).await
+}
+/// 从服务器自身探测全局 IPv6（SSH 走原始主机地址），返回顺序即推荐顺序。
+#[tauri::command]
+pub async fn detect_server_ipv6_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    id: i64,
+) -> R<Vec<String>> {
+    detect_server_ipv6(state.inner().clone(), id).await
 }
 #[tauri::command]
 pub async fn delete_server_cmd(state: tauri::State<'_, Arc<AppState>>, id: i64) -> R<()> {

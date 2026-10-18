@@ -71,7 +71,7 @@ pub fn deployed_protocol_details(
         .filter(|n| n.source == "self-built")
         .filter(|n| is_supported_protocol(&n.protocol))
         .filter(|n| !upstream_nodes.contains(&n.id))
-        .filter(|n| crate::domain::direct_addr(n) == server.host)
+        .filter(|n| crate::domain::server_owns_addr(&server, &crate::domain::direct_addr(n)))
         .map(|n| {
             describe_deployed_protocol(
                 &n.protocol,
@@ -559,121 +559,9 @@ fn emit_installed_bin_hash(
     emit("安装", &format!("已安装 {bin} sha256: {measured}"), 48);
 }
 
-/// 远端文件读取结果：区分「文件不存在」（正常）与「读取失败」（异常）。
-///
-/// 为什么需要这个类型：本仓多处把「读失败」与「文件不存在」当成同一件事
-/// （`relay/build.rs` 的 `read_conf` 把非零退出归成空串、`servers/privacy.rs` 的
-/// `cat … 2>/dev/null || true`），后果是读失败时按「首次部署」处理——覆盖用户
-/// 既有配置、轮换本不该动的密钥，且表面上什么都看不出来。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RemoteFile {
-    /// 文件不存在（`[ -e ]` 为假）。
-    Absent,
-    /// 文件存在，内容逐字带回（**空文件是 `Content("")`**，与 Absent 不同：
-    /// 前者要保留其余段合并，后者才整份渲染）。
-    Content(String),
-}
-
-impl RemoteFile {
-    /// 内容视图：`Absent` 视作空串。
-    ///
-    /// 只用在「按内容决定取舍」的**下游**函数（渲染/合并/解析私钥——它们本来就把
-    /// 空配置当首建处理）。**判断「文件在不在」必须显式 `matches!(.., Absent)`**：
-    /// 这个访问器存在的意义只是别让下游把两个变体各写一遍，不是抹平二者差异。
-    pub(crate) fn content(&self) -> &str {
-        match self {
-            RemoteFile::Absent => "",
-            RemoteFile::Content(c) => c,
-        }
-    }
-}
-
-/// 读远端文件：存在则 cat（exit 0），不存在则 exit 42，其它非零 = 读失败。
-///
-/// **单次往返**同时取回内容与存在性，不必「先 test 再 cat」跑两条命令（也就没有
-/// 两次读取之间文件被改动的窗口）。`[ -e ]` 为真但 cat 失败（权限/IO）→ cat 非零
-/// → 落 Err，正是我们要的语义。
-pub(crate) async fn read_remote_file(
-    sess: &mut SshSession,
-    cancel: &AtomicBool,
-    step: &str,
-    path: &str,
-    timeout: Duration,
-) -> Result<RemoteFile, String> {
-    let script = format!("if [ -e '{path}' ]; then cat '{path}'; else exit 42; fi");
-    let out = run_cmd(sess, cancel, step, &script, timeout).await?;
-    match out.exit_code {
-        0 => Ok(RemoteFile::Content(out.stdout)),
-        42 => Ok(RemoteFile::Absent),
-        code => {
-            let tail = crate::util::stderr_tail(&out.stderr);
-            Err(format!(
-                "读取 {path} 失败(exit={code}): {}",
-                if tail.trim().is_empty() {
-                    "远端无错误输出"
-                } else {
-                    tail.trim_end()
-                }
-            ))
-        }
-    }
-}
-
-/// 远端写文件：mkdir -p 父目录 + 临时文件 + chmod + `mv -f` 原子替换。
-/// 路径为常量白名单，故无注入面（内容整体 base64 后单引号包裹）。
-/// pub(crate)：relay::build 收敛写回与 peers 下发复用。
-///
-/// **原子性**：原实现 `> '{path}'` 是 truncate-then-stream，取消/超时/断连
-/// （都是常态）会留下截断的配置，服务起不来而不报原因。
-///
-/// **权限**：按路径判定，**不加参数**——本批缺陷的形态就是「某条路径上忘了应用」，
-/// 可选参数等于给未来的调用点留同一个坑。`wg0.conf` 内含 PrivateKey，首次写入按
-/// umask 会落 644（`mkdir -p` 还会把 /etc/wireguard 建成 755），而 `wg-quick`
-/// 自己都会警告 world accessible。
-///
-/// 顺带一提：`chmod` 不能省。改成 `> tmp && mv` 之后，tmp 的模式会**替换**掉原文件
-/// 的模式，省掉 chmod 反而会把本来就是 600 的 wg0.conf 降级成 644。
-pub(crate) async fn write_remote_file(
-    sess: &mut SshSession,
-    cancel: &AtomicBool,
-    step: &str,
-    remote_path: &str,
-    content: &str,
-    timeout: Duration,
-) -> Result<(), String> {
-    let b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        content.as_bytes(),
-    );
-    let parent = remote_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(".");
-    let (mode, dir_mode) = remote_perms(remote_path);
-    let mut cmd = format!("mkdir -p '{parent}' && ");
-    if let Some(dm) = dir_mode {
-        // 显式 chmod 而非 `mkdir -p -m`：后者只对**新建**目录生效，已存在却是 755 的
-        // /etc/wireguard 它修不了——而恰恰是这种情况最需要修。
-        // 顺序必须在 `mkdir -p` **之后**：目录还不存在时 chmod 会失败，`&&` 链直接
-        // 短路，首次写 wg0.conf 一个字节都写不进去。
-        cmd.push_str(&format!("chmod {dm:o} '{parent}' && "));
-    }
-    cmd.push_str(&format!(
-        "echo '{b64}' | base64 -d > '{remote_path}.new' \
-         && chmod {mode:o} '{remote_path}.new' \
-         && mv -f '{remote_path}.new' '{remote_path}'"
-    ));
-    run_cmd_ok(sess, cancel, step, &cmd, timeout).await?;
-    Ok(())
-}
-
-/// 远端文件权限策略：路径 → (文件 mode, 父目录 mode)。
-///
-/// 新增敏感文件时**必须**在这里登记，否则落 umask 默认（通常 644）。
-fn remote_perms(path: &str) -> (u32, Option<u32>) {
-    if path == crate::relay::WG_CONF_PATH || path == crate::relay::WG_BAK_PATH {
-        (0o600, Some(0o700))
-    } else {
-        (0o644, None)
-    }
-}
+// 远端文件原语拆到 servers::remote_file（deploy.rs 已顶到单文件 1500 行上限）。
+// 经此重导出，relay/privacy 按旧路径的引用保持不变。
+pub(crate) use crate::servers::remote_file::{read_remote_file, write_remote_file, RemoteFile};
 
 /// 取消感知的单命令执行：取消标志置位即中断（不等命令超时）。
 /// pub(crate)：relay::build/peers 建链拆链与设备下发复用。
@@ -790,6 +678,9 @@ impl ProdRunner {
         let need_singbox = ["hysteria2", "tuic"]
             .iter()
             .any(|p| req.protocols.iter().any(|x| x == p));
+        // 出站地址族：与入口（addr_family / effective_host）完全独立，
+        // 只决定 VPS→目标域名时优先/限定哪一族。字面 IP 目标不受影响。
+        let egress = EgressFamily::from_db(&server.egress_family);
         let emit_progress = |step: &str, message: &str, progress: i64| {
             emit(JobProgress {
                 job_id: req.job_id,
@@ -804,7 +695,7 @@ impl ProdRunner {
         let (auth, _) =
             load_auth_parts(&state.db, &state.creds, req.server_id).map_err(|e| e.to_string())?;
         let mut sess = SshSession::connect(
-            &server.host,
+            crate::domain::effective_host(&server),
             server.port as u16,
             &server.user,
             &auth,
@@ -989,7 +880,9 @@ impl ProdRunner {
             repos::nodes::list(&conn, &state.creds)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|n| n.source == "self-built" && n.addr == server.host)
+                .filter(|n| {
+                    n.source == "self-built" && crate::domain::server_owns_addr(&server, &n.addr)
+                })
                 .map(|n| (n.protocol.clone(), n))
                 .collect()
         };
@@ -1003,10 +896,29 @@ impl ProdRunner {
             // EOF/503）；vmess(WS) 不涉 Reality，空密钥即可。
             // 兜底域名与上游出口共用同一个常量，避免两条链路各写一份而漂移——
             // 漂移的表现是「界面显示 A、服务器写 B」，且失败只在客户端侧可见。
-            let reality_dest = req
-                .reality_dest
-                .clone()
-                .unwrap_or_else(|| crate::servers::upstream::DEFAULT_REALITY_DEST.into());
+            //
+            // 但**只在没有既有节点 sni 时**才用默认值：重部署（例如仅切出口）若把
+            // 用户自定义的伪装域名重置成默认值，就是一次静默的配置回退——服务器
+            // 与节点两侧虽然一致，却不再是用户选的那个域名。
+            let reality_dest = match &req.reality_dest {
+                Some(d) => d.clone(),
+                None => req
+                    .protocols
+                    .iter()
+                    .find_map(|p| {
+                        existing_nodes.get(p).and_then(|n| {
+                            crate::servers::reality_dest::sni_of_params(&n.params_json)
+                        })
+                    })
+                    .or_else(|| {
+                        ["vless", "trojan"].iter().find_map(|p| {
+                            existing_nodes.get(*p).and_then(|n| {
+                                crate::servers::reality_dest::sni_of_params(&n.params_json)
+                            })
+                        })
+                    })
+                    .unwrap_or_else(|| crate::servers::upstream::DEFAULT_REALITY_DEST.into()),
+            };
             let mut entries: Vec<XrayInboundEntry> = Vec::new();
             for p in ["vless", "trojan", "vmess"] {
                 if !req.protocols.iter().any(|x| x == p) {
@@ -1063,7 +975,7 @@ impl ProdRunner {
                     ws_path: "/ray".into(),
                 });
             }
-            let cfg = xray_config_json_multi(&entries);
+            let cfg = xray_config_json_multi(&entries, egress);
             write_remote_file(
                 &mut sess,
                 cancel,
@@ -1104,7 +1016,7 @@ impl ProdRunner {
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key)
             });
             let ss_port = ports["ss"];
-            let cfg = ss_config_json(ss_port, &pw);
+            let cfg = ss_config_json(ss_port, &pw, egress);
             write_remote_file(
                 &mut sess,
                 cancel,
@@ -1174,9 +1086,37 @@ impl ProdRunner {
             // ports["hysteria2"] 会在调用前就索引并 panic（单 L2 即触发）。
             let hy2_selected = req.protocols.iter().any(|p| p == "hysteria2");
             let tuic_selected = req.protocols.iter().any(|p| p == "tuic");
+            // 出口写法随 sing-box 版本分支：1.12+ 用出站 domain_resolver，
+            // 更早版本用 domain_strategy。探测失败按旧版处理——把新版字段写进
+            // 旧版配置会让 sing-box 直接 FATAL，比「出口不生效」严重得多。
+            let ver_out = run_cmd(
+                &mut sess,
+                cancel,
+                "配置",
+                "/usr/local/bin/sing-box version",
+                PROBE_TIMEOUT,
+            )
+            .await;
+            // 取消不能被上面的「失败不阻断」吞掉
+            check_cancel(cancel)?;
+            let singbox_ver = match ver_out {
+                Ok(out) if out.exit_code == 0 => parse_singbox_version(&out.stdout),
+                _ => None,
+            };
+            if singbox_ver.is_none() {
+                // 探测失败时配置里不写任何出口字段（两种写法各有版本会 FATAL，
+                // 见 deploy_spec 的实测注释）：要让用户知道这次出口没生效。
+                emit_progress(
+                    "配置",
+                    "无法识别 sing-box 版本，本次未写入出口地址族（服务保持可用，可重试部署）",
+                    55,
+                );
+            }
             let cfg = singbox_config_json(
                 hy2_selected.then(|| (ports["hysteria2"], hy2_pw.as_str())),
                 tuic_selected.then(|| (ports["tuic"], tuic_uuid.as_str(), tuic_pw.as_str())),
+                egress,
+                singbox_ver,
             );
             write_remote_file(
                 &mut sess,
@@ -1254,6 +1194,17 @@ impl ProdRunner {
                 CONFIG_TIMEOUT,
             )
             .await?;
+            // 只 enable --now 不会让已在跑的服务重新读配置——重部署写下的新
+            // ipv6_first 会停在磁盘上不生效（与服务已 active 的假象并存）。
+            // 与 xray 一样：restart 的退出码不作判据，判据是下面的状态等待。
+            run_cmd(
+                &mut sess,
+                cancel,
+                "启动",
+                "systemctl restart ssserver",
+                CONFIG_TIMEOUT,
+            )
+            .await?;
             wait_service_active(&mut sess, cancel, "ssserver").await?;
         }
         if need_singbox {
@@ -1262,6 +1213,16 @@ impl ProdRunner {
                 cancel,
                 "启动",
                 "systemctl daemon-reload && systemctl enable --now singbox",
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+            // 同上：sing-box 配置里的 domain_resolver / domain_strategy 必须
+            // 重启进程才生效，否则「切了出口但行为没变」。
+            run_cmd(
+                &mut sess,
+                cancel,
+                "启动",
+                "systemctl restart singbox",
                 CONFIG_TIMEOUT,
             )
             .await?;
@@ -1344,7 +1305,7 @@ impl ProdRunner {
                     name: format!("{}-{}", server.name, proto),
                     source: "self-built".into(),
                     protocol: proto.clone(),
-                    addr: server.host.clone(),
+                    addr: crate::domain::effective_host(&server).to_string(),
                     port: *port as i64,
                     params_json: params.clone(),
                     group_name: "自建".into(),
