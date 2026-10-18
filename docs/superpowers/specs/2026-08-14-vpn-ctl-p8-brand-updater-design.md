@@ -1,6 +1,6 @@
 # vpn-ctl P8 设计规格：产品化（云驿品牌落地 + tauri-updater 自动更新）
 
-> 状态：待老板审阅。战略见 `docs/strategy.md`。品牌决策：**云驿（YunYi）**；签名私钥决策：**GitHub Secrets 自动签名**（均老板已拍板）。
+> 状态：待老板审阅。战略见 `docs/product/strategy.md`。品牌决策：**云驿（YunYi）**；签名私钥决策：**GitHub Secrets 自动签名**（均老板已拍板）。
 
 ## 1. 背景与目标
 

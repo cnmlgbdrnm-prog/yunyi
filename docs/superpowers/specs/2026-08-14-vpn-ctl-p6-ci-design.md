@@ -1,6 +1,6 @@
 # vpn-ctl P6 设计规格：CI 机器保证（GitHub Actions）
 
-> 状态：已老板批准并实施（bc7841c）。战略文档见 `docs/strategy.md`（P9 已落地）。
+> 状态：已老板批准并实施（bc7841c）。战略文档见 `docs/product/strategy.md`（P9 已落地）。
 
 ## 1. 背景与目标
 
