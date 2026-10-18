@@ -1,0 +1,44 @@
+{
+  "name": "vpn-ctl",
+  "private": true,
+  "version": "0.4.0",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run fetch:sidecar && npm run fetch:tor && tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "fetch:sidecar": "node scripts/fetch-sidecar.mjs",
+    "fetch:tor": "node scripts/fetch-tor.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "check:sensitive": "node scripts/check-sensitive.mjs",
+    "check:updater-pubkey": "node scripts/check-updater-pubkey.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-updater": "^2",
+    "qrcode": "^1.5.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.4",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "jsdom": "^30.0.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4",
+    "vitest": "^3.2.7"
+  }
+}

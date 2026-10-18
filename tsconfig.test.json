@@ -1,0 +1,6 @@
+{
+  // 本地测试类型检查：测试源码在 tests/frontend（不随 git 上传），
+  // 主 tsconfig.json 仍只包含 src，CI 的 tsc 不受影响。
+  "extends": "./tsconfig.json",
+  "include": ["src", "tests/frontend"]
+}

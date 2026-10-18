@@ -1,0 +1,118 @@
+[package]
+name = "vpn-ctl"
+version = "0.4.0"
+description = "VPN subscription manager desktop app"
+edition = "2021"
+license = "GPL-3.0-only"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# test 特性：启用 tauri::test（mock_builder/get_ipc_response），ipc_tests 契约测试使用
+tauri = { version = "2", features = ["test"] }
+tauri-plugin-opener = "2"
+# updater：应用自更新（GitHub Releases 分发，minisign 公钥校验签名）
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# tokio 追加 net、io-util：SSH 客户端与部署管道需要的 TCP/读写能力；
+# test-util：测速执行器不变量测试的 tokio::time::pause 虚拟时钟
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "test-util"] }
+# 默认特性走 aws-lc-rs，Windows 需要 NASM 外链；改用 ring 后端（内置 C 构建，免 NASM/OpenSSL）
+russh = { version = "0.53", default-features = false, features = ["ring", "flate2"] }
+serde_yaml = "0.9.34"
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes-gcm = "0.10"
+keyring = { version = "3", features = ["windows-native"] }
+axum = "0.8.9"
+thiserror = "2.0.20"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4.3"
+rand = "0.8"
+url = "2.5.8"
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+rfd = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+regex = "1.13.1"
+percent-encoding = "2.3.2"
+# async-trait：DeployRunner 等生产 trait 需要（原先仅 dev 依赖，T4 起生产代码使用）
+async-trait = "0.1"
+# X25519：WG 设备密钥生成（与 wg genkey 同构的 Curve25519 密钥体系；ed25519 与 WG 不兼容）
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+
+[features]
+# 测试源码集中放在仓库根 tests/rust，且不随 git 上传（见 .gitignore）。
+# 只有显式启用本特性时，源码里的 include! 才会把测试模块编进 crate：
+#   cargo test --features local-tests
+# 不启用时（CI、普通构建）所有 #[cfg(all(test, feature = "local-tests"))]
+# 代码都被剥离，因此新克隆缺少 tests/ 也能通过 fmt/clippy/build。
+local-tests = []
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"
+
+# sysproxy：读取 WinINET 系统代理（更新检查/下载跟随系统代理），仅 Windows 编译
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+# windows-sys：上网客户端的原生探测（GetAdaptersAddresses 扫 TUN 网卡、
+# Toolhelp32+NtQueryInformationProcess 取进程命令行）。此前这两步靠 spawn
+# powershell，冷启动实测 1.7s + 4.5s（NetAdapter 模块首次初始化占 3.3s，
+# 冷/热差 35 倍），改为进程内调用后降至毫秒级。已在依赖树中，不提新 crate。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # DNS 客户端缓存反查（net/dnscache.rs）：DnsQuery_W + DnsFree 的绑定在这里。
+    # 名字/类型那张表（DnsGetCacheDataTable）是**未公开导出**，windows-sys 里没有，
+    # 故那一处自己写 extern 块，不需要额外 feature。
+    "Win32_NetworkManagement_Dns",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Wdk_System_Threading",
+    # 命名管道 IPC（提权服务）：CreateNamedPipeW/ConnectNamedPipe/GetNamedPipeClientProcessId。
+    # windows-sys 按**签名依赖**做门控：ConnectNamedPipe/ReadFile 的签名里有 OVERLAPPED，
+    # 故还需 Win32_System_IO；CreateNamedPipeW 的签名里有 SECURITY_ATTRIBUTES，
+    # 故还需 Win32_Security。少一个的表现是「导入未解析」，不是运行时错误。
+    # Win32_Security_Authorization：ConvertStringSecurityDescriptorToSecurityDescriptorW，
+    # 用 SDDL 给管道装 DACL——不装的话管道继承 SYSTEM 的默认 DACL，主程序自己都连不上。
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    # ShellExecuteW + runas：设置页「安装网络服务」用它拉起本 exe 的提权分支。
+    # 这是全程唯一一次 UAC 的来源。
+    "Win32_UI_Shell",
+    # SendMessageTimeoutW + HWND_BROADCAST + WM_SETTINGCHANGE：改完用户级环境变量后
+    # 通知系统重读。不广播的话 explorer 的环境块不刷新，新进程照样拿不到新值——
+    # 那这次写入要等下次登录才生效，等于没修（见 net/sysproxy_set.rs）。
+    "Win32_UI_WindowsAndMessaging",
+] }
+# windows：会话级防火墙阻断用的 INetFwPolicy2 COM。**已在依赖树中**（tauri 的传递
+# 依赖就是 0.61.3），提升为直接依赖几乎不增体积。不用 windows-sys 的理由：那里没有
+# WindowsFirewall 的绑定，手搓 IDispatch vtable 不现实。
+# 不选 WFP（FwpmFilterAdd0 那套）：几百行 unsafe 落在 SYSTEM 进程里，错一条就是
+# 全机断网；不选 netsh：本地化输出解析 + 每条规则一次 spawn。
+# Win32_System_Ole/Variant 是 `_NewEnum` 那条路要的：它返回 IUnknown，得 cast 成
+# IEnumVARIANT 才能遍历出规则名（删规则没有「按前缀删」，只能先枚举）。
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+# windows-service：提权服务的 SCM 宿主（TUN 全局模式要装 wintun 内核驱动，必须
+# 管理员令牌；服务方案换到的是「装的时候一次 UAC，之后开关 TUN 全程不弹」）。
+# 不用 windows-sys 手搓 StartServiceCtrlDispatcher：派发器/状态上报/控制码处理
+# 的样板代码多且易错，出错的表现是「服务无响应」而非编译失败，很难查。
+windows-service = "0.8.1"
+
