@@ -344,7 +344,9 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            // 退出即停 sidecar 与本机上网客户端：杀进程、还原系统代理、清空槽位
+            // 退出即停 sidecar；本机上网客户端则**保留端口、切直连**：
+            // 已运行的程序（浏览器/终端/Claude Code…）环境变量里还记着这个代理，
+            // 杀了它就会整片断网（见 net::runtime::stop_for_exit 的根因说明）
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let state = app.state::<Arc<AppState>>();
                 tauri::async_runtime::block_on(crate::speed::stop_all(&state));
@@ -353,13 +355,10 @@ fn main() {
                 // （例如网络压根没起来、Tor 却已在 bootstrap）。这里再收一次——
                 // `stop_all` 是幂等的，且复用了用户自己 9050 的 Tor 不会被杀。
                 tauri::async_runtime::block_on(crate::tor::stop_all(&state));
-                // 服务核验归属后再退出；另一个空窗口不能直接用 SCM 停掉活会话。
-                #[cfg(windows)]
-                match crate::service::client::call(&crate::service::protocol::Request::Shutdown) {
-                    Ok(crate::service::protocol::Response::ShuttingDown) => {}
-                    Ok(other) => eprintln!("[vpn-ctl] 服务未接受退出请求: {other:?}"),
-                    Err(e) => eprintln!("[vpn-ctl] 请求网络服务退出失败: {e}"),
-                }
+                // 刻意不发 Shutdown：服务与它的 mihomo 要留在后台切直连，否则
+                // 环境变量里记着本机代理的程序会立刻断网。`stop_all` 已经把端点
+                // 切到直连并释放了会话归属；服务在下次开启网络、`sc stop` 或
+                // 重启时正常回收。
             }
         });
 }

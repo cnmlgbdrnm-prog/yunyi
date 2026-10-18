@@ -169,6 +169,7 @@ pub fn handle(req: &Request) -> Response {
         } => start(config_yaml, *mixed_port, *ctrl_port, token),
         Request::ReloadNet { config_yaml } => reload(config_yaml),
         Request::StopNet => stop(),
+        Request::Detach => detach(),
         Request::SetTun { enable } => set_tun(*enable),
         Request::Status => status(),
         Request::BlockDirect { programs, tag } | Request::BlockPublicDirect { programs, tag } => {
@@ -413,6 +414,28 @@ pub(super) fn with_tun(config_yaml: &str, enable: bool) -> Result<String, String
     serde_yaml::to_string(&root).map_err(|e| format!("序列化配置失败: {e}"))
 }
 
+/// 生成「保留端口、直连出口」的配置：摘掉 `tun` 块，`mode` 设为 `direct`。
+///
+/// 为什么不能只 `PATCH /configs {"mode":"direct"}`：TUN 开着时模式切直连并不会
+/// 拆掉虚拟网卡，流量仍会被引进一个已不受分流规则管理的设备。整份热重载一次
+/// 同时完成「摘 TUN」与「切直连」，只触发一次配置生效。
+///
+/// 其余字段原样保留：下次 `StartNet` 本来就会重写整份配置，这里不需要也不应该
+/// 清理节点/规则——保留它们反而让「切回规则模式」仍然可用。
+pub(super) fn direct_config(config_yaml: &str) -> Result<String, String> {
+    let mut root: serde_yaml::Value =
+        serde_yaml::from_str(config_yaml).map_err(|e| format!("配置不是合法 YAML: {e}"))?;
+    let map = root
+        .as_mapping_mut()
+        .ok_or_else(|| "配置顶层必须是映射（key: value），实际不是".to_string())?;
+    map.remove(serde_yaml::Value::from("tun"));
+    map.insert(
+        serde_yaml::Value::from("mode"),
+        serde_yaml::Value::from("direct"),
+    );
+    serde_yaml::to_string(&root).map_err(|e| format!("序列化配置失败: {e}"))
+}
+
 /// 关 TUN 后等待网卡消失的上限。热重载是异步的（CHANGELOG 记实测约 1.4s 生效），
 /// 立刻核验会把「还没拆完」误报成残留。
 const TUN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -573,6 +596,103 @@ fn set_tun(enable: bool) -> Response {
             message: format!("热重载被 mihomo 拒绝: HTTP {code}"),
         },
         Err(e) => Response::Failed { message: e },
+    }
+}
+
+/// 保留 mihomo：切直连、摘 TUN，进程与端口都不动。
+///
+/// **失败也不能改成杀进程**——杀进程正是要修的故障：已经跑着的程序（环境变量里
+/// 记着本机代理）会立刻断网。失败时维持现状（通常是 VPN 模式，仍然能上网）并把
+/// 原因回报给主程序记日志；下次 `StartNet` 或服务停止会正常收掉它。
+fn detach() -> Response {
+    {
+        // 只核验存活，不在网络往返期间占着 CHILD 锁：并发的 Status 查询会一起卡住
+        let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+        {
+            // 没有活着的 mihomo：没有端口要保，顺手把崩溃残留的记账清干净
+            let _ = guard.take();
+            MIXED_PORT.store(0, Ordering::Relaxed);
+            TUN_ENABLED.store(false, Ordering::Relaxed);
+            *LAST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return Response::Detached;
+        }
+    }
+    let ctrl = CTRL_PORT.load(Ordering::Relaxed);
+    let token = TOKEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let current = LAST_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(current) = current else {
+        return Response::Failed {
+            message: "mihomo 在运行但服务没有记住配置，无法切直连（进程保持不动）".into(),
+        };
+    };
+    if ctrl == 0 || token.is_empty() {
+        return Response::Failed {
+            message: "服务没有记住控制器端口/token，无法切直连（进程保持不动）".into(),
+        };
+    }
+    let updated = match direct_config(&current) {
+        Ok(value) => value,
+        Err(message) => {
+            return Response::Failed {
+                message: format!("{message}（进程保持不动）"),
+            }
+        }
+    };
+    let path = paths::config_path();
+    if let Err(e) = std::fs::write(&path, &updated) {
+        return Response::Failed {
+            message: format!("写入直连配置失败: {e}（进程保持不动）"),
+        };
+    }
+    let body = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "payload": updated,
+        "force": true,
+    });
+    let addr = format!("127.0.0.1:{ctrl}");
+    match crate::service::http::put_json(&addr, "/configs", &token, &body) {
+        Ok(code) if (200..300).contains(&code) => {
+            *LAST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(updated);
+            let was_tun = TUN_ENABLED.swap(false, Ordering::Relaxed);
+            if was_tun {
+                // 与关 TUN 同一条口径：热重载收下配置不等于系统侧已经拆干净。
+                // 这里只记日志、仍然报 Detached——直连模式下残留的 TUN 也还能上网，
+                // 把它升级成失败反而会诱使调用方去杀进程（那才是断网）。
+                let problems = wait_tun_gone(
+                    &crate::net::winprobe::adapter_names,
+                    TUN_TEARDOWN_TIMEOUT,
+                    TUN_TEARDOWN_INTERVAL,
+                );
+                if !problems.is_empty() {
+                    eprintln!(
+                        "[yunyi-service] 已切直连，但 TUN 网卡没撤干净: {}",
+                        problems.join("；")
+                    );
+                }
+            }
+            Response::Detached
+        }
+        result => {
+            // 与 reload 同样的顺序：PUT 失败就把磁盘上的旧配置写回去，
+            // 否则下次热重载会从一份与实际运行状态不符的文件起算。
+            let restore = std::fs::write(&path, &current);
+            let detail = match result {
+                Ok(code) => format!("mihomo 拒绝切直连: HTTP {code}"),
+                Err(e) => format!("切直连通信失败: {e}"),
+            };
+            Response::Failed {
+                message: match restore {
+                    Ok(()) => format!("{detail}（进程保持不动）"),
+                    Err(e) => format!("{detail}；恢复旧配置文件失败: {e}（进程保持不动）"),
+                },
+            }
+        }
     }
 }
 

@@ -1,7 +1,8 @@
 //! 本机上网运行时：独立 mihomo 实例（完整节点+分组+智能规则 config）。
 //! start 流程：冲突 → 二进制 → 端口 → config → spawn → 就绪 → 系统代理；
 //! stop 反向：杀进程 + 还原代理。槽位锁全程持有（仿 sidecar::ensure_started 模式），
-//! 子进程已退出视为崩溃自愈（清槽重启）；App 退出经 stop_all 清理。
+//! 子进程已退出视为崩溃自愈（清槽重启）；App 退出经 stop_all 切直连并保留端口
+//! （不能杀：已运行程序的环境变量里还记着这个端口，见 [`stop_for_exit`]）。
 
 use crate::config::AUTO_GROUP;
 use crate::domain::{Node, RelayRule, Server};
@@ -474,6 +475,11 @@ pub async fn start(state: &AppState, opts: StartOptions) -> Result<NetStatus, St
     // 判为「其它代理接管」（就是用户此前反复遇到的 61415 拦截）。
     // 服务先核验会话所属进程，再回收失主会话；必须早于系统代理/TUN 冲突检查。
     recover_service_session()?;
+    // 上一轮退出可能留下一个直连 mihomo 占着固定端口（退出保护，见
+    // `stop_for_exit`）。用户这次明确要开网络：先让服务收掉它，避免把自家端点
+    // 误判成「端口被占用」。失败无所谓——服务不可达时没有服务托管的端点；
+    // 另一个活窗口持有时后面的 StartNet 也会因归属冲突被拒。
+    let _ = svc::call(&SvcRequest::StopNet);
     kill_own_orphans(&state.data_dir, &exclude_own_pids(state))?;
     // 强杀自愈（四重清扫之二）：走到这里必然意味着**本应用没有会话在跑**（上面
     // 要么已 return，要么把死实例清了槽），所以此刻还挂着的自家阻断规则，必然是
@@ -861,22 +867,105 @@ pub async fn apply_config_change(state: &AppState) -> Result<ConfigApply, String
     Ok(ConfigApply::Reloaded)
 }
 
-/// 关闭：杀进程 → 还原系统代理快照 → 清槽。未运行时空操作（幂等）。
+/// 把主程序自己起的 mihomo 切到直连（保留进程与端口）。
+///
+/// 只改 `mode`，不重载整份配置：本地子进程没有 TUN（TUN 只能由服务打开），
+/// 而 `PATCH /configs` 是 mihomo 支持的运行时开关（实测 204，端口不断）。
+async fn switch_direct(n: &RunningNet) -> Result<(), String> {
+    let resp = reqwest::Client::new()
+        .patch(format!("http://127.0.0.1:{}/configs", n.ctrl_port))
+        .bearer_auth(&n.token)
+        .json(&serde_json::json!({ "mode": "direct" }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("请求控制器切换直连失败: {e}"))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let trimmed: String = body.chars().take(200).collect();
+        return Err(format!("控制器拒绝切换直连: HTTP {code} {trimmed}"));
+    }
+    Ok(())
+}
+
+/// 关闭网络时的收尾策略。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopPolicy {
+    /// 用户点「关闭网络」：服务托管的 mihomo 切直连保留；主程序自己起的子进程
+    /// 仍然杀掉（无服务时没有 TUN，测试与收尾也需要它退出）。
+    KeepService,
+    /// 程序退出：两种托管方式都保留一个直连端点。
+    KeepAll,
+}
+
+/// 关闭：服务托管的切直连、本地子进程杀进程 → 还原系统代理快照 → 清槽。
+/// 未运行时空操作（幂等）。
 pub async fn stop(state: &AppState) -> Result<NetStatus, String> {
+    stop_with_policy(state, StopPolicy::KeepService).await
+}
+
+/// 程序退出专用：不杀本机代理，只把它切到直连。
+///
+/// 根因见 [`pinned_mixed_port`] 的注释：用户级 `HTTP_PROXY` 是进程启动那一刻的
+/// 死快照。关闭程序时如果杀掉 7890，浏览器/终端/Claude Code 之类已经跑着的
+/// 程序会整片 `ECONNREFUSED`。切直连后它们仍有一个活着的本地代理，新进程按
+/// 已还原的系统代理设置走直连。
+pub async fn stop_for_exit(state: &AppState) -> Result<NetStatus, String> {
+    stop_with_policy(state, StopPolicy::KeepAll).await
+}
+
+async fn stop_with_policy(state: &AppState, policy: StopPolicy) -> Result<NetStatus, String> {
     let mut guard = state.net.lock().await;
     if let Some(mut n) = guard.take() {
         match n.child.take() {
             Some(mut c) => {
-                let _ = c.kill();
-                let _ = c.wait();
+                if policy == StopPolicy::KeepAll {
+                    if let Err(e) = switch_direct(&n).await {
+                        // 切不过去也**不杀**：留在原模式（通常是 VPN）至少还能上网。
+                        eprintln!("[vpn-ctl] 退出时切换直连失败，保留代理进程: {e}");
+                    }
+                    // 丢掉句柄不会杀进程（std::process::Child 的 Drop 只关句柄）；
+                    // 下次 start 的 kill_own_orphans 会按镜像与 -d 收掉它。
+                    drop(c);
+                } else {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
             }
-            // 进程归服务管，主程序没有句柄——只能请服务停。服务此刻不可达也
-            // 不报错：系统代理与登记表照样要还原，留着才是真断网
-            None => {
-                let _ = svc::call(&SvcRequest::StopNet);
-            }
+            // 进程归服务管，主程序没有句柄——只能请服务切直连。服务此刻不可达
+            // 也不报错：系统代理与登记表照样要还原，留着才是真断网。
+            None => match svc::call(&SvcRequest::Detach) {
+                Ok(SvcResponse::Detached) => {}
+                Ok(SvcResponse::Failed { message }) if svc::is_unknown_command(&message) => {
+                    // 旧服务不认识 Detach，它的 reap_owner 仍会杀掉 mihomo；
+                    // 如实留一条线索，别把「没修上」伪装成成功。
+                    eprintln!(
+                        "[vpn-ctl] 网络服务版本过旧，无法保留直连代理；更新网络服务后，\
+                         关闭程序才不会再让已运行的程序断网: {message}"
+                    );
+                }
+                Ok(SvcResponse::Failed { message }) => {
+                    eprintln!("[vpn-ctl] 保留直连代理失败（进程不杀）: {message}");
+                }
+                Ok(other) => eprintln!("[vpn-ctl] 保留直连代理收到非预期响应: {other:?}"),
+                Err(e) => eprintln!("[vpn-ctl] 请求网络服务保留直连代理失败: {e}"),
+            },
         }
         sysproxy_set::restore_proxy(n.snapshot.as_ref())?;
+    } else {
+        // 界面刚启动、还没开网络也要清掉服务归属：服务可能在上一轮退出时留了
+        // 一个直连 mihomo，归属不清会让下一次开启/退出都被「另一个窗口持有」拦住。
+        match svc::call(&SvcRequest::Detach) {
+            Ok(SvcResponse::Detached) => {}
+            Ok(SvcResponse::Failed { message }) if svc::is_unknown_command(&message) => {}
+            Ok(SvcResponse::Failed { message }) => {
+                eprintln!("[vpn-ctl] 释放网络服务归属失败: {message}");
+            }
+            Ok(other) => eprintln!("[vpn-ctl] 释放网络服务归属收到非预期响应: {other:?}"),
+            // 服务未安装/未启动：没有归属可释放
+            Err(_) => {}
+        }
     }
     // 无条件注销：幂等 stop（本就未运行）也不该留下可疑登记。自我托管集合一起清
     // ——留着它会让下次「没开网络」时的拨号白试一次直连（那时本来就直连，无害但
@@ -1478,5 +1567,6 @@ pub async fn publish_tor(
 
 /// App 退出清理（main ExitRequested 调用）。
 pub async fn stop_all(state: &AppState) {
-    let _ = stop(state).await;
+    // 程序退出的唯一收尾入口：保留一个直连端点，见 [`stop_for_exit`]。
+    let _ = stop_for_exit(state).await;
 }
