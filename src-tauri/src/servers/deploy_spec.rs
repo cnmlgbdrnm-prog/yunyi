@@ -140,21 +140,6 @@ pub fn default_port(proto: &str) -> u16 {
     }
 }
 
-/// 解析部署摘要（deploys.latest_summary 的 config_json）中的已部署协议列表；
-/// 摘要形状 {"protocols":[...],"ports":{...}}，缺字段/损坏记录容忍为空。
-pub fn parse_deployed_protocols(config_json: &str) -> Vec<String> {
-    serde_json::from_str::<serde_json::Value>(config_json)
-        .ok()
-        .and_then(|v| {
-            v.get("protocols")?.as_array().map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-        })
-        .unwrap_or_default()
-}
-
 /// 补装合并：现有协议在前（部署顺序稳定），新勾选协议只补不在列表中的项。
 pub fn merge_deploy_protocols(existing: &[String], chosen: &[String]) -> Vec<String> {
     let mut merged: Vec<String> = existing.to_vec();
@@ -164,6 +149,149 @@ pub fn merge_deploy_protocols(existing: &[String], chosen: &[String]) -> Vec<Str
         }
     }
     merged
+}
+
+/// 已部署协议的展示详情：`label` 是完整的协议变体名（传输层/安全层/流控），
+/// 而不是白名单里的裸协议名。只显示 `vless` 无法区分 TCP+REALITY+Vision 与
+/// WebSocket+TLS，用户也就无从判断“部署的到底是哪种”。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct DeployedProtocolDetail {
+    pub protocol: String,
+    pub port: u16,
+    pub label: String,
+    pub transport: String,
+    pub security: String,
+    pub flow: Option<String>,
+}
+
+/// 协议在 UI/部署白名单中的固定顺序（未知协议排最后）。
+pub fn protocol_order(protocol: &str) -> usize {
+    PROTOCOLS
+        .iter()
+        .position(|p| *p == protocol)
+        .unwrap_or(PROTOCOLS.len())
+}
+
+/// 安全层显示名：只做大小写归一，不替缺失字段编造标签。
+fn security_name(raw: &str) -> String {
+    if raw.eq_ignore_ascii_case("reality") {
+        "REALITY".into()
+    } else if raw.eq_ignore_ascii_case("tls") {
+        "TLS".into()
+    } else if raw.is_empty() {
+        String::new()
+    } else {
+        raw.to_uppercase()
+    }
+}
+
+/// 从节点参数还原协议变体。参数是自建节点写回时的明文 JSON；
+/// 缺失字段按空处理——标签必须与实际握手参数一致，不能“猜一个更好看的”。
+pub fn describe_deployed_protocol(
+    protocol: &str,
+    port: u16,
+    params_json: &str,
+) -> DeployedProtocolDetail {
+    let params: serde_json::Value =
+        serde_json::from_str(params_json).unwrap_or_else(|_| serde_json::json!({}));
+    let s = |key: &str| params.get(key).and_then(|v| v.as_str()).unwrap_or("");
+
+    let (label, transport, security, flow) = match protocol {
+        "vless" => {
+            // 节点参数里写的是小写 "tcp"，大小写都当 TCP，不能把 "tcp" 当传输层
+            // 拼进标签（会出现「VLESS + tcp + REALITY」这种半成品）。
+            let raw_type = s("type");
+            let transport = match raw_type.to_ascii_lowercase().as_str() {
+                "ws" => "WebSocket",
+                "" | "tcp" => "TCP",
+                _ => raw_type,
+            };
+            let security = security_name(s("security"));
+            let raw_flow = s("flow");
+            let mut parts = vec!["VLESS"];
+            if transport != "TCP" {
+                parts.push(transport);
+            }
+            if !security.is_empty() {
+                parts.push(&security);
+            }
+            if raw_flow == "xtls-rprx-vision" {
+                parts.push("Vision");
+            } else if !raw_flow.is_empty() {
+                parts.push(raw_flow);
+            }
+            (
+                parts.join(" + "),
+                transport.to_string(),
+                security,
+                (!raw_flow.is_empty()).then(|| raw_flow.to_string()),
+            )
+        }
+        "trojan" => {
+            let transport = if s("type").eq_ignore_ascii_case("ws") {
+                "WebSocket"
+            } else {
+                "TCP"
+            };
+            let security = security_name(s("security"));
+            let mut parts = vec!["Trojan"];
+            if transport != "TCP" {
+                parts.push(transport);
+            }
+            if !security.is_empty() {
+                parts.push(&security);
+            }
+            (parts.join(" + "), transport.to_string(), security, None)
+        }
+        "vmess" => {
+            let raw_network = s("network");
+            let transport = match raw_network.to_ascii_lowercase().as_str() {
+                "" | "ws" => "WebSocket",
+                "tcp" => "TCP",
+                _ => raw_network,
+            };
+            (
+                format!("VMess + {transport}（无 TLS）"),
+                transport.to_string(),
+                "无".to_string(),
+                None,
+            )
+        }
+        "ss" => {
+            let cipher = match s("cipher") {
+                "" => "2022-blake3-aes-256-gcm",
+                raw => raw,
+            };
+            (
+                format!("SS-2022（{cipher}）"),
+                "TCP+UDP".to_string(),
+                "无".to_string(),
+                None,
+            )
+        }
+        "hysteria2" => (
+            "Hysteria2（QUIC + 自签 TLS）".to_string(),
+            "QUIC".to_string(),
+            "自签 TLS".to_string(),
+            None,
+        ),
+        "tuic" => (
+            "TUIC（QUIC + 自签 TLS）".to_string(),
+            "QUIC".to_string(),
+            "自签 TLS".to_string(),
+            None,
+        ),
+        other => (other.to_string(), String::new(), String::new(), None),
+    };
+
+    DeployedProtocolDetail {
+        protocol: protocol.to_string(),
+        port,
+        label,
+        transport,
+        security,
+        flow,
+    }
 }
 
 /// 解析远端 xray 单进程多入站配置的 (protocol, port) 列表（重部署复用端口用）。

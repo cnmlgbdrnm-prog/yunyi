@@ -1,6 +1,6 @@
 // 服务器列表：每行一张 ServerRow 卡片，展开态内嵌部署向导或编辑表单。
 import type { Dispatch, SetStateAction } from 'react'
-import type { ConnectionTest, Server } from '../../api/types'
+import type { ConnectionTest, DeployedProtocolDetail, Server } from '../../api/types'
 import { isTargetBusy, targetResult, type TrackedJob } from '../../jobs/registry'
 import DeployWizard from '../../components/DeployWizard'
 import ServerFormPanel, { type ServerFormState } from '../../components/ServerFormPanel'
@@ -50,7 +50,7 @@ export default function ServerList({
   bbrChecking: Set<number>
   bbrEnabling: Set<number>
   bbrMsg: Record<number, { ok: boolean; text: string }>
-  deployedProtos: Record<number, string[]>
+  deployedProtos: Record<number, DeployedProtocolDetail[]>
   tests: Record<number, ConnectionTest>
   linkSummary: (s: Server) => string | null
   moreOpen: Set<number>

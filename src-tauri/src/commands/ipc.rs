@@ -495,13 +495,23 @@ pub async fn start_deploy_cmd(
     )
 }
 
-/// 查看已部署协议（最新部署摘要）。
+/// 查看已部署协议（以本地自建节点为准）。
 #[tauri::command]
 pub async fn deployed_protocols_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
 ) -> R<Vec<String>> {
     crate::servers::deploy::deployed_protocols(state.inner(), server_id).map_err(AppError::Message)
+}
+
+/// 查看已部署协议详情（协议变体 + 端口，以本地自建节点为准）。
+#[tauri::command]
+pub async fn deployed_protocol_details_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+) -> R<Vec<crate::servers::deploy::DeployedProtocolDetail>> {
+    crate::servers::deploy::deployed_protocol_details(state.inner(), server_id)
+        .map_err(AppError::Message)
 }
 
 /// 补装协议（现有 ∪ 勾选 提交 deploy job）。

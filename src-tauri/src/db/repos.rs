@@ -1094,21 +1094,6 @@ pub mod deploys {
         )?;
         Ok(())
     }
-
-    /// 最新一次部署摘要（deployed_at 倒序，同毫秒并列时以 id 兜底）；无记录 → None。
-    pub fn latest_summary(conn: &Connection, server_id: i64) -> rusqlite::Result<Option<String>> {
-        conn.query_row(
-            "SELECT config_json FROM deploys WHERE server_id=?1 \
-             ORDER BY deployed_at DESC, id DESC LIMIT 1",
-            params![server_id],
-            |r| r.get(0),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })
-    }
 }
 
 pub mod channels {

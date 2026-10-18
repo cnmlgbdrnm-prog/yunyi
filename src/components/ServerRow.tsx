@@ -7,9 +7,10 @@
 // 展开区（部署向导 / 编辑表单）由父级作为 children 注入：那两块各自持有自己的状态与副作用，
 // 放进来只会让本组件重新变成一个什么都管的巨型组件。
 import type { ReactNode } from 'react'
-import type { ConnectionTest, Server } from '../api/types'
+import type { ConnectionTest, DeployedProtocolDetail, Server } from '../api/types'
 import ConfirmButton from './ConfirmButton'
 import ChannelPanel from './ChannelPanel'
+import DeployedProtocolList from './DeployedProtocolList'
 import ExpandableCard from './ExpandableCard'
 import UpstreamPanel from './UpstreamPanel'
 import { formatCheckedAt } from '../utils/checkedAtFormat'
@@ -35,8 +36,8 @@ interface Props {
     /** 上一次开启/检测的结果 */
     msg: { ok: boolean; text: string } | undefined
   }
-  /** 已部署协议（后端摘要）；undefined = 没读到 → 不显示，也不用空值覆盖 */
-  deployedProtos: string[] | undefined
+  /** 已部署协议详情（后端节点行）；undefined = 没读到 → 不显示，也不用空值覆盖 */
+  deployedProtos: DeployedProtocolDetail[] | undefined
   test: ConnectionTest | undefined
   /** 行内链路摘要（只有已建/接管中的链路才算） */
   linkSummary: string | null
@@ -126,11 +127,7 @@ export default function ServerRow({
                     <p className={`text-xs ${bbr.msg.ok ? 'text-emerald-400' : 'text-red-400'}`}>{bbr.msg.text}</p>
                   )}
                   {linkSummary && <p className="text-xs text-emerald-400">{linkSummary}</p>}
-                  {deployedProtos != null && deployedProtos.length > 0 && (
-                    <p className="text-xs text-neutral-400">
-                      已部署协议：<span className="text-emerald-400">{deployedProtos.join(' · ')}</span>
-                    </p>
-                  )}
+                  <DeployedProtocolList protocols={deployedProtos ?? []} />
                   {test && !test.ok && <p className="text-xs text-red-400">连通测试失败：{test.message}</p>}
                   {test && test.ok && <p className="text-xs text-emerald-400">连通测试成功：{test.system}</p>}
                   {passwordless && (

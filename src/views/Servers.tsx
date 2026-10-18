@@ -13,7 +13,7 @@ import {
   deleteServer,
   enableBbr,
   installIperf3,
-  listDeployedProtocols,
+  listDeployedProtocolDetails,
   listRelayRules,
   listServers,
   listThroughput,
@@ -23,7 +23,7 @@ import {
   testServerConnection,
   updateServer,
 } from '../api'
-import type { ConnectionTest, RelayRule, Server, ThroughputTest } from '../api/types'
+import type { ConnectionTest, DeployedProtocolDetail, RelayRule, Server, ThroughputTest } from '../api/types'
 import {
   bindJob,
   cancelableJobIds,
@@ -61,9 +61,9 @@ export default function Servers() {
   const [pwDone, setPwDone] = useState<Record<number, boolean>>({})
   // 就地展开：同一时间最多一张卡片展开（部署向导或编辑表单），互斥由单状态模型保证
   const [expand, setExpand] = useState<{ type: 'deploy' | 'edit'; id: number } | null>(null)
-  // 已部署协议徽章：**后端为准**（deployed_protocols_cmd 读最新部署摘要）。
+  // 已部署协议徽章：**后端节点行为准**（含完整变体与端口，不再读最新部署摘要）。
   // 原先只由部署完成回调写本地 state，切页即消失——徽章与后端事实重复（评审 #17）。
-  const [deployedProtos, setDeployedProtos] = useState<Record<number, string[]>>({})
+  const [deployedProtos, setDeployedProtos] = useState<Record<number, DeployedProtocolDetail[]>>({})
   // 测速与对测任务态取自注册表：多 job 并行跟踪，切页不丢（见 jobs/registry 文件头）。
   // 后端两个任务共用一个 kind（server_speed），前端分成两个桶——对测终态要另刷吞吐列表。
   const [concurrency, setConcurrency] = useState(3)
@@ -108,12 +108,12 @@ export default function Servers() {
     }
   }, [])
 
-  // 已部署协议：逐台读后端摘要。读失败**不打掉页面**（沿用 Nodes.tsx:68 对隐私开关的做法：
+  // 已部署协议：逐台读后端节点行详情。读失败**不打掉页面**（沿用 Nodes.tsx:68 对隐私开关的做法：
   // 这只是个徽章，没读到就不显示），但也不写空值覆盖上一次结果——免得一次瞬时失败
   // 让徽章闪没。
   const loadDeployed = useCallback(async (ids: number[]) => {
     const pairs = await Promise.all(
-      ids.map(async (id) => [id, await listDeployedProtocols(id).catch(() => null)] as const),
+      ids.map(async (id) => [id, await listDeployedProtocolDetails(id).catch(() => null)] as const),
     )
     setDeployedProtos((prev) => {
       const next = { ...prev }
