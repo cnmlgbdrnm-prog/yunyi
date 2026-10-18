@@ -250,6 +250,20 @@ ALTER TABLE privacies ADD COLUMN fwd_host TEXT NOT NULL DEFAULT '127.0.0.1';
 ALTER TABLE privacies ADD COLUMN fwd_port INTEGER NOT NULL DEFAULT 0;
 UPDATE privacies SET fwd_host = '127.0.0.1', fwd_port = port;
 "#,
+    r#"
+-- v15：服务器双栈地址。host 保持 IPv4/域名；host_v6 为可选的 IPv6 字面量（空串=没有）；
+-- addr_family 决定 SSH 管理、服务器测速与自建节点当前使用的地址族（v4/v6）。
+-- 切换由 set_server_addr_family_cmd 在同一事务内同时改服务器与节点 addr，避免
+-- 「服务器切了、节点还指旧地址」的错位。
+ALTER TABLE servers ADD COLUMN host_v6 TEXT NOT NULL DEFAULT '';
+ALTER TABLE servers ADD COLUMN addr_family TEXT NOT NULL DEFAULT 'v4';
+"#,
+    r#"
+-- v16：服务器出口地址族。与 addr_family（本机→VPS 的入口/管理地址）完全独立：
+-- egress_family 决定 VPS 再访问目标域名时用 IPv4 还是 IPv6 出站（v4/v6）。
+-- 该值在部署时写进三类服务端配置，切换后需要重部署才生效。
+ALTER TABLE servers ADD COLUMN egress_family TEXT NOT NULL DEFAULT 'v4';
+"#,
 ];
 
 /// 当前 schema 版本（= 已应用迁移条数）。测试断言用，避免把版本号写死在断言里——

@@ -98,6 +98,9 @@ export default function DeployWizard({ server, onClose, onDone }: Props) {
   // 部署终态：成功回调 onDone（携带协议清单）+ 送验；失败只上屏原因。
   // 事件丢失由注册表那个唯一的 5s 对账兜底。
   useJobTerminal('deploy', (job) => {
+    // 只认本服务器的任务：保存出口族触发的自动重部署也是 deploy 任务，
+    // 少了目标判据就会把它当成向导自己发起的部署，误报「完成」并收掉向导。
+    if (job.targets[0] !== String(server.id)) return
     if (job.error) {
       setError(job.error)
       return

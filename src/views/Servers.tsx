@@ -9,7 +9,6 @@ import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateA
 import {
   cancelJob,
   checkBbr,
-  createServer,
   deleteServer,
   enableBbr,
   installIperf3,
@@ -21,7 +20,6 @@ import {
   serverThroughput,
   setupPasswordless,
   testServerConnection,
-  updateServer,
 } from '../api'
 import type { ConnectionTest, DeployedProtocolDetail, RelayRule, Server, ThroughputTest } from '../api/types'
 import {
@@ -37,6 +35,8 @@ import {
 import ServerFormPanel, { EMPTY_SERVER_FORM, type ServerFormState } from '../components/ServerFormPanel'
 import ServerList from './servers/ServerList'
 import ServerTools from './servers/ServerTools'
+import { useAddrFamilySwitch } from './servers/useAddrFamilySwitch'
+import { useServerSave } from './servers/useServerSave'
 
 /** Set<number> 型开关状态：新增/移除一个 id。展开态有三处（更多/通道/上游出口），
  *  原先各写一份七行；一份就够，行为也只有一个定义。 */
@@ -69,6 +69,9 @@ export default function Servers() {
   const [concurrency, setConcurrency] = useState(3)
   const speedJobs = useTrackedJobs('server_speed')
   const throughputJobs = useTrackedJobs('server_throughput')
+  // 部署任务（含保存出口族后自动排的重部署）：向导展开时由向导自己显示，
+  // 其余情况由行级进度显示（ServerList）。
+  const deployJobs = useTrackedJobs('deploy')
   // 对测同一时间只允许一个（运行中按钮即禁用），取唯一那个即可
   const throughputJob = firstJob(throughputJobs)
   // BBR：惰性检测（行内按钮触发）；algo=当前算法，msg=成功/失败结果
@@ -124,6 +127,9 @@ export default function Servers() {
     })
   }, [])
 
+  // 地址族切换是「服务器 + 全部自建直连节点」的事务改动，切换期间锁住该行按钮。
+  const { busy: addrBusy, switchTo: handleAddrFamily } = useAddrFamilySwitch(setError, refresh, loadDeployed)
+
   // 行内链路摘要：从规则数据派生（仅显示已建/接管中的链路，not-built 不算）
   const linkSummary = (s: Server): string | null => {
     const rule = rules.find((r) => (r.relay_server_id === s.id || r.landing_server_id === s.id) && r.status !== 'not-built')
@@ -161,24 +167,14 @@ export default function Servers() {
     }
   }, [rules, fromId, toId])
 
-  const handleSave = async () => {
-    if (!form) return
-    setError(null)
-    try {
-      if (editingId != null) {
-        // 编辑模式：凭据留空 = 保留原凭据
-        await updateServer({ ...form, id: editingId, credential: form.credential === '' ? null : form.credential })
-      } else {
-        await createServer({ ...form })
-      }
-      setForm(null)
-      setEditingId(null)
-      setExpand(null)
-      await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
-  }
+  // 保存编排（新建 / 编辑 + 出口变化时的自动重部署）收在 hook 里，见 useServerSave。
+  // 编辑保存后表单关闭，重部署进度因此落在行级（ServerList 的 deployJobs）。
+  const closeForm = useCallback(() => {
+    setForm(null)
+    setEditingId(null)
+    setExpand(null)
+  }, [])
+  const handleSave = useServerSave(servers, editingId, form, refresh, setError, closeForm)
 
   const handleTest = async (id: number) => {
     setTesting((prev) => new Set(prev).add(id))
@@ -357,12 +353,14 @@ export default function Servers() {
     setForm({
       name: s.name,
       host: s.host,
+      hostV6: s.host_v6,
       port: s.port,
       user: s.user,
       authKind: s.auth_kind,
       kind: s.kind,
       notes: s.notes,
       credential: '',
+      egressFamily: s.egress_family,
     })
     setExpand({ type: 'edit', id: s.id })
   }
@@ -372,6 +370,8 @@ export default function Servers() {
   // 部署任务也在这里收：向导可能已经收起或用户已经切页，卡片上的「已部署协议」
   // 仍要立刻对上后端（目标首位就是被部署的服务器 id）。
   useJobTerminal('deploy', (job) => {
+    // 自动重部署没有向导兜着，失败原因要上屏，否则只在行内闪一下就没了
+    if (job.error) setError(job.error)
     const id = Number(job.targets[0])
     if (Number.isNaN(id)) return
     void loadDeployed([id])
@@ -443,7 +443,9 @@ export default function Servers() {
       <ServerList
         servers={servers}
         speedJobs={speedJobs}
+        deployJobs={deployJobs}
         testing={testing}
+        addrBusy={addrBusy}
         pwBusy={pwBusy}
         pwDone={pwDone}
         bbrAlgo={bbrAlgo}
@@ -464,6 +466,7 @@ export default function Servers() {
         onToggleUpstreams={(id) => toggleSet(setUpstreamsOpen, id)}
         onSpeedTest={handleSpeedTestOne}
         onTest={(id) => void handleTest(id)}
+        onAddrFamily={(id, family) => void handleAddrFamily(id, family)}
         onPasswordless={(id) => void handlePasswordless(id)}
         onBbrEnable={(id) => void handleEnableBbr(id)}
         onBbrCheck={(id) => void handleCheckBbr(id)}
@@ -472,11 +475,7 @@ export default function Servers() {
         onDelete={(id) => void handleDelete(id)}
         onClose={() => setExpand(null)}
         onSave={handleSave}
-        onCancelEdit={() => {
-          setForm(null)
-          setEditingId(null)
-          setExpand(null)
-        }}
+        onCancelEdit={closeForm}
         onDeployDone={(s) => {
           // 部署终态：重读后端摘要（徽章不再由回调携带的协议清单镜像）
           setExpand(null)

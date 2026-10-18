@@ -417,6 +417,9 @@ fn refresh_self_hosted(nodes: &[Node], rules: &[RelayRule], servers: &[Server]) 
     for r in rules {
         if let Some(s) = servers.iter().find(|s| s.id == r.relay_server_id) {
             hosts.insert(s.host.clone());
+            if !s.host_v6.is_empty() {
+                hosts.insert(s.host_v6.clone());
+            }
         }
     }
     crate::net::local_proxy::set_self_hosted(hosts);

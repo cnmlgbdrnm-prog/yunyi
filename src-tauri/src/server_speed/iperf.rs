@@ -519,9 +519,15 @@ pub(crate) async fn run_client_and_finish(
 /// 无包管理器/安装失败 → 可读错误带原因；装完 iperf3 -v 验证。
 pub async fn install_iperf3_on(state: &AppState, server_id: i64) -> Result<String, String> {
     let (auth, s) = crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
-    let mut sess = SshSession::connect(&s.host, s.port as u16, &s.user, &auth, CONNECT_TIMEOUT)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut sess = SshSession::connect(
+        crate::domain::effective_host(&s),
+        s.port as u16,
+        &s.user,
+        &auth,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if sess
         .run_ok("检查 iperf3", "iperf3 -v", Duration::from_secs(10))
         .await

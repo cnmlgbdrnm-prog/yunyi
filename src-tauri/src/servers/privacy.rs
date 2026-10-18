@@ -526,7 +526,7 @@ pub async fn run_privacy_job(
     }
 
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,
@@ -605,7 +605,7 @@ pub async fn run_privacy_job(
             if is_ssh_transport_loss(e) {
                 emit("重连", "SSH 中断，重新核对远端 Onion", 92);
                 if let Ok(mut fresh) = SshSession::connect(
-                    &server.host,
+                    crate::domain::effective_host(&server),
                     server.port as u16,
                     &server.user,
                     &auth,
@@ -645,7 +645,7 @@ pub async fn run_privacy_job(
             emit("回滚", "开启失败，正在回滚", 90);
             // 原会话可能正是失败原因。回滚先建立新连接，才有机会恢复远端配置。
             let rollback_result = match SshSession::connect(
-                &server.host,
+                crate::domain::effective_host(&server),
                 server.port as u16,
                 &server.user,
                 &auth,
@@ -996,7 +996,7 @@ pub async fn run_privacy_remove_job(
     };
 
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,

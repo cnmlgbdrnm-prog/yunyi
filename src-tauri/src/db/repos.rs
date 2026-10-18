@@ -820,7 +820,7 @@ pub mod servers {
     use super::*;
     use crate::domain::Server;
 
-    const COLS: &str = "id,name,host,port,user,auth_kind,kind,system,notes,created_at,latency,bandwidth,last_checked_at,last_check_error";
+    const COLS: &str = "id,name,host,port,user,auth_kind,kind,system,notes,created_at,latency,bandwidth,last_checked_at,last_check_error,host_v6,addr_family,egress_family";
 
     pub fn list(conn: &Connection) -> rusqlite::Result<Vec<Server>> {
         let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM servers ORDER BY name"))?;
@@ -843,17 +843,17 @@ pub mod servers {
 
     pub fn insert(conn: &Connection, s: &Server, auth_ref: &str) -> rusqlite::Result<()> {
         conn.execute(
-            "INSERT INTO servers (name,host,port,user,auth_kind,auth_ref,kind,system,notes,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![s.name, s.host, s.port, s.user, s.auth_kind, auth_ref, s.kind, s.system, s.notes, s.created_at],
+            "INSERT INTO servers (name,host,host_v6,addr_family,egress_family,port,user,auth_kind,auth_ref,kind,system,notes,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![s.name, s.host, s.host_v6, s.addr_family, s.egress_family, s.port, s.user, s.auth_kind, auth_ref, s.kind, s.system, s.notes, s.created_at],
         )?;
         Ok(())
     }
 
     pub fn update(conn: &Connection, s: &Server) -> rusqlite::Result<()> {
         conn.execute(
-            "UPDATE servers SET name=?2,host=?3,port=?4,user=?5,auth_kind=?6,kind=?7,notes=?8 WHERE id=?1",
-            params![s.id, s.name, s.host, s.port, s.user, s.auth_kind, s.kind, s.notes],
+            "UPDATE servers SET name=?2,host=?3,host_v6=?4,addr_family=?5,egress_family=?6,port=?7,user=?8,auth_kind=?9,kind=?10,notes=?11 WHERE id=?1",
+            params![s.id, s.name, s.host, s.host_v6, s.addr_family, s.egress_family, s.port, s.user, s.auth_kind, s.kind, s.notes],
         )?;
         Ok(())
     }
@@ -956,6 +956,9 @@ pub mod servers {
             bandwidth: r.get(11)?,
             last_checked_at: r.get(12)?,
             last_check_error: r.get(13)?,
+            host_v6: r.get(14)?,
+            addr_family: r.get(15)?,
+            egress_family: r.get(16)?,
         })
     }
 }

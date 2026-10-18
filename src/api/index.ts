@@ -31,6 +31,7 @@ import type {
   SyncOutcome,
   ThroughputTest,
   UpdateInfo,
+  UpdateServerResult,
   Upstream,
 } from './types'
 
@@ -249,6 +250,7 @@ export function listServers(): Promise<Server[]> {
 export function createServer(input: {
   name: string
   host: string
+  hostV6: string
   port: number
   user: string
   authKind: 'password' | 'key'
@@ -263,14 +265,27 @@ export function updateServer(input: {
   id: number
   name: string
   host: string
+  hostV6: string
   port: number
   user: string
   authKind: 'password' | 'key'
   kind: 'relay' | 'landing'
   notes: string
   credential: string | null
-}): Promise<Server> {
+  egressFamily: 'v4' | 'v6'
+}): Promise<UpdateServerResult> {
   return invoke('update_server_cmd', { ...input })
+}
+
+/** 切换整台服务器（SSH/测速/自建直连节点）的地址族。
+ *  首次切到 v6 且未登记地址时，后端会 SSH 到服务器自动探测并登记。 */
+export function setServerAddrFamily(id: number, family: 'v4' | 'v6'): Promise<Server> {
+  return invoke('set_server_addr_family_cmd', { id, family })
+}
+
+/** 只探测不切换：从服务器自身读取全局 IPv6，返回候选地址（推荐值在首位）。 */
+export function detectServerIpv6(id: number): Promise<string[]> {
+  return invoke('detect_server_ipv6_cmd', { id })
 }
 
 export function deleteServer(id: number): Promise<void> {

@@ -82,7 +82,7 @@ pub fn add_channel(state: &AppState, input: AddChannelInput) -> Result<Channel, 
 pub async fn scan_ports(state: &AppState, server_id: i64) -> Result<Vec<ServerPort>, ServersError> {
     let (auth, server) = load_auth(state, server_id)?;
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,
@@ -262,7 +262,7 @@ async fn connect_channel(state: &AppState, id: i64) -> Result<(Channel, SshSessi
     };
     let (auth, server) = load_auth(state, channel.server_id)?;
     let sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,

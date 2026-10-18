@@ -8,7 +8,7 @@
 // （应用状态装配）模块；
 // main() 启动 Tauri，注册 updater 自更新插件（minisign 校验 GitHub Releases 签名），
 // 在 setup 阶段打开数据目录、创建数据库、装配 AppState 后注入 managed state
-// （含打包内置 mihomo 资源路径），并以 invoke_handler 注册全部 44 个 Tauri 命令
+// （含打包内置 mihomo 资源路径），并以 invoke_handler 注册全部 Tauri 命令
 // 供前端调用；ExitRequested 时停止 sidecar 子进程。
 // 输入输出：无输入参数；正常退出码 0，Tauri 构建失败时 panic。
 // 依赖：tauri；本文件声明的 commands、config、crypto、db、domain、jobs、relay、serve、
@@ -293,6 +293,8 @@ fn main() {
             commands::list_servers_cmd,
             commands::create_server_cmd,
             commands::update_server_cmd,
+            commands::set_server_addr_family_cmd,
+            commands::detect_server_ipv6_cmd,
             commands::delete_server_cmd,
             commands::test_server_connection_cmd,
             commands::setup_passwordless_cmd,

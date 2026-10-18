@@ -13,6 +13,7 @@ import ChannelPanel from './ChannelPanel'
 import DeployedProtocolList from './DeployedProtocolList'
 import ExpandableCard from './ExpandableCard'
 import UpstreamPanel from './UpstreamPanel'
+import { effectiveServerHost, formatHostPort } from '../utils/addrFamily'
 import { formatCheckedAt } from '../utils/checkedAtFormat'
 import { formatBandwidth } from '../utils/format'
 import { serverKindLabel } from '../utils/serverKindLabel'
@@ -22,6 +23,10 @@ interface Props {
   /** 行内测速状态：busy=有在跟踪的任务覆盖这台；error=该行失败原因；done=有结果且无错 */
   speed: { busy: boolean; error: string | null; done: boolean }
   testing: boolean
+  /** 地址族切换进行中（服务器 + 全部自建直连节点一起改，期间锁住开关） */
+  addrBusy: boolean
+  /** 切到 v6 时若未登记地址，后端会自动 SSH 探测并登记后再切 */
+  onAddrFamily: (family: 'v4' | 'v6') => void
   /** 一键免密进行中 */
   passwordlessBusy: boolean
   /** 免密态：本地刚成功 **或** 服务器本就是密钥认证（后者不依赖操作时的临时状态） */
@@ -56,6 +61,9 @@ interface Props {
   onEdit: () => void
   onDelete: () => void
   onClose: () => void
+  /** 常驻卡片底部、不随展开区收起（自动重部署的行内进度就落在这里：
+   *  编辑保存后表单即关闭，展开区里放不下一个已经收起的进度条）。 */
+  footer?: ReactNode
   children?: ReactNode
 }
 
@@ -63,6 +71,8 @@ export default function ServerRow({
   server: s,
   speed,
   testing,
+  addrBusy,
+  onAddrFamily,
   passwordlessBusy,
   passwordless,
   passwordlessJustDone,
@@ -84,6 +94,7 @@ export default function ServerRow({
   onEdit,
   onDelete,
   onClose,
+  footer,
   children,
 }: Props) {
   // BBR 按钮有两种动作：检测出来的算法**不是** bbr 且还没给过结果时，点它是「开启」；
@@ -108,9 +119,33 @@ export default function ServerRow({
                     <span className="rounded bg-emerald-950 px-1.5 py-0.5 text-xs text-emerald-300">已免密</span>
                   )}
                 </div>
-                <p className="text-xs text-neutral-400">
-                  <span>{s.host}:{s.port}</span> · {s.user} · <span>{s.auth_kind === 'password' ? '密码' : '密钥'}</span>
-                  {s.system ? ` · ${s.system}` : ''}
+                <p className="flex flex-wrap items-center gap-x-1 text-xs text-neutral-400">
+                  <span className="font-mono">{formatHostPort(effectiveServerHost(s), s.port)}</span>
+                  <span className="ml-1 inline-flex overflow-hidden rounded border border-neutral-700" role="group" aria-label="地址族">
+                    <button
+                      type="button"
+                      aria-pressed={s.addr_family === 'v4'}
+                      disabled={addrBusy}
+                      onClick={() => s.addr_family !== 'v4' && onAddrFamily('v4')}
+                      className={`px-1.5 py-0.5 ${s.addr_family === 'v4' ? 'bg-blue-600 text-white' : 'text-neutral-400 hover:bg-neutral-800'} disabled:cursor-not-allowed disabled:opacity-50`}
+                    >
+                      IPv4
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={s.addr_family === 'v6'}
+                      aria-busy={addrBusy}
+                      disabled={addrBusy}
+                      title={s.host_v6 ? undefined : '未登记 IPv6 地址：点击后自动从服务器探测，也可以在「编辑」里手动填写'}
+                      onClick={() => s.addr_family !== 'v6' && onAddrFamily('v6')}
+                      className={`px-1.5 py-0.5 ${s.addr_family === 'v6' ? 'bg-blue-600 text-white' : 'text-neutral-400 hover:bg-neutral-800'} disabled:cursor-not-allowed disabled:opacity-50`}
+                    >
+                      {addrBusy ? '…' : 'IPv6'}
+                    </button>
+                  </span>
+                  <span>· {s.user} · <span>{s.auth_kind === 'password' ? '密码' : '密钥'}</span>
+                    {s.system ? ` · ${s.system}` : ''}
+                  </span>
                 </p>
                 <p className="text-xs text-neutral-500">
                   {s.latency != null ? `延迟 ${s.latency}ms` : '延迟 —'} ·{' '}
@@ -202,13 +237,14 @@ export default function ServerRow({
               </div>
             )}
             {open.channels && <ChannelPanel serverId={s.id} />}
-            {open.upstreams && <UpstreamPanel serverId={s.id} serverHost={s.host} />}
+            {open.upstreams && <UpstreamPanel serverId={s.id} serverHost={effectiveServerHost(s)} />}
           </div>
         }
         onClose={onClose}
       >
         {children}
       </ExpandableCard>
+      {footer != null && <div className="px-4 pb-4">{footer}</div>}
     </li>
   )
 }

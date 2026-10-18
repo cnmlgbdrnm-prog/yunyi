@@ -250,6 +250,13 @@ export interface Server {
   id: number
   name: string
   host: string
+  /** 可选 IPv6 字面量（不带方括号）；空串表示未登记。 */
+  host_v6: string
+  /** 当前选用的地址族：v4 用 host，v6 用 host_v6。 */
+  addr_family: 'v4' | 'v6'
+  /** 服务器出口地址族：VPS → 目标域名时优先/限定哪一族。
+   *  与 `addr_family` 完全独立；改动后需重部署才在 VPS 上生效。 */
+  egress_family: 'v4' | 'v6'
   port: number
   user: string
   auth_kind: 'password' | 'key'
@@ -261,6 +268,16 @@ export interface Server {
   bandwidth: number | null
   last_checked_at: string | null
   last_check_error: string | null
+}
+
+/** 更新服务器结果：保存本身总是成功；出口族变化时后端自动排的重部署
+ *  作为「后续动作」单独返回，提交失败只进 `deploy_error`，不回滚保存。 */
+export interface UpdateServerResult {
+  server: Server
+  /** 已排队的重部署任务 id；未触发（出口未变/未部署任何协议）为 null */
+  deploy_job_id: number | null
+  /** 排重部署失败的原因；成功或未触发为 null */
+  deploy_error: string | null
 }
 
 export interface ConnectionTest {

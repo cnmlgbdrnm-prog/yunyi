@@ -178,6 +178,12 @@ pub fn drop_rule(token: &str, port: u16) -> String {
 }
 
 pub fn url_for(host: &str, port: u16, token: &str) -> String {
+    // IPv6 字面量在 URL 里必须带方括号；数据库只存裸地址。
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
     format!("http://{host}:{port}/sub/{token}")
 }
 
@@ -321,7 +327,7 @@ pub async fn create_share(
 
     let cancel = AtomicBool::new(false);
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,
@@ -447,10 +453,10 @@ pub async fn create_share(
     Ok(ShareInfo {
         server_id,
         server_name: server.name.clone(),
-        host: server.host.clone(),
+        host: crate::domain::effective_host(&server).to_string(),
         token: token.clone(),
         port,
-        url: url_for(&server.host, port, &token),
+        url: url_for(crate::domain::effective_host(&server), port, &token),
         node_names: proxy_names(&yaml),
         active,
     })
@@ -532,7 +538,7 @@ async fn read_server_shares(
 ) -> Result<Vec<ShareInfo>, String> {
     let (auth, _) = crate::servers::load_auth(state, server.id).map_err(|e| e.to_string())?;
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(server),
         server.port as u16,
         &server.user,
         &auth,
@@ -611,10 +617,10 @@ async fn read_server_shares(
         out.push(ShareInfo {
             server_id: server.id,
             server_name: server.name.clone(),
-            host: server.host.clone(),
+            host: crate::domain::effective_host(server).to_string(),
             token: token.to_string(),
             port,
-            url: url_for(&server.host, port, token),
+            url: url_for(crate::domain::effective_host(server), port, token),
             node_names: proxy_names(&yaml),
             active,
         });
@@ -685,7 +691,7 @@ pub async fn delete_share(
         (server, auth)
     };
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,

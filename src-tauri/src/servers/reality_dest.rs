@@ -46,6 +46,17 @@ pub fn rewrite_sni_in_params(params_json: &str, dest: &str) -> Option<String> {
     serde_json::to_string(&v).ok()
 }
 
+/// 从节点 params_json 只读取 sni（不改写）：非 REALITY / 无 sni / 空串返回 None。
+/// 重部署时用它保留用户自定义的伪装域名——不读回来就会回落默认值，
+/// 表现为「只切了出口，伪装域名却被重置」。
+pub fn sni_of_params(params_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(params_json).ok()?;
+    v.get("sni")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// 远程改写命令（纯函数，测试用 base64 解码回来看脚本内容）。
 /// 脚本自身含大量单引号（`DEST='…'`、`o.get('dest')`）——**不能**直接
 /// `python3 -c '<脚本>'`：内层单引号会提前闭合外层引用、把引号全部吃掉，
@@ -96,7 +107,7 @@ pub async fn change_reality_dest(
     let dest = validate_dest(dest)?;
     let (auth, server) = load_auth(state, server_id)?;
     let mut sess = SshSession::connect(
-        &server.host,
+        crate::domain::effective_host(&server),
         server.port as u16,
         &server.user,
         &auth,
@@ -137,8 +148,13 @@ pub async fn change_reality_dest(
         )));
     }
     let conn = state.db.lock();
-    repos::nodes::update_reality_sni(&conn, &server.host, &dest, &state.creds)
-        .map_err(|e| ServersError::Db(e.to_string()))?;
+    repos::nodes::update_reality_sni(
+        &conn,
+        crate::domain::effective_host(&server),
+        &dest,
+        &state.creds,
+    )
+    .map_err(|e| ServersError::Db(e.to_string()))?;
     Ok(())
 }
 
