@@ -361,6 +361,56 @@ pub fn dead_self_env_proxy(
     checked > 0
 }
 
+/// 从两套已读出的值里挑出「本应用留下的、指向本机死端口的代理端口」。
+///
+/// 判定与 [`dead_self_proxy`] / [`dead_self_env_proxy`] 同源且同样保守：某一套值里
+/// 只要有一个端点非 loopback、有监听或解析不出，就整套不报告——宁可漏掉一次自愈，
+/// 也绝不把用户自己配的公司代理当成残留去动。
+///
+/// 返回去重后的端口，固定混合端口 [`crate::net::runtime::NET_DEFAULT_PORT`] 排在最前：
+/// 登录兜底只需要一个活端点，优先恢复当前版本会写入的那个端口。
+pub fn dead_ports(
+    server: Option<&str>,
+    env: &[(&str, Option<String>)],
+    listener: &dyn Fn(u16) -> bool,
+) -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Some(server) = server {
+        if dead_self_proxy(server, listener) {
+            ports.extend(parse_proxy_endpoints(server).into_iter().map(|(_, p)| p));
+        }
+    }
+    if dead_self_env_proxy(env, listener) {
+        for (_, value) in env {
+            if let Some((_, port)) = value.as_deref().and_then(parse_env_proxy_url) {
+                ports.push(port);
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    let default = crate::net::runtime::NET_DEFAULT_PORT;
+    if let Some(pos) = ports.iter().position(|p| *p == default) {
+        let port = ports.remove(pos);
+        ports.insert(0, port);
+    }
+    ports
+}
+
+/// 登录兜底：当前用户级指针里是否有「指向本机死端口」的残留，返回候选端口。
+/// 只读；清除或拉起兜底由调用方决定（见 [`crate::boot_heal`]）。
+#[cfg(windows)]
+pub fn dead_self_proxy_ports() -> Result<Vec<u16>, String> {
+    let server = live_system_proxy()?;
+    let env = read_user_env_proxies()?;
+    Ok(dead_ports(server.as_deref(), &env, &local_listener_exists))
+}
+
+#[cfg(not(windows))]
+pub fn dead_self_proxy_ports() -> Result<Vec<u16>, String> {
+    Ok(Vec::new())
+}
+
 #[cfg(windows)]
 fn local_listener_exists(port: u16) -> bool {
     // Go 系代理（SO_REUSEADDR，Windows 假空闲）吃 bind 探测——必须查真实监听表。

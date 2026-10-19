@@ -454,10 +454,19 @@ async fn sync_local_private(
         Ok(()) => match crate::net::runtime::apply_config_change(state).await {
             Ok(crate::net::runtime::ConfigApply::NotRunning) => Ok(()),
             Ok(_) => {
-                emit("核验", "验证本机隐私线路的 HTTPS 请求", 97);
-                crate::net::runtime::verify_private_proxy(state, &display_name(&target.name))
-                    .await
-                    .map_err(|e| format!("隐私线路 HTTPS 核验失败: {e}"))
+                emit("等待", "等待本机 Tor 引导完成", 96);
+                match crate::net::private_gate::wait_ready(state).await {
+                    Ok(()) => {
+                        emit("核验", "验证本机隐私线路的 HTTPS 请求", 97);
+                        crate::net::runtime::verify_private_proxy(
+                            state,
+                            &display_name(&target.name),
+                        )
+                        .await
+                        .map_err(|e| format!("隐私线路 HTTPS 核验失败: {e}"))
+                    }
+                    Err(e) => Err(format!("隐私入口未就绪: {e}")),
+                }
             }
             Err(e) => Err(format!("更新运行中客户端配置失败: {e}")),
         },
