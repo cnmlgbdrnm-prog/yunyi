@@ -943,3 +943,57 @@ pub async fn get_peer_config_cmd(
 ) -> R<String> {
     get_peer_config(state.inner().clone(), peer_id).await
 }
+
+#[tauri::command]
+pub async fn server_monitor_summary_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> R<MonitorSummary> {
+    monitor_summary(state.inner().clone())
+}
+
+#[tauri::command]
+pub async fn server_monitor_history_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+    metric: String,
+    range_secs: i64,
+) -> R<Vec<MonitorPoint>> {
+    monitor_history(state.inner().clone(), server_id, metric, range_secs)
+}
+
+#[tauri::command]
+pub async fn server_monitor_alerts_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    include_resolved: bool,
+    limit: u32,
+) -> R<Vec<MonitorAlert>> {
+    monitor_alerts(state.inner().clone(), include_resolved, limit)
+}
+
+#[tauri::command]
+pub async fn server_monitor_collect_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> R<MonitorSummary> {
+    monitor_collect(state.inner().clone()).await
+}
+
+#[tauri::command]
+pub async fn server_monitor_config_cmd(state: tauri::State<'_, Arc<AppState>>) -> R<MonitorConfig> {
+    monitor_config(state.inner().clone())
+}
+
+#[tauri::command]
+pub async fn server_monitor_set_config_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    config: MonitorConfig,
+) -> R<MonitorConfig> {
+    monitor_set_config(state.inner().clone(), config)
+}
+
+#[tauri::command]
+pub async fn server_monitor_ack_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    alert_id: i64,
+) -> R<()> {
+    monitor_ack(state.inner().clone(), alert_id)
+}
