@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T1（pending）
-- 下一动作：创建 `server_monitor` 模块骨架与配置解析
+- 当前：T2（pending）
+- 下一动作：增加迁移 v17 与样本存储
 - 阻塞：无
-- 已完成：（空）
+- 已完成：T1
 - 最后更新：2026-10-19
 
 ---
@@ -118,7 +118,7 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 - **验收:** `cargo test --features local-tests server_monitor::config -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；`cargo check` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `c0777e2`；config 测试 5/5、server_monitor 模块 7/7 通过，`cargo check` 通过；任务审查 Spec ✅ / Task quality Approved（5 条 Minor 已登记 SDD ledger）
 
 - [ ] **Step 1: 写失败的配置测试**
 
