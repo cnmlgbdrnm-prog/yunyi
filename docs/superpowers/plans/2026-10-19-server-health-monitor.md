@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T4（pending）
-- 下一动作：实现告警状态机
+- 当前：T5（pending）
+- 下一动作：实现告警存储与摘要查询
 - 阻塞：无
-- 已完成：T1、T2、T3
+- 已完成：T1、T2、T3、T4
 - 最后更新：2026-10-19
 
 ---
@@ -1602,7 +1602,7 @@ git commit -m "feat(monitor): 增加采集脚本输出解析"
 
 - **验收:** `cargo test --features local-tests server_monitor::alert -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commits `d999d5f` + `afc385a`；告警测试 9/9（含第二轮真实 store 口径回归），修复轮 1/5 复审查 ADDRESSED；任务审查最终 Approved（1 条 Important 已修，5 条 Minor 已登记 SDD ledger）
 
 - [ ] **Step 1: 写失败的告警测试**
 
@@ -1755,9 +1755,38 @@ fn service_transition_from_active_opens_after_two_samples() {
     d2.services.as_mut().unwrap().insert("xray".into(), "inactive".into());
     let recent = [base.clone(), d1];
     let mut i = input(&d2, &recent, &[], &t);
-    i.last_reachable = Some(&base);
+    // 第 2 轮的真实 store 值：最近可达样本就是上一轮的掉线样本。
+    i.last_reachable = Some(&recent[1]);
     let tr = evaluate(&i);
     assert!(tr.iter().any(|x| matches!(x, AlertTransition::Open { kind: AlertKind::Service, .. })));
+}
+
+#[test]
+fn service_opens_on_round_two_when_last_reachable_is_the_first_down_sample() {
+    let t = Thresholds::default();
+    let base = sample("t1", true);
+    let mut down1 = sample("t2", true);
+    down1.services.as_mut().unwrap().insert("xray".into(), "inactive".into());
+
+    // 第 1 轮：基线健康，连续掉线只有 1 次，不打开。
+    let round1_recent = [base.clone()];
+    let mut r1 = input(&down1, &round1_recent, &[], &t);
+    r1.last_reachable = Some(&base);
+    assert!(!evaluate(&r1).iter().any(|x| matches!(
+        x,
+        AlertTransition::Open { kind: AlertKind::Service, .. }
+    )));
+
+    // 第 2 轮：last_reachable 是上一轮的掉线样本，基线要从 recent 更早处找到。
+    let mut down2 = sample("t3", true);
+    down2.services.as_mut().unwrap().insert("xray".into(), "inactive".into());
+    let round2_recent = [base, down1];
+    let mut r2 = input(&down2, &round2_recent, &[], &t);
+    r2.last_reachable = Some(&round2_recent[1]);
+    assert!(evaluate(&r2).iter().any(|x| matches!(
+        x,
+        AlertTransition::Open { kind: AlertKind::Service, .. }
+    )));
 }
 
 #[test]
@@ -2198,15 +2227,9 @@ fn eval_service(input: &AlertInput<'_>, out: &mut Vec<AlertTransition>) {
                     });
                     return;
                 }
-                let baseline_active = input.last_reachable.is_some_and(|s| {
-                    s.services.as_ref().is_some_and(|m| {
-                        input
-                            .expected_services
-                            .iter()
-                            .all(|u| m.get(u).map(String::as_str) == Some("active"))
-                    })
-                });
-                if baseline_active && service_down_streak(input) >= TRANSITION_SAMPLES {
+                if service_baseline_active(input)
+                    && service_down_streak(input) >= TRANSITION_SAMPLES
+                {
                     out.push(AlertTransition::Open {
                         kind: AlertKind::Service,
                         severity: Severity::Critical,
@@ -2240,6 +2263,45 @@ fn down_value(expected: &[String], states: &BTreeMap<String, String>) -> String 
         .map(|u| format!("{u}={}", states.get(u).map(String::as_str).unwrap_or("unknown")))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn all_expected_active(
+    input: &AlertInput<'_>,
+    states: Option<&BTreeMap<String, String>>,
+) -> bool {
+    states.is_some_and(|m| {
+        input
+            .expected_services
+            .iter()
+            .all(|u| m.get(u).map(String::as_str) == Some("active"))
+    })
+}
+
+/// 掉线段的基线：最近可达样本全 active 时直接采用；否则（上一轮已经掉线）
+/// 从 `recent` 向前跳过不可达、状态未知与本轮掉线段，取更早的最近可达样本。
+/// 只看 `last_reachable` 会在第二轮永远拿到上一轮 down 样本，服务告警永远打不开。
+fn service_baseline_active(input: &AlertInput<'_>) -> bool {
+    if input
+        .last_reachable
+        .is_some_and(|s| all_expected_active(input, s.services.as_ref()))
+    {
+        return true;
+    }
+    for s in input.recent.iter().rev() {
+        if !s.reachable {
+            continue;
+        }
+        let Some(m) = &s.services else { continue };
+        if input
+            .expected_services
+            .iter()
+            .any(|u| matches!(m.get(u).map(String::as_str), Some("inactive" | "failed")))
+        {
+            continue;
+        }
+        return all_expected_active(input, Some(m));
+    }
+    false
 }
 
 fn service_down_streak(input: &AlertInput<'_>) -> u32 {
@@ -2369,7 +2431,7 @@ mod tests {
 - [ ] **Step 4: 运行告警测试**
 
 Run: `cargo test --features local-tests server_monitor::alert -- --skip net::runtime_tests --skip net::runtime_service_tests`
-Expected: 7 个告警测试通过。
+Expected: 9 个告警测试通过（含第 2 轮真实 store 口径的回归用例）。
 
 - [ ] **Step 5: 提交**
 
