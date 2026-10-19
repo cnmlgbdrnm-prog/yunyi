@@ -6,6 +6,8 @@ import {
   refreshMonitor,
   useMonitorSummary,
 } from '../monitor/registry'
+import AlertHistory from './monitor/AlertHistory'
+import MonitorSettingsDrawer from './monitor/MonitorSettingsDrawer'
 import ServerCard from './monitor/ServerCard'
 
 function relative(ts: string | null): string {
@@ -20,6 +22,8 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
   const { summary, collecting, error } = useMonitorSummary()
   const [expanded, setExpanded] = useState<number | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [historyKey, setHistoryKey] = useState(0)
 
   useEffect(() => {
     void refreshMonitor()
@@ -39,6 +43,7 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
     try {
       await monitorAck(id)
       await refreshMonitor()
+      setHistoryKey((k) => k + 1)
     } catch (e) {
       setActionError(String(e))
     }
@@ -72,6 +77,13 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
             className="rounded bg-emerald-700 px-3 py-1.5 text-sm text-white disabled:opacity-50"
           >
             {collecting ? '采集中…' : '立即采集'}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+            className="rounded border border-neutral-700 px-3 py-1.5 text-sm text-neutral-300"
+          >
+            设置
           </button>
         </div>
       </div>
@@ -149,6 +161,20 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
             />
           ))}
         </div>
+      )}
+
+      <AlertHistory refreshKey={historyKey} onAck={(id) => void ack(id)} />
+      {settingsOpen && (
+        <MonitorSettingsDrawer
+          config={summary.config}
+          servers={summary.servers}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={(cfg) => {
+            void cfg
+            setSettingsOpen(false)
+            void refreshMonitor()
+          }}
+        />
       )}
     </div>
   )
