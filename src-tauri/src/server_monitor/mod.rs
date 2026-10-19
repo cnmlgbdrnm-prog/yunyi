@@ -1,6 +1,7 @@
 //! 服务器健康监控：应用内调度、只读 SSH 采集、样本/告警存储与 IPC 类型。
 //! 子模块随任务逐个加入（T1 只声明 config）；每新增一个文件都要在这里补一行，
 //! 否则后面的任务会在模块文件尚未创建时编译失败。
+pub mod alerts;
 pub mod config;
 pub mod parse;
 pub mod store;
