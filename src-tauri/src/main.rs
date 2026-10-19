@@ -272,7 +272,16 @@ fn main() {
             if let Err(e) = crate::boot_heal::ensure_registered() {
                 eprintln!("[vpn-ctl] 注册登录兜底失败: {e}");
             }
+            let monitor_state = state.clone();
             app.manage(state);
+            let monitor_handle = app.handle().clone();
+            let monitor_emit: crate::server_monitor::MonitorEmit =
+                Arc::new(move |event, payload| {
+                    let _ = monitor_handle.emit(event, payload);
+                });
+            if let Err(e) = crate::server_monitor::start(&monitor_state, monitor_emit) {
+                eprintln!("[vpn-ctl] 启动服务器监控失败: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -372,6 +381,7 @@ fn main() {
             // 杀了它就会整片断网（见 net::runtime::stop_for_exit 的根因说明）
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let state = app.state::<Arc<AppState>>();
+                tauri::async_runtime::block_on(crate::server_monitor::stop(&state));
                 tauri::async_runtime::block_on(crate::speed::stop_all(&state));
                 tauri::async_runtime::block_on(crate::net::runtime::stop_all(&state));
                 // 双保险：`net::runtime::stop` 已经会收 Tor，但槽位为空时它走不到那句
