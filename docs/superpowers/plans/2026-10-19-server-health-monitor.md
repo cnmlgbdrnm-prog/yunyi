@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T5（pending）
-- 下一动作：实现告警存储与摘要查询
+- 当前：T6（pending）
+- 下一动作：实现只读 SSH 探针与采集脚本
 - 阻塞：无
-- 已完成：T1、T2、T3、T4
+- 已完成：T1、T2、T3、T4、T5
 - 最后更新：2026-10-19
 
 ---
@@ -2460,11 +2460,11 @@ git commit -m "feat(monitor): 增加告警状态机"
   - `store::apply_transitions(&Connection, i64, &str, &[AlertTransition]) -> Result<(), String>`
   - `store::ack(&Connection, i64, &str) -> Result<bool, String>`
   - `summary::expected_units(&[String]) -> Vec<String>`
-  - `summary::build_summary(&Arc<AppState>, Option<&MonitorShared>) -> Result<MonitorSummary, String>`
+  - `summary::build_summary(&Arc<AppState>, Option<&MonitorStatus>) -> Result<MonitorSummary, String>`
 
 - **验收:** `cargo test --features local-tests server_monitor::summary -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `a36dff5`；摘要测试 4/4、server_monitor 模块 32/32 通过；`active_alerts` 列映射 11/11、`build_summary` 在调用 `deployed_protocols` 前释放 DB 锁；任务审查 Spec ✅ / Task quality Approved（6 条 Minor 已登记 SDD ledger）
 
 - [ ] **Step 1: 写失败的摘要测试**
 
