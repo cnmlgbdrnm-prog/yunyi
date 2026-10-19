@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T10（pending）
-- 下一动作：实现纯 SVG 趋势图
+- 当前：T11（pending）
+- 下一动作：实现趋势面板 TrendPanel
 - 阻塞：无
-- 已完成：T1–T9
+- 已完成：T1–T10
 - 最后更新：2026-10-19
 
 ---
@@ -4564,7 +4564,7 @@ git commit -m "feat(monitor): 增加前端类型、API 与事件 store"
 
 - **验收:** `npx vitest run tests/frontend/components/LineChart.test.tsx` 通过；组件 ≤500 行。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `737c650`；`npx vitest run tests/frontend/components/LineChart.test.tsx` 4/4 通过；`npx tsc --noEmit` 通过；review Spec ✅、Approved（6 项 Minor 已登记 ledger 留待收尾）
 
 - [ ] **Step 1: 写失败的图表测试**
 
