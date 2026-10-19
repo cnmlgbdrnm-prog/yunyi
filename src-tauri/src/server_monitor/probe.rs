@@ -41,8 +41,12 @@ pub enum ProbeOutcome {
         stdout: String,
         command_error: Option<String>,
     },
-    Unreachable { error: String },
-    LocalError { error: String },
+    Unreachable {
+        error: String,
+    },
+    LocalError {
+        error: String,
+    },
 }
 
 #[async_trait]

@@ -53,10 +53,7 @@ pub struct MonitorHandle {
 }
 
 pub fn start(state: &Arc<AppState>, emit: MonitorEmit) -> Result<(), String> {
-    let mut slot = state
-        .monitor
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slot = state.monitor.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_some() {
         return Err("监控调度器已在运行".into());
     }
@@ -78,7 +75,10 @@ pub async fn stop(state: &Arc<AppState>) {
     let _ = handle.shared.shutdown.send_replace(true);
     handle.shared.wake.notify_waiters();
     let abort = handle.join.inner().abort_handle();
-    if tokio::time::timeout(STOP_TIMEOUT, handle.join).await.is_err() {
+    if tokio::time::timeout(STOP_TIMEOUT, handle.join)
+        .await
+        .is_err()
+    {
         abort.abort();
     }
 }
@@ -265,7 +265,11 @@ async fn run_round_inner(
                 error: Some(sanitize_text(&error)),
                 ..Default::default()
             }),
-            ProbeOutcome::Connected { connect_ms, stdout, command_error } => {
+            ProbeOutcome::Connected {
+                connect_ms,
+                stdout,
+                command_error,
+            } => {
                 let parsed = parse_probe_output(&stdout);
                 let error = command_error
                     .map(|e| sanitize_text(&e))
@@ -304,8 +308,8 @@ async fn run_round_inner(
         let thresholds = config::effective_thresholds(&cfg, sample.server_id);
         let recent = store::recent_samples(&tx, sample.server_id, RECENT_SAMPLES)?;
         let last_reachable = store::last_reachable_sample(&tx, sample.server_id)?;
-        let wg_baseline = store::last_nonempty_wg_sample(&tx, sample.server_id)?
-            .and_then(|s| s.wg_interfaces);
+        let wg_baseline =
+            store::last_nonempty_wg_sample(&tx, sample.server_id)?.and_then(|s| s.wg_interfaces);
         let active = store::active_alerts_for_server(&tx, sample.server_id)?;
         let transitions = alerts::evaluate(&AlertInput {
             server_name: &target.server.name,
@@ -365,10 +369,7 @@ fn collect_targets(
 
 fn maybe_prune(state: &Arc<AppState>, shared: &Arc<MonitorShared>) -> Result<(), String> {
     let now = chrono::Utc::now();
-    let mut last = shared
-        .last_prune
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut last = shared.last_prune.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_some_and(|t| now - t < PRUNE_INTERVAL) {
         return Ok(());
     }

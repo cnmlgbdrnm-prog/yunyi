@@ -183,9 +183,7 @@ pub fn history(
                     }
                 }
                 MonitorMetric::Load1 => r.get::<_, Option<f64>>(6)?,
-                MonitorMetric::ConnectMs => r
-                    .get::<_, Option<i64>>(7)?
-                    .map(|v| v as f64),
+                MonitorMetric::ConnectMs => r.get::<_, Option<i64>>(7)?.map(|v| v as f64),
             };
             Ok((ts, value))
         })
