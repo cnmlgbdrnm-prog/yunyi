@@ -16,6 +16,11 @@ import type {
   FirewallClearResult,
   Job,
   LinkStatus,
+  MonitorAlert,
+  MonitorConfig,
+  MonitorMetric,
+  MonitorPoint,
+  MonitorSummary,
   NetStatus,
   Node,
   Privacy,
@@ -563,4 +568,41 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
     body: update.body,
     downloadAndInstall: () => update.downloadAndInstall(),
   }
+}
+
+// ---------- 服务器健康监控 ----------
+
+export function monitorSummary(): Promise<MonitorSummary> {
+  return invoke('server_monitor_summary_cmd')
+}
+
+export function monitorHistory(
+  serverId: number,
+  metric: MonitorMetric,
+  rangeSecs: number,
+): Promise<MonitorPoint[]> {
+  return invoke('server_monitor_history_cmd', { serverId, metric, rangeSecs })
+}
+
+export function monitorAlerts(
+  includeResolved: boolean,
+  limit = 100,
+): Promise<MonitorAlert[]> {
+  return invoke('server_monitor_alerts_cmd', { includeResolved, limit })
+}
+
+export function monitorCollect(): Promise<MonitorSummary> {
+  return invoke('server_monitor_collect_cmd')
+}
+
+export function monitorConfig(): Promise<MonitorConfig> {
+  return invoke('server_monitor_config_cmd')
+}
+
+export function monitorSetConfig(config: MonitorConfig): Promise<MonitorConfig> {
+  return invoke('server_monitor_set_config_cmd', { config })
+}
+
+export function monitorAck(alertId: number): Promise<void> {
+  return invoke('server_monitor_ack_cmd', { alertId })
 }

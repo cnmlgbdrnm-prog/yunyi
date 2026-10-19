@@ -478,3 +478,112 @@ export interface Upstream {
   last_check_error: string | null
   created_at: string
 }
+
+export interface MonitorThresholds {
+  cpu_pct: number
+  mem_pct: number
+  disk_pct: number
+  disk_critical_pct: number
+  load_per_core: number
+  breach_samples: number
+  clear_samples: number
+  offline_samples: number
+}
+
+export type PartialMonitorThresholds = Partial<MonitorThresholds>
+
+export interface MonitorServerOverride {
+  enabled?: boolean | null
+  thresholds?: PartialMonitorThresholds | null
+}
+
+export interface MonitorConfig {
+  enabled: boolean
+  interval_secs: number
+  concurrency: number
+  defaults: MonitorThresholds
+  servers: Record<string, MonitorServerOverride>
+}
+
+export interface MonitorSample {
+  server_id: number
+  ts: string
+  reachable: boolean
+  connect_ms: number | null
+  uptime_secs: number | null
+  load1: number | null
+  load5: number | null
+  load15: number | null
+  cpu_pct: number | null
+  cpu_cores: number | null
+  mem_used_kb: number | null
+  mem_total_kb: number | null
+  disk_used_kb: number | null
+  disk_total_kb: number | null
+  bbr_algo: string | null
+  services: Record<string, string> | null
+  wg_interfaces: string[] | null
+  error: string | null
+}
+
+export interface ServerHealth {
+  server_id: number
+  name: string
+  host: string
+  monitored: boolean
+  online: boolean | null
+  stale: boolean
+  last_sample_at: string | null
+  expected_services: string[]
+  deployment_known: boolean
+  wg_expected: boolean
+  sample: MonitorSample | null
+  local_error: string | null
+  active_alerts: number
+  unacked_alerts: number
+}
+
+export type MonitorAlertKind =
+  | 'offline'
+  | 'cpu'
+  | 'memory'
+  | 'disk'
+  | 'load'
+  | 'service'
+  | 'wireguard'
+
+export interface MonitorAlert {
+  id: number
+  server_id: number
+  server_name: string
+  kind: MonitorAlertKind
+  severity: 'warning' | 'critical'
+  opened_at: string
+  resolved_at: string | null
+  acked_at: string | null
+  last_value: string | null
+  last_at: string
+  message: string
+}
+
+export interface MonitorSummary {
+  config: MonitorConfig
+  config_error: string | null
+  last_round_at: string | null
+  last_round_error: string | null
+  collecting: boolean
+  servers: ServerHealth[]
+  active_alerts: MonitorAlert[]
+}
+
+export interface MonitorPoint {
+  ts: string
+  value: number
+}
+
+export type MonitorMetric =
+  | 'cpu_pct'
+  | 'mem_pct'
+  | 'disk_pct'
+  | 'load1'
+  | 'connect_ms'
