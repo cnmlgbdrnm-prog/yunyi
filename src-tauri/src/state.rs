@@ -62,6 +62,8 @@ pub struct AppState {
     pub self_ref: std::sync::OnceLock<std::sync::Weak<AppState>>,
     /// 数据目录：sidecar 工作目录 `{data_dir}/sidecar` 的父级，由 db_path 派生
     pub data_dir: std::path::PathBuf,
+    /// 服务器健康监控调度器；应用退出时 stop。None = 尚未启动。
+    pub monitor: std::sync::Mutex<Option<crate::server_monitor::scheduler::MonitorHandle>>,
 }
 
 impl AppState {
@@ -140,6 +142,7 @@ impl AppState {
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
                 .to_path_buf(),
+            monitor: std::sync::Mutex::new(None),
         });
         // 构造期无并发读取（worker 未启动），set 必成功
         let _ = state_slot.set(state.clone());

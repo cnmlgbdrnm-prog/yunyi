@@ -5,8 +5,11 @@ pub mod alerts;
 pub mod config;
 pub mod parse;
 pub mod probe;
+pub mod scheduler;
 pub mod store;
 pub mod summary;
+
+pub use scheduler::{collect_now, start, stop, MonitorEmit};
 
 pub use config::{MonitorConfig, PartialThresholds, ServerMonitorOverride, Thresholds};
 
