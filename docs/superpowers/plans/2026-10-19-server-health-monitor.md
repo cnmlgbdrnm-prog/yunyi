@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T8（pending）
-- 下一动作：实现命令层与 IPC 注册
+- 当前：T9（pending）
+- 下一动作：实现前端类型、API 与事件 store
 - 阻塞：无
-- 已完成：T1、T2、T3、T4、T5、T6、T7
+- 已完成：T1、T2、T3、T4、T5、T6、T7、T8
 - 最后更新：2026-10-19
 
 ---
@@ -3875,9 +3875,9 @@ git commit -m "feat(monitor): 增加调度器与轮次编排"
   - `server_monitor_set_config_cmd(config)` → `MonitorConfig`
   - `server_monitor_ack_cmd(alertId)` → `()`
 
-- **验收:** `cargo test --features local-tests server_monitor::commands -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；`cargo check` 通过。
+- **验收:** `cargo test --features local-tests commands::monitor -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；`cargo check` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `e41389a`；命令测试 4/4（`commands::monitor`）、模块 38/38、`cargo check` 通过；7 个命令注册各一次、`commands/mod.rs` 只增 2 行（1477 行）；任务审查 Spec ✅ / Task quality Approved（2 条 Minor 已登记 SDD ledger）
 
 - [ ] **Step 1: 写失败的命令测试**
 
@@ -3945,7 +3945,7 @@ fn ack_missing_alert_is_not_found() {
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cargo test --features local-tests server_monitor::commands -- --skip net::runtime_tests --skip net::runtime_service_tests`
+Run: `cargo test --features local-tests commands::monitor -- --skip net::runtime_tests --skip net::runtime_service_tests`
 Expected: 编译失败。
 
 - [ ] **Step 3: 写 `commands/monitor.rs`**
@@ -4138,7 +4138,7 @@ pub async fn server_monitor_ack_cmd(
 
 - [ ] **Step 6: 运行命令测试**
 
-Run: `cargo test --features local-tests server_monitor::commands -- --skip net::runtime_tests --skip net::runtime_service_tests`
+Run: `cargo test --features local-tests commands::monitor -- --skip net::runtime_tests --skip net::runtime_service_tests`
 Expected: 4 个测试通过。
 
 - [ ] **Step 7: 提交**
