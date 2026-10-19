@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T3（pending）
-- 下一动作：实现采集脚本输出解析器
+- 当前：T4（pending）
+- 下一动作：实现告警状态机
 - 阻塞：无
-- 已完成：T1、T2
+- 已完成：T1、T2、T3
 - 最后更新：2026-10-19
 
 ---
@@ -1238,7 +1238,7 @@ git commit -m "feat(monitor): 增加 v17 迁移与样本存储"
 
 - **验收:** `cargo test --features local-tests server_monitor::parse -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `b2d3656`；解析测试 6/6 通过（CPU 13.043% 用例），parse.rs 190 行；任务审查 Spec ✅ / Task quality Approved（6 条 Minor 与 2 条跨任务 ⚠️ 已登记 SDD ledger）
 
 - [ ] **Step 1: 写失败的解析测试**
 
