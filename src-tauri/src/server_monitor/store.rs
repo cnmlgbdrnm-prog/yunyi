@@ -1,6 +1,7 @@
 //! 监控 SQLite 读写：样本、告警、历史降采样与保留期清理。
 //! 所有函数返回 Result<_, String>，命令层用 AppError::Message 统一收口。
-use super::{MonitorMetric, MonitorPoint, MonitorSample};
+use super::alerts::{AlertTransition, Severity};
+use super::{MonitorAlert, MonitorMetric, MonitorPoint, MonitorSample};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 
@@ -245,6 +246,197 @@ pub fn wg_expected_server_ids(conn: &Connection) -> Result<HashSet<i64>, String>
         set.insert(b);
     }
     Ok(set)
+}
+
+const ALERT_COLS: &str = "a.id,a.server_id,s.name,a.kind,a.severity,a.opened_at,\
+a.resolved_at,a.acked_at,a.last_value,a.last_at,a.message";
+
+fn row_to_alert(r: &rusqlite::Row<'_>) -> rusqlite::Result<MonitorAlert> {
+    Ok(MonitorAlert {
+        id: r.get(0)?,
+        server_id: r.get(1)?,
+        server_name: r.get(2)?,
+        kind: r.get(3)?,
+        severity: r.get(4)?,
+        opened_at: r.get(5)?,
+        resolved_at: r.get(6)?,
+        acked_at: r.get(7)?,
+        last_value: r.get(8)?,
+        last_at: r.get(9)?,
+        message: r.get(10)?,
+    })
+}
+
+pub fn active_alerts(conn: &Connection) -> Result<Vec<MonitorAlert>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ALERT_COLS} FROM server_alerts a
+             JOIN servers s ON s.id=a.server_id
+             WHERE a.resolved_at IS NULL
+             ORDER BY CASE a.severity WHEN 'critical' THEN 0 ELSE 1 END, a.opened_at"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], row_to_alert)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn alerts(
+    conn: &Connection,
+    include_resolved: bool,
+    limit: i64,
+) -> Result<Vec<MonitorAlert>, String> {
+    let sql = if include_resolved {
+        format!(
+            "SELECT {ALERT_COLS} FROM server_alerts a
+             JOIN servers s ON s.id=a.server_id
+             ORDER BY a.opened_at DESC LIMIT ?1"
+        )
+    } else {
+        format!(
+            "SELECT {ALERT_COLS} FROM server_alerts a
+             JOIN servers s ON s.id=a.server_id
+             WHERE a.resolved_at IS NULL
+             ORDER BY a.opened_at DESC LIMIT ?1"
+        )
+    };
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![limit], row_to_alert)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn active_alerts_for_server(
+    conn: &Connection,
+    server_id: i64,
+) -> Result<Vec<MonitorAlert>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ALERT_COLS} FROM server_alerts a
+             JOIN servers s ON s.id=a.server_id
+             WHERE a.server_id=?1 AND a.resolved_at IS NULL"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![server_id], row_to_alert)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())
+}
+
+pub fn apply_transitions(
+    conn: &Connection,
+    server_id: i64,
+    ts: &str,
+    transitions: &[AlertTransition],
+) -> Result<(), String> {
+    for t in transitions {
+        match t {
+            AlertTransition::Open {
+                kind,
+                severity,
+                message,
+                value,
+            } => {
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM server_alerts
+                         WHERE server_id=?1 AND kind=?2 AND resolved_at IS NULL",
+                        params![server_id, kind.as_str()],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                if let Some(id) = existing {
+                    update_alert(conn, id, *severity, message, value.as_deref(), ts, false)?;
+                } else {
+                    conn.execute(
+                        "INSERT INTO server_alerts
+                         (server_id,kind,severity,opened_at,last_value,last_at,message)
+                         VALUES (?1,?2,?3,?4,?5,?4,?6)",
+                        params![
+                            server_id,
+                            kind.as_str(),
+                            severity.as_str(),
+                            ts,
+                            value,
+                            message
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            AlertTransition::Update {
+                id,
+                severity,
+                message,
+                value,
+                clear_ack,
+            } => {
+                update_alert(
+                    conn,
+                    *id,
+                    *severity,
+                    message,
+                    value.as_deref(),
+                    ts,
+                    *clear_ack,
+                )?;
+            }
+            AlertTransition::Resolve { id } => {
+                conn.execute(
+                    "UPDATE server_alerts SET resolved_at=?2 WHERE id=?1 AND resolved_at IS NULL",
+                    params![id, ts],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_alert(
+    conn: &Connection,
+    id: i64,
+    severity: Severity,
+    message: &str,
+    value: Option<&str>,
+    ts: &str,
+    clear_ack: bool,
+) -> Result<(), String> {
+    if clear_ack {
+        conn.execute(
+            "UPDATE server_alerts
+             SET severity=?2,message=?3,last_value=?4,last_at=?5,acked_at=NULL
+             WHERE id=?1",
+            params![id, severity.as_str(), message, value, ts],
+        )
+    } else {
+        conn.execute(
+            "UPDATE server_alerts
+             SET severity=?2,message=?3,last_value=?4,last_at=?5
+             WHERE id=?1",
+            params![id, severity.as_str(), message, value, ts],
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 返回 false = 没有这条活动告警（已恢复/不存在）。
+pub fn ack(conn: &Connection, alert_id: i64, ts: &str) -> Result<bool, String> {
+    let n = conn
+        .execute(
+            "UPDATE server_alerts SET acked_at=?2
+             WHERE id=?1 AND resolved_at IS NULL",
+            params![alert_id, ts],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
 }
 
 #[cfg(all(test, feature = "local-tests"))]
