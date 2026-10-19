@@ -2,6 +2,7 @@
 //! 子模块随任务逐个加入（T1 只声明 config）；每新增一个文件都要在这里补一行，
 //! 否则后面的任务会在模块文件尚未创建时编译失败。
 pub mod config;
+pub mod store;
 
 pub use config::{MonitorConfig, PartialThresholds, ServerMonitorOverride, Thresholds};
 

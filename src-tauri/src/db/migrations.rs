@@ -264,6 +264,50 @@ ALTER TABLE servers ADD COLUMN addr_family TEXT NOT NULL DEFAULT 'v4';
 -- 该值在部署时写进三类服务端配置，切换后需要重部署才生效。
 ALTER TABLE servers ADD COLUMN egress_family TEXT NOT NULL DEFAULT 'v4';
 "#,
+    r#"
+-- v17：服务器健康监控。
+-- 样本按轮写入；ts 是客户端 UTC RFC3339（毫秒精度，固定宽度，便于字典序比较）。
+CREATE TABLE server_metric_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  ts TEXT NOT NULL,
+  reachable INTEGER NOT NULL,
+  connect_ms INTEGER,
+  uptime_secs INTEGER,
+  load1 REAL,
+  load5 REAL,
+  load15 REAL,
+  cpu_pct REAL,
+  cpu_cores INTEGER,
+  mem_used_kb INTEGER,
+  mem_total_kb INTEGER,
+  disk_used_kb INTEGER,
+  disk_total_kb INTEGER,
+  bbr_algo TEXT,
+  services_json TEXT,
+  wg_json TEXT,
+  error TEXT
+);
+CREATE INDEX idx_server_metric_samples_server_ts
+  ON server_metric_samples(server_id, ts);
+CREATE INDEX idx_server_metric_samples_ts ON server_metric_samples(ts);
+
+CREATE TABLE server_alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  severity TEXT NOT NULL CHECK (severity IN ('warning','critical')),
+  opened_at TEXT NOT NULL,
+  resolved_at TEXT,
+  acked_at TEXT,
+  last_value TEXT,
+  last_at TEXT NOT NULL,
+  message TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_server_alerts_active
+  ON server_alerts(server_id, kind) WHERE resolved_at IS NULL;
+CREATE INDEX idx_server_alerts_opened_at ON server_alerts(opened_at);
+"#,
 ];
 
 /// 当前 schema 版本（= 已应用迁移条数）。测试断言用，避免把版本号写死在断言里——
