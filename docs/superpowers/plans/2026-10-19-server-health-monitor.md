@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T9（pending）
-- 下一动作：实现前端类型、API 与事件 store
+- 当前：T10（pending）
+- 下一动作：实现纯 SVG 趋势图
 - 阻塞：无
-- 已完成：T1、T2、T3、T4、T5、T6、T7、T8
+- 已完成：T1–T9
 - 最后更新：2026-10-19
 
 ---
@@ -4170,7 +4170,7 @@ git commit -m "feat(monitor): 增加 IPC 命令与注册"
 
 - **验收:** `npm run test:typecheck` 通过；`npx vitest run tests/frontend/monitor/registry.test.ts` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `b936299`；store 测试 3/3、`npm run test:typecheck` 通过、App.test.tsx 3/3 回归；11 个类型与 Rust 序列化逐字段核对、7 个命令/参数名核对通过；任务审查 Spec ✅ / Task quality Approved（4 条 Minor 已登记 SDD ledger）
 
 - [ ] **Step 1: 追加 API 类型**
 
