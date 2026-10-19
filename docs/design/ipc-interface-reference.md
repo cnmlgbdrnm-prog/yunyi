@@ -174,6 +174,10 @@
 
 监控只在桌面端应用打开时按 `interval_secs` 采集；应用退出即停，不做常驻。
 
+线格式类型：`MonitorSummary` / `MonitorSample` / `MonitorAlert` / `MonitorPoint` 定义在
+`src-tauri/src/server_monitor/mod.rs`，`MonitorConfig` / `Thresholds` 在
+`server_monitor/config.rs`；前端对应 `src/api/types.ts`。
+
 | 命令 | UI 封装 | 参数 | 返回 |
 | --- | --- | --- | --- |
 | `server_monitor_summary_cmd` | `monitorSummary()` | — | `MonitorSummary` |
