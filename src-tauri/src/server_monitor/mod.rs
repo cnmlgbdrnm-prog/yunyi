@@ -4,6 +4,7 @@
 pub mod alerts;
 pub mod config;
 pub mod parse;
+pub mod probe;
 pub mod store;
 pub mod summary;
 
