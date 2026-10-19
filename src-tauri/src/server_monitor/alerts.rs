@@ -360,10 +360,7 @@ fn eval_service(input: &AlertInput<'_>, out: &mut Vec<AlertTransition>) {
         .expected_services
         .iter()
         .any(|u| matches!(cur.get(u).map(String::as_str), Some("inactive" | "failed")));
-    let all_active = input
-        .expected_services
-        .iter()
-        .all(|u| cur.get(u).map(String::as_str) == Some("active"));
+    let all_active = all_expected_active(input, Some(cur));
 
     if down {
         let message = service_message(input.expected_services, cur);
@@ -391,15 +388,9 @@ fn eval_service(input: &AlertInput<'_>, out: &mut Vec<AlertTransition>) {
                     });
                     return;
                 }
-                let baseline_active = input.last_reachable.is_some_and(|s| {
-                    s.services.as_ref().is_some_and(|m| {
-                        input
-                            .expected_services
-                            .iter()
-                            .all(|u| m.get(u).map(String::as_str) == Some("active"))
-                    })
-                });
-                if baseline_active && service_down_streak(input) >= TRANSITION_SAMPLES {
+                if service_baseline_active(input)
+                    && service_down_streak(input) >= TRANSITION_SAMPLES
+                {
                     out.push(AlertTransition::Open {
                         kind: AlertKind::Service,
                         severity: Severity::Critical,
@@ -416,6 +407,41 @@ fn eval_service(input: &AlertInput<'_>, out: &mut Vec<AlertTransition>) {
             }
         }
     }
+}
+
+fn all_expected_active(input: &AlertInput<'_>, states: Option<&BTreeMap<String, String>>) -> bool {
+    states.is_some_and(|m| {
+        input
+            .expected_services
+            .iter()
+            .all(|u| m.get(u).map(String::as_str) == Some("active"))
+    })
+}
+
+/// 掉线段的基线：最近可达样本全 active 时直接采用；否则（上一轮已经掉线）
+/// 从 `recent` 向前跳过不可达、状态未知与本轮掉线段，取更早的最近可达样本。
+fn service_baseline_active(input: &AlertInput<'_>) -> bool {
+    if input
+        .last_reachable
+        .is_some_and(|s| all_expected_active(input, s.services.as_ref()))
+    {
+        return true;
+    }
+    for s in input.recent.iter().rev() {
+        if !s.reachable {
+            continue;
+        }
+        let Some(m) = &s.services else { continue };
+        if input
+            .expected_services
+            .iter()
+            .any(|u| matches!(m.get(u).map(String::as_str), Some("inactive" | "failed")))
+        {
+            continue;
+        }
+        return all_expected_active(input, Some(m));
+    }
+    false
 }
 
 fn service_message(expected: &[String], states: &BTreeMap<String, String>) -> String {
