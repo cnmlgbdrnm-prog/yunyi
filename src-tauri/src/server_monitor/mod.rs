@@ -5,6 +5,7 @@ pub mod alerts;
 pub mod config;
 pub mod parse;
 pub mod store;
+pub mod summary;
 
 pub use config::{MonitorConfig, PartialThresholds, ServerMonitorOverride, Thresholds};
 
