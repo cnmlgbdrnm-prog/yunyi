@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T13（pending）
-- 下一动作：实现告警历史与监控设置抽屉
+- 当前：T14（pending）
+- 下一动作：实现导航角标与仪表盘健康卡片
 - 阻塞：无
-- 已完成：T1–T12
+- 已完成：T1–T13
 - 最后更新：2026-10-19
 
 ---
@@ -5455,7 +5455,7 @@ git commit -m "feat(monitor): 增加服务器卡片与监控页骨架"
 
 - **验收:** `npx vitest run tests/frontend/views/MonitorSettings.test.tsx` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `bb046fa`；`npx vitest run tests/frontend/views/MonitorSettings.test.tsx tests/frontend/views/Monitor.test.tsx` 2+3 通过；`npx tsc --noEmit` 通过；行数 88/164/181；review Spec ✅、Approved（5 项 Minor 已登记 ledger）
 
 - [ ] **Step 1: 写失败的设置测试**
 
