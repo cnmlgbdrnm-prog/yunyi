@@ -63,7 +63,6 @@ pub enum AlertTransition {
 }
 
 pub struct AlertInput<'a> {
-    pub server_name: &'a str,
     pub current: &'a MonitorSample,
     pub recent: &'a [MonitorSample],
     pub last_reachable: Option<&'a MonitorSample>,

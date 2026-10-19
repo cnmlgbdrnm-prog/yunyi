@@ -312,7 +312,6 @@ async fn run_round_inner(
             store::last_nonempty_wg_sample(&tx, sample.server_id)?.and_then(|s| s.wg_interfaces);
         let active = store::active_alerts_for_server(&tx, sample.server_id)?;
         let transitions = alerts::evaluate(&AlertInput {
-            server_name: &target.server.name,
             current: sample,
             recent: &recent,
             last_reachable: last_reachable.as_ref(),
@@ -331,7 +330,7 @@ async fn run_round_inner(
     // 必须先放掉 DB 锁：maybe_prune 会再次 lock，std::sync::Mutex 不可重入。
     drop(conn);
 
-    maybe_prune(&state, shared)?;
+    maybe_prune(state, shared)?;
     Ok(None)
 }
 
