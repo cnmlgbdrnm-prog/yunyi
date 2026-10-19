@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T7（pending）
-- 下一动作：实现调度器、轮次编排与生命周期
+- 当前：T8（pending）
+- 下一动作：实现命令层与 IPC 注册
 - 阻塞：无
-- 已完成：T1、T2、T3、T4、T5、T6
+- 已完成：T1、T2、T3、T4、T5、T6、T7
 - 最后更新：2026-10-19
 
 ---
@@ -3184,7 +3184,7 @@ git commit -m "feat(monitor): 增加只读 SSH 探针"
 
 - **验收:** `cargo test --features local-tests server_monitor::scheduler -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；`cargo check` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `ad90fe0`；调度测试 4/4（含 2.1s 退出用例）、模块 38/38、`cargo check` 通过；锁序/全不可达守卫/退出 ≤2s/main 接线均核验；任务审查 Spec ✅ / Task quality Approved（5 条 Minor 已登记 SDD ledger）
 
 - [ ] **Step 1: 写失败的调度测试**
 
