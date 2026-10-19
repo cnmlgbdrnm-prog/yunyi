@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T14（pending）
-- 下一动作：实现导航角标与仪表盘健康卡片
+- 当前：T15（pending）
+- 下一动作：收尾文档并跑全量验收
 - 阻塞：无
-- 已完成：T1–T13
+- 已完成：T1–T14
 - 最后更新：2026-10-19
 
 ---
@@ -5890,7 +5890,7 @@ git commit -m "feat(monitor): 增加告警历史与设置抽屉"
 
 - **验收:** `npx vitest run tests/frontend/components/NavItem.test.tsx tests/frontend/views/ServerHealthCard.test.tsx tests/frontend/navigation.test.ts` 通过；`npm run test:typecheck` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `0d35ee7`；T14 三文件 6/6 通过；`npm run test:typecheck` 通过；`App.test.tsx` 3/3、`Dashboard.test.tsx` 30/30 无回归；review Spec ✅、Approved（3 项 Minor 已登记 ledger）
 
 - [ ] **Step 1: 写失败的组件测试**
 
