@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T12（pending）
-- 下一动作：实现服务器卡片与监控页骨架
+- 当前：T13（pending）
+- 下一动作：实现告警历史与监控设置抽屉
 - 阻塞：无
-- 已完成：T1–T11
+- 已完成：T1–T12
 - 最后更新：2026-10-19
 
 ---
@@ -4945,7 +4945,7 @@ git commit -m "feat(monitor): 增加趋势面板"
 
 - **验收:** `npx vitest run tests/frontend/views/Monitor.test.tsx` 通过；`Monitor.tsx` 与 `ServerCard.tsx` 各 ≤500 行。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `f5262dd`；`npx vitest run tests/frontend/views/Monitor.test.tsx` 3/3 通过；`npx tsc --noEmit` 通过；行数 155/166；review Spec ✅、Approved（6 项 Minor 已登记 ledger，其中逐服务器阈值覆盖与中文状态文案留待 T15 评估）
 
 - [ ] **Step 1: 写失败的监控页测试**
 
