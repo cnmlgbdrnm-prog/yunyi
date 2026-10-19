@@ -21,13 +21,14 @@ pub struct ParsedProbe {
 
 pub fn parse_probe_output(out: &str) -> ParsedProbe {
     let sections = split_sections(out);
-    let mut p = ParsedProbe::default();
-
-    p.uptime_secs = sections
-        .get("uptime")
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|v| v.parse::<f64>().ok())
-        .map(|v| v.max(0.0) as u64);
+    let mut p = ParsedProbe {
+        uptime_secs: sections
+            .get("uptime")
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v.max(0.0) as u64),
+        ..Default::default()
+    };
 
     if let Some(load) = sections.get("load") {
         let vals: Vec<f64> = load

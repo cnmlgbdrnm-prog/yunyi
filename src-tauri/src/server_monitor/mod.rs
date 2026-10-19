@@ -11,7 +11,7 @@ pub mod summary;
 
 pub use scheduler::{collect_now, start, stop, MonitorEmit};
 
-pub use config::{MonitorConfig, PartialThresholds, ServerMonitorOverride, Thresholds};
+pub use config::{MonitorConfig, Thresholds};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
