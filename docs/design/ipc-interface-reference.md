@@ -2,8 +2,8 @@
 
 本文列出应用注册的**全部 Tauri 命令**及其 UI 封装，供联调与排障时查表。
 
-- **事实源**：前端 `src/api/index.ts`（87 个封装）↔ 后端
-  `src-tauri/src/main.rs` 的 `generate_handler![...]`（87 条命令），当前 **1:1 完整对应**；
+- **事实源**：前端 `src/api/index.ts`（94 个封装）↔ 后端
+  `src-tauri/src/main.rs` 的 `generate_handler![...]`（94 条命令），当前 **1:1 完整对应**；
   Rust 壳在 `src-tauri/src/commands/ipc.rs`，线格式类型在 `src/api/types.ts` 与
   `src-tauri/src/domain.rs`。
 - 页面**不得**直接 `invoke`，只能调用 `src/api/index.ts` 的封装。
@@ -156,7 +156,7 @@
 | `list_jobs_cmd` | `listJobs()` | — | `Job[]`（最近 50 条，倒序） |
 | `cancel_job_cmd` | `cancelJob(jobId)` | `{ jobId }` | `void` |
 
-任务进度走事件流（见 §12），不是轮询命令。
+任务进度走事件流（见 §13），不是轮询命令。
 
 ## 11. 设置、系统代理与应用更新
 
@@ -170,7 +170,29 @@
 
 `checkForUpdate` 不是 IPC 命令：它先取系统代理，再调用 `@tauri-apps/plugin-updater`。
 
-## 12. 事件流
+## 12. 服务器健康监控
+
+监控只在桌面端应用打开时按 `interval_secs` 采集；应用退出即停，不做常驻。
+
+| 命令 | UI 封装 | 参数 | 返回 |
+| --- | --- | --- | --- |
+| `server_monitor_summary_cmd` | `monitorSummary()` | — | `MonitorSummary` |
+| `server_monitor_history_cmd` | `monitorHistory(serverId, metric, rangeSecs)` | `{ serverId, metric, rangeSecs }` | `MonitorPoint[]` |
+| `server_monitor_alerts_cmd` | `monitorAlerts(includeResolved, limit)` | `{ includeResolved, limit }` | `MonitorAlert[]` |
+| `server_monitor_collect_cmd` | `monitorCollect()` | — | `MonitorSummary` |
+| `server_monitor_config_cmd` | `monitorConfig()` | — | `MonitorConfig` |
+| `server_monitor_set_config_cmd` | `monitorSetConfig(config)` | `{ config }` | `MonitorConfig` |
+| `server_monitor_ack_cmd` | `monitorAck(alertId)` | `{ alertId }` | `void` |
+
+`metric` 取值：`cpu_pct`、`mem_pct`、`disk_pct`、`load1`、`connect_ms`；
+`rangeSecs` 只接受 `3600`、`86400`、`604800`；`limit` 范围 1–500。
+
+| 事件 | 载荷 | 说明 |
+| --- | --- | --- |
+| `monitor://tick` | `MonitorSummary` | 每轮采集完成后推送整份摘要 |
+| `monitor://collecting` | `{ collecting: boolean }` | 采集开始/结束；前端据此禁用「立即采集」 |
+
+## 13. 事件流
 
 | 事件 | 载荷 | 说明 |
 | --- | --- | --- |
