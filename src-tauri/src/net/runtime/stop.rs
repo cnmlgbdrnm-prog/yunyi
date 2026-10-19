@@ -90,6 +90,15 @@ async fn stop_with_policy(state: &AppState, policy: StopPolicy) -> Result<NetSta
                 Err(e) => eprintln!("[vpn-ctl] 请求网络服务保留直连代理失败: {e}"),
             },
         }
+        // 退出兜底：服务不可达、或服务侧 mihomo 已经死了时，Detach 不会留下活端口。
+        // 已运行程序的环境变量是进程启动时的死快照，端口一消失它们就整片
+        // `ECONNREFUSED`；这里直接起一个最小 direct mihomo 把端口占住。先兜底再
+        // 还原系统代理——这样退出等待的这几秒里，新进程也不会撞上一个空端口。
+        if policy == StopPolicy::KeepAll && !crate::net::winprobe::port_is_listening(n.mixed_port) {
+            if let Err(e) = spawn_direct_fallback(state, n.mixed_port).await {
+                eprintln!("[vpn-ctl] 退出兜底直连失败: {e}");
+            }
+        }
         sysproxy_set::restore_proxy(n.snapshot.as_ref())?;
     } else {
         // 界面刚启动、还没开网络也要清掉服务归属：服务可能在上一轮退出时留了
@@ -148,3 +157,51 @@ async fn stop_with_policy(state: &AppState, policy: StopPolicy) -> Result<NetSta
         tor_detail: None,
     })
 }
+
+/// 退出兜底：Detach/本地子进程都没能留下活端口时，直接起一个最小 direct mihomo。
+///
+/// 不改系统代理/环境变量——它们由调用方随后 `restore_proxy` 还原；这个端点只为让
+/// 那些仍握着旧环境变量的**已运行**程序不再 `ECONNREFUSED`。配置与登录兜底同源
+/// （[`super::direct_config_yaml`]），两条路不会各自漂移。
+///
+/// 失败只返回错误给调用方记日志：退出清理已经做了能做的，不能因为兜底失败反过来
+/// 阻断退出或跳过代理还原（那会把“端口可能没保住”升级成“代理指针也没还原”）。
+async fn spawn_direct_fallback(state: &AppState, port: u16) -> Result<(), String> {
+    let net_dir = state.data_dir.join(NET_DIR);
+    let resource = state
+        .sidecar_resource
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or(None);
+    let exe = sidecar::ensure_binary(&net_dir, resource.as_deref())?;
+    std::fs::write(net_dir.join("config.yaml"), super::direct_config_yaml(port))
+        .map_err(|e| format!("写入退出兜底配置失败: {e}"))?;
+    let mut child = crate::util::quiet(std::process::Command::new(&exe))
+        .arg("-d")
+        .arg(&net_dir)
+        .current_dir(&net_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("启动退出兜底 mihomo 失败: {e}"))?;
+    let attempts = FALLBACK_TIMEOUT.as_millis() / FALLBACK_INTERVAL.as_millis();
+    for _ in 0..attempts {
+        if crate::net::winprobe::port_is_listening(port) {
+            // 丢掉句柄不杀进程：应用马上退出，mihomo 要继续占着端口给已运行程序用。
+            // std::process::Child 的 Drop 只关句柄，不终止子进程。
+            drop(child);
+            return Ok(());
+        }
+        tokio::time::sleep(FALLBACK_INTERVAL).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "退出兜底 mihomo 未能在 {}s 内监听 127.0.0.1:{port}",
+        FALLBACK_TIMEOUT.as_secs()
+    ))
+}
+
+/// 等退出兜底 mihomo 监听的上限：正常几百毫秒，慢盘/杀软扫描留足余量。
+const FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FALLBACK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);

@@ -18,6 +18,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod boot_heal;
 mod commands;
 mod config;
 mod crypto;
@@ -150,6 +152,15 @@ fn main() {
     // exe** 的这两个标志去过 UAC，晚一步就会先弹出一个 GUI 窗口再装服务。
     #[cfg(windows)]
     {
+        // 登录兜底必须同样在 Tauri 之前接住：它要在“应用还没被打开”的窗口里
+        // 修复系统重启留下的死代理指针，不能因此拉起一个 GUI/WebView。
+        if args.iter().any(|a| a == "--boot-heal") {
+            if let Err(e) = boot_heal::run() {
+                // 打包后是 GUI 子系统，stderr 不可见；详细痕迹在 boot-heal.log。
+                eprintln!("[vpn-ctl] 登录兜底失败: {e}");
+            }
+            return;
+        }
         if args.iter().any(|a| a == "--install-service") {
             match service::install::install() {
                 Ok(()) => println!("服务安装完成"),
@@ -251,6 +262,14 @@ fn main() {
             // 开启。判据与开启路径同源：只清死指针，别的客户端的真接管绝不碰。
             if let Err(e) = crate::net::sysproxy_set::heal_dead_system_proxy() {
                 eprintln!("[vpn-ctl] 启动自愈残留系统代理失败: {e}");
+            }
+            // 注册登录兜底：重启/强杀会跳过所有退出清理，而系统代理与环境变量的
+            // 注册表值会活过重启；只有登录后有人把它们指向的本机端口重新拉起来，
+            // “应用没启动”的那段窗口才不会整片 ECONNREFUSED。失败只记一行——
+            // 应用启动时的自愈仍然有效，不把这件事变成启动阻断。
+            #[cfg(windows)]
+            if let Err(e) = crate::boot_heal::ensure_registered() {
+                eprintln!("[vpn-ctl] 注册登录兜底失败: {e}");
             }
             app.manage(state);
             Ok(())

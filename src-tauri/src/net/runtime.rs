@@ -24,6 +24,13 @@ pub const NET_DIR: &str = "net";
 /// 系统代理 mixed 端口：**恒为它**，占用即报错，绝不顺延（见 [`pinned_mixed_port`]）。
 pub const NET_DEFAULT_PORT: u16 = 7890;
 
+/// 退出/登录兜底用的最小直连配置：只要 `mixed-port` 与 `direct`，不读节点、不建
+/// TUN、不依赖 geo。它的唯一职责是让已经写进用户环境变量/系统代理的端口继续有人
+/// 监听——那些指针是进程启动时的死快照，事后改不掉。
+pub(crate) fn direct_config_yaml(port: u16) -> String {
+    format!("mixed-port: {port}\nallow-lan: false\nmode: direct\nlog-level: silent\n")
+}
+
 fn alloc_tor_upstream_port(mixed_port: u16, ctrl_port: u16) -> Result<u16, String> {
     for _ in 0..8 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -1137,6 +1144,13 @@ const CONN_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 // 判据已拆到 net/runtime_conns.rs（控制单文件行数）；此处 re-export 保持既有路径。
 pub use crate::net::runtime_conns::conns_to_close;
 
+/// 隐私线单目标核验预算。隐私线是 Tor 双跳（本机 Tor → 出口机 Tor），冷电路实测
+/// 5–13s，偶发 20–30s；15s 会在电路尚未建成时把整条线路误判为不可用。
+const PRIVATE_PROBE_TIMEOUT_MS: u64 = 30_000;
+/// 两个目标都失败后再来一轮。mihomo 的延迟测试每次新建连接，重试通常能落到已建成的
+/// 电路上；实测单轮偶发 503/504（Tor 换电路），两轮则 8/8 通过。
+const PRIVATE_PROBE_ROUNDS: usize = 2;
+
 /// 切到隐私线前先让 Mihomo **经这条指定代理**完成 HTTPS 请求。Tor 的 100% 引导
 /// 与远端 Onion 端口可连，都不能证明 VMess/WS/TLS 等完整协议已可用。
 pub(crate) async fn probe_private_proxy(
@@ -1148,43 +1162,71 @@ pub(crate) async fn probe_private_proxy(
         .no_proxy()
         .build()
         .map_err(|e| format!("建立本地核验客户端失败: {e}"))?;
-    let mut last_error = String::new();
-    for target in [
-        "https://www.google.com/generate_204",
-        "https://example.com/",
-    ] {
-        let mut url =
-            reqwest::Url::parse(controller).map_err(|e| format!("控制器地址无效: {e}"))?;
-        url.path_segments_mut()
-            .map_err(|_| "控制器地址不能追加路径".to_string())?
-            .extend(["proxies", proxy_name, "delay"]);
-        url.query_pairs_mut()
-            .append_pair("timeout", "15000")
-            .append_pair("url", target);
-        match client
-            .get(url)
-            .bearer_auth(token)
-            .timeout(std::time::Duration::from_secs(19))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                if resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("delay").and_then(|d| d.as_u64()))
-                    .is_some()
-                {
-                    return Ok(());
+    let mut last_round: Vec<String> = Vec::new();
+    // 只有「代理测试超时/失败」才值得提示重试；404（代理不存在）之类重试也没用。
+    let mut transient = false;
+    for round in 0..PRIVATE_PROBE_ROUNDS {
+        last_round.clear();
+        for target in [
+            "https://www.google.com/generate_204",
+            "https://example.com/",
+        ] {
+            let mut url =
+                reqwest::Url::parse(controller).map_err(|e| format!("控制器地址无效: {e}"))?;
+            url.path_segments_mut()
+                .map_err(|_| "控制器地址不能追加路径".to_string())?
+                .extend(["proxies", proxy_name, "delay"]);
+            url.query_pairs_mut()
+                .append_pair("timeout", &PRIVATE_PROBE_TIMEOUT_MS.to_string())
+                .append_pair("url", target);
+            match client
+                .get(url)
+                .bearer_auth(token)
+                .timeout(std::time::Duration::from_secs(35))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("delay").and_then(|d| d.as_u64()))
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                    last_round.push(format!("{target}：控制器未返回有效延迟"));
                 }
-                last_error = "控制器未返回有效延迟".into();
+                // 504 是 mihomo 自己判的「代理测试超时」，不是目标站返回的 504；
+                // 旧文案把它写成「目标站返回 HTTP 504」，排障时会被带偏。
+                Ok(resp) => {
+                    transient |= matches!(resp.status().as_u16(), 503 | 504);
+                    last_round.push(format!(
+                        "{target}：mihomo 代理测试失败（HTTP {}）",
+                        resp.status()
+                    ));
+                }
+                Err(e) => {
+                    transient = true;
+                    last_round.push(format!("{target}：请求控制器失败: {e}"));
+                }
             }
-            Ok(resp) => last_error = format!("{} 返回 HTTP {}", target, resp.status()),
-            Err(e) => last_error = format!("{} 请求失败: {e}", target),
+        }
+        if round + 1 < PRIVATE_PROBE_ROUNDS {
+            // 给刚失败的 Tor 电路一点时间收尾，免得第二轮立刻复用同一条坏电路。
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
-    Err(last_error)
+    let hint = if transient {
+        "（Tor 电路可能仍在建立，稍后重试通常可成功）"
+    } else {
+        ""
+    };
+    Err(format!(
+        "{PRIVATE_PROBE_ROUNDS} 轮核验均未通过{hint}：{}",
+        last_round.join("；")
+    ))
 }
 
 pub async fn verify_private_proxy(state: &AppState, proxy_name: &str) -> Result<(), String> {
@@ -1276,6 +1318,9 @@ pub async fn select(state: &AppState, proxy_name: &str) -> Result<(), String> {
             !p.onion_host.is_empty() && crate::servers::privacy::display_name(&p.name) == proxy_name
         });
     if private {
+        // 先等 Tor 引导完成：它没就绪时 mihomo 的延迟测试只会立刻回 503，
+        // 把「还在连接」误报成「HTTPS 核验失败」。
+        crate::net::private_gate::wait_ready(state).await?;
         verify_private_proxy(state, proxy_name)
             .await
             .map_err(|e| format!("隐私出口尚未通过 HTTPS 连通核验，已保留原出口: {e}"))?;
