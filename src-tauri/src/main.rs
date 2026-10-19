@@ -30,6 +30,7 @@ mod net;
 mod relay;
 mod serve;
 mod server_bbr;
+mod server_monitor;
 mod server_speed;
 mod servers;
 mod service;
