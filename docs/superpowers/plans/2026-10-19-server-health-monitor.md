@@ -88,7 +88,7 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 ## 执行状态（进度指针）
 
 - 当前：T15（completed）
-- 下一动作：无（等待整分支终审）
+- 下一动作：无（终审与修复复审通过，待合并）
 - 阻塞：无
 - 已完成：T1–T15
 - 最后更新：2026-10-19
@@ -6176,7 +6176,7 @@ git commit -m "feat(monitor): 接入导航角标与仪表盘卡片"
 
 - **验收:** 下列全部命令通过，并完成真机读数核对。
 
-- **状态:** completed ｜ **证据:** 文档提交 `0c19241`（CHANGELOG + IPC §12）；自动验收：fmt/clippy（0 warning）/cargo test 925 passed、typecheck/`npm test` 348/build/check:* 全通过（`ce6f3d5`、`c4aa96e`）；真机核对（2026-10-19 12:55–13:01）：迁移 v17 且 4 台服务器保留、ashura/VM 读数与 SSH 一致、手动采集按钮禁用后补 4 样本、暂停 81s 零新样本、恢复立即一轮、退出 901ms 且 71s 零新样本、重开配置/历史保留并自动续采、趋势图正常；DB/UI/日志未出现凭据
+- **状态:** completed ｜ **证据:** 文档提交 `0c19241`（CHANGELOG + IPC §12）；自动验收：fmt/clippy（0 warning）/cargo test 925 passed、typecheck/`npm test` 348/build/check:* 全通过（`ce6f3d5`、`c4aa96e`）；真机核对（2026-10-19 12:55–13:01）：迁移 v17 且 4 台服务器保留、ashura/VM 读数与 SSH 一致、手动采集按钮禁用后补 4 样本、暂停 81s 零新样本、恢复立即一轮、退出 901ms 且 71s 零新样本、重开配置/历史保留并自动续采、趋势图正常；DB/UI/日志未出现凭据；整分支终审 With fixes → `da2d455`（C1 趋势断线/≤360、I1 WG 展示）+ `64e9003`（M2 空态、M3 部署信息、M6 告警文本 200 字符），scoped re-review Approved；24h 真机 path 复验含连续 L 段
 
 - [ ] **Step 1: 更新 CHANGELOG**
 
