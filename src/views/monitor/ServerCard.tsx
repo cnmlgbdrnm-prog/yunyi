@@ -130,14 +130,13 @@ export default function ServerCard({
           {['xray', 'ssserver', 'singbox'].map((unit) => {
             const expected = health.expected_services.includes(unit)
             const state = s?.services?.[unit] ?? 'unknown'
-            const cls = !expected
-              ? health.deployment_known
+            const down = state === 'inactive' || state === 'failed'
+            const cls = down
+              ? 'bg-red-950 text-red-300'
+              : !expected && health.deployment_known
                 ? 'bg-neutral-800 text-neutral-500'
-                : 'bg-neutral-800 text-neutral-400'
-              : state === 'active'
-                ? 'bg-emerald-950 text-emerald-300'
-                : state === 'inactive' || state === 'failed'
-                  ? 'bg-red-950 text-red-300'
+                : state === 'active'
+                  ? 'bg-emerald-950 text-emerald-300'
                   : 'bg-neutral-800 text-neutral-400'
             return (
               <span key={unit} className={`rounded px-2 py-0.5 ${cls}`}>
@@ -145,6 +144,11 @@ export default function ServerCard({
               </span>
             )
           })}
+          {!health.deployment_known && (
+            <span className="rounded bg-neutral-800 px-2 py-0.5 text-neutral-300">
+              部署信息未知
+            </span>
+          )}
           <span className="rounded bg-neutral-800 px-2 py-0.5 text-neutral-300">
             WG {s?.wg_interfaces == null ? '未知' : s.wg_interfaces.length ? s.wg_interfaces.join(', ') : '未发现接口'}
           </span>

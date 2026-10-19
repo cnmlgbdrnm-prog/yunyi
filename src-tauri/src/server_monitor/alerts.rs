@@ -86,7 +86,23 @@ pub fn evaluate(input: &AlertInput<'_>) -> Vec<AlertTransition> {
     eval_load(input, &mut out);
     eval_service(input, &mut out);
     eval_wireguard(input, &mut out);
+    normalize_transitions(&mut out);
     out
+}
+
+/// 所有展示文本统一走 `sanitize_text`：单行、压空白、按字符截断到 200。
+/// 离线消息由前缀 + 已截断的 error 拼接，必须在拼接后再统一收口。
+fn normalize_transitions(out: &mut [AlertTransition]) {
+    for t in out {
+        match t {
+            AlertTransition::Open { message, value, .. }
+            | AlertTransition::Update { message, value, .. } => {
+                *message = sanitize_text(message);
+                *value = value.as_deref().map(sanitize_text);
+            }
+            AlertTransition::Resolve { .. } => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -195,7 +195,8 @@ async fn run_round_inner(
     let (cfg, _) = config::load(&state.settings);
     let targets = collect_targets(state, &cfg)?;
     if targets.is_empty() {
-        return Ok(Some("没有启用监控的服务器".into()));
+        // 没有服务器或全部暂停不是采集失败：不写 last_round_error，照常 emit tick。
+        return Ok(None);
     }
     shared
         .status
