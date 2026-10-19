@@ -147,6 +147,10 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
             去服务器页
           </button>
         </div>
+      ) : summary.servers.every((h) => !h.monitored) ? (
+        <div className="rounded border border-neutral-800 bg-neutral-900 p-6 text-center text-sm text-neutral-400">
+          所有服务器都已暂停监控
+        </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           {summary.servers.map((h) => (
