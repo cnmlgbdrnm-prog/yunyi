@@ -1473,3 +1473,5 @@ pub async fn get_peer_config(state: Arc<AppState>, peer_id: i64) -> R<String> {
 // 重导出保证 `crate::commands::xxx_cmd` 路径与 generate_handler! 不变。
 mod ipc;
 pub use ipc::*;
+mod monitor;
+pub use monitor::*;

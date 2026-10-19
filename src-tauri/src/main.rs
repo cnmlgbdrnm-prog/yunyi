@@ -371,6 +371,13 @@ fn main() {
             commands::list_throughput_cmd,
             commands::check_bbr_cmd,
             commands::enable_bbr_cmd,
+            commands::server_monitor_summary_cmd,
+            commands::server_monitor_history_cmd,
+            commands::server_monitor_alerts_cmd,
+            commands::server_monitor_collect_cmd,
+            commands::server_monitor_config_cmd,
+            commands::server_monitor_set_config_cmd,
+            commands::server_monitor_ack_cmd,
             sysproxy::get_system_proxy_cmd,
         ])
         .build(tauri::generate_context!())
