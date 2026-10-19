@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { installJobListener } from './jobs/registry'
+import { installMonitorListener, refreshMonitor } from './monitor/registry'
 import ConnLog from './views/ConnLog'
 import Dashboard from './views/Dashboard'
 import Subscriptions from './views/Subscriptions'
@@ -49,6 +50,11 @@ export default function App() {
       disposed = true
       unlisten?.()
     }
+  }, [])
+  // 监控事件监听同样全进程只装一次；首帧先拉一次摘要，不等第一轮事件。
+  useEffect(() => {
+    void installMonitorListener(listen)
+    void refreshMonitor()
   }, [])
   return (
     <div className="flex h-screen bg-neutral-950 text-neutral-100">
