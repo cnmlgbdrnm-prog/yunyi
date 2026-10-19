@@ -50,6 +50,8 @@ export default function TrendPanel({
   }, [serverId, metric, range])
 
   const meta = METRICS.find((m) => m.key === metric)!
+  // 后端按 ceil(range/360) 秒下采样，断线阈值必须按实际点距计算。
+  const stepSecs = Math.max(intervalSecs, Math.ceil(range / 360))
 
   return (
     <div className="mt-3 border-t border-neutral-800 pt-3">
@@ -91,7 +93,7 @@ export default function TrendPanel({
       ) : (
         <LineChart
           points={points}
-          intervalSecs={intervalSecs}
+          intervalSecs={stepSecs}
           label={meta.label}
           formatValue={meta.format}
         />
