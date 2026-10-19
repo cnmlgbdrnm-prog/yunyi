@@ -1,6 +1,6 @@
 //! 监控配置：JSON 存取、默认值、逐字段覆盖与校验。
-use crate::settings::SettingsService;
 use super::CONFIG_KEY;
+use crate::settings::SettingsService;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -33,9 +33,15 @@ impl Default for MonitorConfig {
     }
 }
 
-fn default_enabled() -> bool { true }
-fn default_interval() -> u64 { DEFAULT_INTERVAL }
-fn default_concurrency() -> usize { DEFAULT_CONCURRENCY }
+fn default_enabled() -> bool {
+    true
+}
+fn default_interval() -> u64 {
+    DEFAULT_INTERVAL
+}
+fn default_concurrency() -> usize {
+    DEFAULT_CONCURRENCY
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Thresholds {
@@ -72,14 +78,30 @@ impl Default for Thresholds {
     }
 }
 
-fn d_cpu_pct() -> f64 { 90.0 }
-fn d_mem_pct() -> f64 { 90.0 }
-fn d_disk_pct() -> f64 { 85.0 }
-fn d_disk_critical_pct() -> f64 { 95.0 }
-fn d_load_per_core() -> f64 { 2.0 }
-fn d_breach_samples() -> u32 { 3 }
-fn d_clear_samples() -> u32 { 2 }
-fn d_offline_samples() -> u32 { 3 }
+fn d_cpu_pct() -> f64 {
+    90.0
+}
+fn d_mem_pct() -> f64 {
+    90.0
+}
+fn d_disk_pct() -> f64 {
+    85.0
+}
+fn d_disk_critical_pct() -> f64 {
+    95.0
+}
+fn d_load_per_core() -> f64 {
+    2.0
+}
+fn d_breach_samples() -> u32 {
+    3
+}
+fn d_clear_samples() -> u32 {
+    2
+}
+fn d_offline_samples() -> u32 {
+    3
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PartialThresholds {
@@ -159,9 +181,7 @@ pub fn validate(cfg: &MonitorConfig) -> Result<(), String> {
     }
     validate_thresholds(&cfg.defaults)?;
     for key in cfg.servers.keys() {
-        let id: i64 = key
-            .parse()
-            .map_err(|_| format!("服务器 id 非法: {key}"))?;
+        let id: i64 = key.parse().map_err(|_| format!("服务器 id 非法: {key}"))?;
         validate_thresholds(&effective_thresholds(cfg, id))?;
     }
     Ok(())
@@ -215,9 +235,8 @@ pub fn server_enabled(cfg: &MonitorConfig, server_id: i64) -> bool {
 
 /// 只保留有意义的覆盖条目，避免每次保存都把默认值写进 JSON。
 fn normalize(mut cfg: MonitorConfig) -> MonitorConfig {
-    cfg.servers.retain(|_, ov| {
-        ov.enabled == Some(false) || ov.thresholds.is_some()
-    });
+    cfg.servers
+        .retain(|_, ov| ov.enabled == Some(false) || ov.thresholds.is_some());
     cfg
 }
 

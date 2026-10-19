@@ -98,10 +98,7 @@ pub fn parse_probe_output(out: &str) -> ParsedProbe {
         .and_then(|s| s.trim().parse::<i32>().ok());
     p.wg_interfaces = match (rc, sections.get("wg")) {
         (Some(0), Some(s)) => {
-            let mut ifaces: Vec<String> = s
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
+            let mut ifaces: Vec<String> = s.split_whitespace().map(str::to_string).collect();
             ifaces.sort();
             ifaces.dedup();
             Some(ifaces)
@@ -158,7 +155,9 @@ fn parse_cpu_line(s: &str) -> Option<[u64; 8]> {
     if vals.len() != 8 {
         return None;
     }
-    Some([vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]])
+    Some([
+        vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7],
+    ])
 }
 
 fn mem_kb(mem: &str, key: &str) -> Option<u64> {
