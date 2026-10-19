@@ -145,11 +145,9 @@ export default function ServerCard({
               </span>
             )
           })}
-          {health.wg_expected && (
-            <span className="rounded bg-neutral-800 px-2 py-0.5 text-neutral-300">
-              WG {s?.wg_interfaces == null ? '未知' : s.wg_interfaces.length ? s.wg_interfaces.join(', ') : '未发现接口'}
-            </span>
-          )}
+          <span className="rounded bg-neutral-800 px-2 py-0.5 text-neutral-300">
+            WG {s?.wg_interfaces == null ? '未知' : s.wg_interfaces.length ? s.wg_interfaces.join(', ') : '未发现接口'}
+          </span>
         </div>
 
         {(s?.error || health.local_error) && (

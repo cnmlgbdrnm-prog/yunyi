@@ -8,6 +8,9 @@ use std::collections::HashSet;
 const SAMPLE_COLS: &str = "server_id,ts,reachable,connect_ms,uptime_secs,load1,load5,load15,\
 cpu_pct,cpu_cores,mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb,bbr_algo,services_json,wg_json,error";
 
+/// 趋势图最多返回的点数：闭区间 cutoff 可能多出 1 个桶，超出时丢弃最早的桶。
+const MAX_HISTORY_POINTS: usize = 360;
+
 fn row_to_sample(r: &rusqlite::Row<'_>) -> rusqlite::Result<MonitorSample> {
     let services_json: Option<String> = r.get(15)?;
     let wg_json: Option<String> = r.get(16)?;
@@ -204,13 +207,18 @@ pub fn history(
         entry.1 += value;
         entry.2 += 1;
     }
-    Ok(buckets
+    let mut points: Vec<MonitorPoint> = buckets
         .into_values()
         .map(|(ts, sum, n)| MonitorPoint {
             ts,
             value: sum / n as f64,
         })
-        .collect())
+        .collect();
+    if points.len() > MAX_HISTORY_POINTS {
+        // BTreeMap 按时间升序，split_off 保留较新的点。
+        points = points.split_off(points.len() - MAX_HISTORY_POINTS);
+    }
+    Ok(points)
 }
 
 pub fn prune(conn: &Connection, sample_cutoff: &str, alert_cutoff: &str) -> Result<(), String> {
