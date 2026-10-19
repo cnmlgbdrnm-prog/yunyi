@@ -87,10 +87,10 @@ Store ⇠── migration v17（server_metric_samples / server_alerts）
 
 ## 执行状态（进度指针）
 
-- 当前：T6（pending）
-- 下一动作：实现只读 SSH 探针与采集脚本
+- 当前：T7（pending）
+- 下一动作：实现调度器、轮次编排与生命周期
 - 阻塞：无
-- 已完成：T1、T2、T3、T4、T5
+- 已完成：T1、T2、T3、T4、T5、T6
 - 最后更新：2026-10-19
 
 ---
@@ -2989,7 +2989,7 @@ git commit -m "feat(monitor): 增加告警存储与摘要查询"
 
 - **验收:** `cargo test --features local-tests server_monitor::probe -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；脚本字符串包含全部段标记且不含 `sudo`。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `7a25df5`；探针测试 2/2 通过；脚本只读、`##wg_rc` 紧跟 `wg show interfaces`、10s 超时、SSH 调用签名核验通过；任务审查 Spec ✅ / Task quality Approved（5 条 Minor 已登记 SDD ledger）
 
 - [ ] **Step 1: 写失败的探针测试**
 
