@@ -33,6 +33,8 @@ import type {
 } from '../api/types'
 import type { ViewKey } from '../App'
 import NetworkCard, { AUTO_OPTION } from '../components/NetworkCard'
+import ServerHealthCard from './dashboard/ServerHealthCard'
+import { useMonitorSummary } from '../monitor/registry'
 
 /** bits_per_second → Mbps 文本；空值/非有限值显示「—」（防 NaN 进 UI） */
 function mbpsText(bps: number | null): string {
@@ -45,6 +47,7 @@ export default function Dashboard({
 }: {
   onNavigate: (view: ViewKey) => void
 }) {
+  const { summary: monitor } = useMonitorSummary()
   const [servers, setServers] = useState<Server[]>([])
   const [rules, setRules] = useState<RelayRule[]>([])
   const [throughputs, setThroughputs] = useState<ThroughputTest[]>([])
@@ -317,6 +320,10 @@ export default function Dashboard({
           }
           alert={errorSubs > 0}
           onClick={() => onNavigate('subscriptions')}
+        />
+        <ServerHealthCard
+          summary={monitor}
+          onClick={() => onNavigate('monitor')}
         />
       </div>
       <NetworkCard

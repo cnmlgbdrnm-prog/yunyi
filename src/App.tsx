@@ -2,7 +2,12 @@
 import { useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { installJobListener } from './jobs/registry'
-import { installMonitorListener, refreshMonitor } from './monitor/registry'
+import {
+  installMonitorListener,
+  refreshMonitor,
+  useMonitorSummary,
+} from './monitor/registry'
+import NavItem from './components/NavItem'
 import ConnLog from './views/ConnLog'
 import Dashboard from './views/Dashboard'
 import Subscriptions from './views/Subscriptions'
@@ -11,6 +16,7 @@ import Servers from './views/Servers'
 import Relay from './views/Relay'
 import Shares from './views/Shares'
 import Settings from './views/Settings'
+import Monitor from './views/Monitor'
 
 export type ViewKey =
   | 'dashboard'
@@ -18,17 +24,19 @@ export type ViewKey =
   | 'subscriptions'
   | 'nodes'
   | 'servers'
+  | 'monitor'
   | 'relay'
   | 'shares'
   | 'settings'
 
-const NAV_ITEMS: { key: ViewKey; label: string }[] = [
+export const NAV_ITEMS: { key: ViewKey; label: string }[] = [
   { key: 'dashboard', label: '仪表盘' },
   // 紧跟仪表盘：这是「网络开着但某个程序没走代理」时第一个要看的地方
   { key: 'connlog', label: '连接日志' },
   { key: 'subscriptions', label: '订阅' },
   { key: 'nodes', label: '节点' },
   { key: 'servers', label: '服务器' },
+  { key: 'monitor', label: '监控' },
   { key: 'relay', label: '中转' },
   { key: 'shares', label: '分享' },
   { key: 'settings', label: '设置' },
@@ -36,6 +44,9 @@ const NAV_ITEMS: { key: ViewKey; label: string }[] = [
 
 export default function App() {
   const [view, setView] = useState<ViewKey>('dashboard')
+  const { summary: monitorSummary } = useMonitorSummary()
+  const unackedMonitor =
+    monitorSummary?.active_alerts.filter((a) => a.acked_at == null).length ?? 0
   // 全进程只装一次 job://progress 订阅与其唯一的对账定时器。
   // 为什么放在根组件而不是各视图：视图是条件挂载的（下面 :73-80），每个视图各自订阅
   // 一份等于「任务进度只在当前那一页可见」，切走的那份订阅连同状态一起没了（评审 #5/#15）。
@@ -61,18 +72,13 @@ export default function App() {
       <nav className="flex w-48 flex-col gap-1 border-r border-neutral-800 p-3">
         <h1 className="mb-4 px-2 text-lg font-bold">云驿</h1>
         {NAV_ITEMS.map((item) => (
-          <button
+          <NavItem
             key={item.key}
-            type="button"
+            label={item.label}
+            active={view === item.key}
+            badge={item.key === 'monitor' ? unackedMonitor : 0}
             onClick={() => setView(item.key)}
-            className={`rounded px-3 py-2 text-left transition-colors ${
-              view === item.key
-                ? 'bg-neutral-800 text-white'
-                : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
-            }`}
-          >
-            {item.label}
-          </button>
+          />
         ))}
       </nav>
       <main className="flex-1 overflow-auto p-6">
@@ -81,6 +87,7 @@ export default function App() {
         {view === 'subscriptions' && <Subscriptions />}
         {view === 'nodes' && <Nodes />}
         {view === 'servers' && <Servers />}
+        {view === 'monitor' && <Monitor onNavigate={setView} />}
         {view === 'relay' && <Relay />}
         {view === 'shares' && <Shares />}
         {view === 'settings' && <Settings />}
