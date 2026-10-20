@@ -32,6 +32,7 @@ pub mod clone;
 pub mod model;
 pub mod naming;
 pub mod plan;
+pub mod scripts;
 
 /// 服务器上所有分享的根目录。
 pub const SHARE_ROOT: &str = "/srv/vpnshare";
