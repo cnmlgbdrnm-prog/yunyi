@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T8（pending）
-- 下一动作：实现 `share/install.rs` 的列举（`share_summary.py` 新格式 + 旧分享只读入口）并写 `list_tests.rs`
+- 当前：T9（pending）
+- 下一动作：实现 `share/install.rs` 的编辑/重置用量/作废（停-写-起、状态推导、旧分享兼容）并写 `manage_tests.rs`
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -2618,7 +2618,7 @@ git commit -m "feat(share): 创建分享的完整编排与回滚"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::list` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `dfbf95f`；`cargo test --features local-tests share::` 71 passed，其中 `list_tests` 4 passed（摘要解析、新分享状态/用量/last_access、过滤 `tls` 非分享目录、旧分享只读映射、旧单元补防火墙持久化并验链接）；旧升级用例同步改为断言删旧规则与 `ExecStartPost/ExecStopPost`。
 
 - [ ] **Step 1: 写摘要解析测试**
 
