@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 pub mod clone;
+pub mod install;
 pub mod model;
 pub mod naming;
 pub mod plan;
