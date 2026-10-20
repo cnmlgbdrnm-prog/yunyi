@@ -92,9 +92,14 @@
 
 | 命令 | UI 封装 | 参数 | 返回 |
 | --- | --- | --- | --- |
-| `list_shares_cmd` | `listShares()` | — | `ShareList { shares, unreachable[] }`（状态实读自服务器） |
-| `create_share_cmd` | `createShare(serverId, nodeIds)` | `{ serverId, nodeIds }` | `ShareInfo`；空列表被拒 |
-| `delete_share_cmd` | `deleteShare(serverId, token)` | `{ serverId, token }` | `void`（停服务 + 删文件 + 撤规则，幂等） |
+| `list_share_candidates_cmd` | `listShareCandidates(serverId)` | `{ serverId }` | `ShareCandidate[]`（后端重算准入，带 `shareable/reason`） |
+| `list_shares_cmd` | `listShares()` | — | `ShareList { shares, unreachable[] }`（状态实读自服务器，新旧格式统一） |
+| `create_share_cmd` | `createShare(serverId, nodeIds, quotaGb, rateUpMbps, rateDownMbps, expiresInDays)` | `{ serverId, nodeIds, quotaGb, rateUpMbps, rateDownMbps, expiresInDays }` | `ShareInfo`；TLS 未就绪/空列表/准入失败均拒绝 |
+| `update_share_cmd` | `updateShare(serverId, id, quotaGb, rateUpMbps, rateDownMbps, expiresInDays)` | `{ serverId, id, quotaGb, rateUpMbps, rateDownMbps, expiresInDays }` | `ShareInfo`；停-写-起网关，保留已用字节 |
+| `reset_share_usage_cmd` | `resetShareUsage(serverId, id)` | `{ serverId, id }` | `ShareInfo`；清零用量并解除停用 |
+| `delete_share_cmd` | `deleteShare(serverId, id)` | `{ serverId, id }` | `void`（停单元 + 删文件 + 撤规则，幂等） |
+| `prepare_share_tls_cmd` | `prepareShareTls(serverId)` | `{ serverId }` | `ShareTlsStatus`；DNS/80/certbot 全链路 |
+| `share_tls_status_cmd` | `shareTlsStatus(serverId)` | `{ serverId }` | `ShareTlsStatus`；未配置时 `ready=false` + 原因 |
 | `start_sub_server_cmd` | `startSubServer(port, token)` | `{ port, token }` | `number`（实际端口） |
 | `stop_sub_server_cmd` | `stopSubServer()` | — | `void` |
 | `get_sub_server_status_cmd` | `getSubServerStatus()` | — | `boolean` |
