@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T6（pending）
-- 下一动作：实现 `share/tls.rs`（域名校验、certbot 签发、证书部署与续期钩子）并写 `tls_tests.rs`
+- 当前：T7（pending）
+- 下一动作：实现 `share/install.rs` 的创建编排（端口分配、配置克隆、单元生成、健康校验、失败回滚）并写 `install_tests.rs`
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -1848,7 +1848,7 @@ git commit -m "feat(share): 订阅 TLS 服务、入口网关与防火墙脚本"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::tls` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `81a0373`；`cargo test --features local-tests share::tls` 16 passed（命令/钩子/邮箱纯函数；未配域名/邮箱/非法邮箱不连服务器；DNS 不匹配与 80 占用不发 certbot；签发失败/无包管理器撤回 80 放行；成功写钩子并返回到期时间；状态查询含缺证书与就绪路径）。
 
 - [ ] **Step 1: 写 TLS 失败测试**
 
