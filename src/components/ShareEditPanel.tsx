@@ -32,12 +32,9 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
   )
   const [quotaDownGb, setQuotaDownGb] = useState(
     String(
-      Math.max(
-        1,
-        Math.round(
-          (share.split_quota ? share.quota_down_bytes : share.quota_bytes) / GB,
-        ),
-      ),
+      share.split_quota
+        ? Math.round(share.quota_down_bytes / GB)
+        : Math.max(1, Math.round(share.quota_bytes / GB)),
     ),
   )
   const [rateUp, setRateUp] = useState(String(share.rate_up_mbps))
