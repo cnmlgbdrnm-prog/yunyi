@@ -150,19 +150,66 @@ pub mod nodes {
 
     /// 把 params_json 里 clash_raw 片段的 name 改成 `new_name`。
     /// 没有 clash_raw、片段非映射、或片段已经是该名字 → None（无需回写）。
-    /// 片段原本没有 name 键也照样写入：既然节点有名字，proxies 就该输出它。
-    fn rewrite_clash_raw_name(params_json: &str, new_name: &str) -> Option<String> {
+    pub(crate) fn rewrite_clash_raw_name(params_json: &str, new_name: &str) -> Option<String> {
         let mut p: serde_json::Value = serde_json::from_str(params_json).ok()?;
-        let raw = p.get("clash_raw")?.as_str()?.to_string();
-        let mut frag: serde_yaml::Value = serde_yaml::from_str(&raw).ok()?;
+        let raw = p.get("clash_raw")?.as_str()?;
+        p["clash_raw"] = serde_json::Value::String(rewrite_raw_yaml_name(raw, new_name)?);
+        serde_json::to_string(&p).ok()
+    }
+
+    /// 把 clash_raw 的**片段 YAML** 里的 name 改成 `new_name`，返回改写后的片段。
+    /// 片段非映射或已经是该名字 → None（无需回写）。片段原本没有 name 键也照样
+    /// 写入：既然节点有名字，proxies 就该输出它。
+    ///
+    /// 导入路径（`subs::service::store_nodes`）与 [`rename`] 共用这一份：消歧只改
+    /// 数据库名而不同步 raw 片段，会让 `proxies` 里仍是旧名、而 `proxy-groups`
+    /// 成员用的是新名——mihomo 要么报重复名，要么分组指向不存在的成员。
+    pub(crate) fn rewrite_raw_yaml_name(raw: &str, new_name: &str) -> Option<String> {
+        let mut frag: serde_yaml::Value = serde_yaml::from_str(raw).ok()?;
         let map = frag.as_mapping_mut()?;
         let key = serde_yaml::Value::String("name".into());
         if map.get(&key).and_then(|v| v.as_str()) == Some(new_name) {
             return None;
         }
         map.insert(key, serde_yaml::Value::String(new_name.into()));
-        p["clash_raw"] = serde_json::Value::String(serde_yaml::to_string(&frag).ok()?);
-        serde_json::to_string(&p).ok()
+        serde_yaml::to_string(&frag).ok()
+    }
+
+    /// 存量重名自愈：节点名是 mihomo 的代理名/分组引用键，也是 sing-box 的 tag，
+    /// 必须全局唯一；重名会让整份客户端配置被 mihomo 拒绝（`duplicate name`）。
+    ///
+    /// 为什么装配期还要再做一次：导入去重只能拦住**新**数据，升级前入库的重名节点
+    /// 仍会在第一次「开启网络」时炸掉。按 `list` 的稳定顺序（`ORDER BY name`）保留
+    /// 第一个，其余追加 ` #2`、` #3`……；改名同时经 [`rename`] 改写 clash_raw 片段，
+    /// 否则 proxies 与分组又会分叉。
+    ///
+    /// 候选名先与**全部现有名**比对（而不是只与已处理过的），避免把 `A` 改名成
+    /// 另一个节点本来就叫的 `A #2`。幂等：没有重名时零写入，返回 0。
+    pub fn ensure_unique_names(
+        conn: &Connection,
+        creds: &crate::crypto::CredentialService,
+    ) -> rusqlite::Result<usize> {
+        let nodes = list(conn, creds)?;
+        let mut existing: std::collections::HashSet<String> =
+            nodes.iter().map(|n| n.name.clone()).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut healed = 0usize;
+        for n in nodes {
+            if seen.insert(n.name.clone()) {
+                continue;
+            }
+            let mut k = 2u32;
+            loop {
+                let candidate = format!("{} #{k}", n.name);
+                if existing.insert(candidate.clone()) {
+                    rename(conn, &n.id, &candidate, creds)?;
+                    healed += 1;
+                    break;
+                }
+                k += 1;
+            }
+        }
+        Ok(healed)
     }
 
     /// 按 id 查单行（测速执行器装载节点用）。

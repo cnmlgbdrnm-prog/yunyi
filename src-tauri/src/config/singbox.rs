@@ -12,7 +12,8 @@
 //! 来源策略：clash_raw 是 Clash 字段体系，不能透传——解析 YAML 片段后按映射表取
 //! 基础字段（type 改名 ss→shadowsocks、server、port→server_port、cipher→method 仅 ss、
 //! password/uuid 直传），其余键忽略不映射（原始 params_json 不丢失）；URI 来源按
-//! 协议映射基础字段。传输层（ws/grpc 等 transport 对象）属 P7 规格范围外；tls 映射
+//! 协议映射基础字段。传输层映射 ws/grpc 的 transport 对象（VMess 取 network 键，
+//! VLESS/Trojan 取 type 键）；tls 映射
 //! enabled/server_name/insecure，REALITY 节点另映射 `tls.reality` 与 uTLS 指纹——
 //! 少了它们客户端握手会直接失败。DNS 采用 sing-box 1.12+ 的对象形式（字符串形式在
 //! 1.13 起 FATAL）。未知键一律忽略。
@@ -225,9 +226,12 @@ fn vmess_outbound(n: &Node, params: &Value) -> Value {
         "alter_id".into(),
         Value::from(int_param(params, "alterId", 0)),
     );
-    // tls 基础：URI 原生 tls 键为 "tls" 时启用（transport 嵌套属 P7 规格范围外）
+    // tls 基础：URI 原生 tls 键为 "tls" 时启用
     if str_param(params, "tls") == "tls" {
         m.insert("tls".into(), tls_basic(params));
+    }
+    if let Some(t) = outbound_transport(params, "network") {
+        m.insert("transport".into(), t);
     }
     Value::Object(m)
 }
@@ -244,9 +248,12 @@ fn vless_outbound(n: &Node, params: &Value) -> Value {
     if !flow.is_empty() {
         m.insert("flow".into(), Value::String(flow));
     }
-    // tls 基础：security=tls/reality 启用（reality 选项属 P7 规格范围外）
+    // tls 基础：security=tls/reality 启用
     if matches!(str_param(params, "security").as_str(), "tls" | "reality") {
         m.insert("tls".into(), tls_basic(params));
+    }
+    if let Some(t) = outbound_transport(params, "type") {
+        m.insert("transport".into(), t);
     }
     Value::Object(m)
 }
@@ -263,6 +270,9 @@ fn trojan_outbound(n: &Node, params: &Value) -> Value {
     );
     if matches!(str_param(params, "security").as_str(), "tls" | "reality") {
         m.insert("tls".into(), tls_basic(params));
+    }
+    if let Some(t) = outbound_transport(params, "type") {
+        m.insert("transport".into(), t);
     }
     Value::Object(m)
 }
@@ -346,6 +356,41 @@ fn wireguard_outbound(n: &Node, params: &Value) -> Value {
     Value::Object(m)
 }
 
+/// 内部传输参数 → sing-box transport 对象。
+///
+/// 键名分两套：VMess 用 `network`，VLESS/Trojan 用 `type`，由调用方传入。
+/// 只映射 ws/grpc——其它传输（http/quic 等）本项目尚无生成路径，宁可不输出，
+/// 也不伪造 sing-box 不认识的字段。
+fn outbound_transport(params: &Value, network_key: &str) -> Option<Value> {
+    let network = str_param(params, network_key);
+    match network.as_str() {
+        "ws" => {
+            let mut t = Map::new();
+            t.insert("type".into(), Value::String("ws".into()));
+            let path = str_param(params, "path");
+            if !path.is_empty() {
+                t.insert("path".into(), Value::String(path));
+            }
+            let host = str_param(params, "host");
+            if !host.is_empty() {
+                t.insert("headers".into(), serde_json::json!({ "Host": host }));
+            }
+            Some(Value::Object(t))
+        }
+        "grpc" => {
+            let mut t = Map::new();
+            t.insert("type".into(), Value::String("grpc".into()));
+            // URI 原生键为 serviceName；Clash 来源的 clash_raw 走另一条映射路径
+            let service = str_param(params, "serviceName");
+            if !service.is_empty() {
+                t.insert("service_name".into(), Value::String(service));
+            }
+            Some(Value::Object(t))
+        }
+        _ => None,
+    }
+}
+
 /// tls 基础对象：enabled 恒 true，server_name 取 sni，insecure 由
 /// skip-cert-verify/allowInsecure/insecure 任一为 "true"/"1" 判定；只输出可确定的字段。
 ///
@@ -354,7 +399,11 @@ fn wireguard_outbound(n: &Node, params: &Value) -> Value {
 fn tls_basic(params: &Value) -> Value {
     let mut t = Map::new();
     t.insert("enabled".into(), Value::Bool(true));
-    let sni = str_param(params, "sni");
+    // VMess 的 SNI 按 mihomo 字段叫 servername，兼容读取两种键
+    let mut sni = str_param(params, "sni");
+    if sni.is_empty() {
+        sni = str_param(params, "servername");
+    }
     if !sni.is_empty() {
         t.insert("server_name".into(), Value::String(sni));
     }

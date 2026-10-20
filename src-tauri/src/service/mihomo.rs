@@ -361,14 +361,17 @@ fn reload(config_yaml: &str) -> Response {
     });
     let addr = format!("127.0.0.1:{ctrl}");
     match crate::service::http::put_json(&addr, "/configs", &token, &body) {
-        Ok(code) if (200..300).contains(&code) => {
+        Ok((code, _)) if (200..300).contains(&code) => {
             *LAST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(updated);
             Response::Reloaded
         }
         result => {
             let restore = std::fs::write(&path, &old);
             let detail = match result {
-                Ok(code) => format!("mihomo 拒绝热重载: HTTP {code}"),
+                Ok((code, body)) if !body.is_empty() => {
+                    format!("mihomo 拒绝热重载: HTTP {code}: {body}")
+                }
+                Ok((code, _)) => format!("mihomo 拒绝热重载: HTTP {code}"),
                 Err(e) => format!("热重载通信失败: {e}"),
             };
             Response::Failed {
@@ -562,7 +565,7 @@ fn set_tun(enable: bool) -> Response {
     });
     let addr = format!("127.0.0.1:{ctrl}");
     match crate::service::http::put_json(&addr, "/configs", &token, &body) {
-        Ok(code) if (200..300).contains(&code) => {
+        Ok((code, _)) if (200..300).contains(&code) => {
             *LAST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(updated);
             // 关 TUN 之后必须核验网卡真拆了：热重载只说明 mihomo 收下了配置，不说明
             // 系统那一侧已经还原。不核验的话，「配置里没有 tun 块、网卡却仍在接管」
@@ -592,7 +595,10 @@ fn set_tun(enable: bool) -> Response {
         }
         // 非 2xx 多半是驱动装不上（wintun 被安全软件拦）——原样报出去，
         // 主程序据此让开关回弹并把 mihomo 的话展示给用户
-        Ok(code) => Response::Failed {
+        Ok((code, body)) if !body.is_empty() => Response::Failed {
+            message: format!("热重载被 mihomo 拒绝: HTTP {code}: {body}"),
+        },
+        Ok((code, _)) => Response::Failed {
             message: format!("热重载被 mihomo 拒绝: HTTP {code}"),
         },
         Err(e) => Response::Failed { message: e },
@@ -657,7 +663,7 @@ fn detach() -> Response {
     });
     let addr = format!("127.0.0.1:{ctrl}");
     match crate::service::http::put_json(&addr, "/configs", &token, &body) {
-        Ok(code) if (200..300).contains(&code) => {
+        Ok((code, _)) if (200..300).contains(&code) => {
             *LAST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(updated);
             let was_tun = TUN_ENABLED.swap(false, Ordering::Relaxed);
             if was_tun {
@@ -683,7 +689,10 @@ fn detach() -> Response {
             // 否则下次热重载会从一份与实际运行状态不符的文件起算。
             let restore = std::fs::write(&path, &current);
             let detail = match result {
-                Ok(code) => format!("mihomo 拒绝切直连: HTTP {code}"),
+                Ok((code, body)) if !body.is_empty() => {
+                    format!("mihomo 拒绝切直连: HTTP {code}: {body}")
+                }
+                Ok((code, _)) => format!("mihomo 拒绝切直连: HTTP {code}"),
                 Err(e) => format!("切直连通信失败: {e}"),
             };
             Response::Failed {

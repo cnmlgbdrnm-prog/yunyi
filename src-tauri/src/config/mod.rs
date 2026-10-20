@@ -431,7 +431,14 @@ pub fn client_yaml_with_tor_upstream(
         if n.protocol == "ssr" {
             continue;
         }
-        proxies.push(node_mapping(n, None, rules, servers, privacies)?);
+        // 运行配置里的代理名必须与分组引用**同源**：下面 `names` 用的是
+        // `client_name`，这里若走 `node_mapping(n, None)`，clash_raw 分支会保留
+        // 片段自带的旧 name，于是 proxies 与 proxy-groups 分叉——重名时 mihomo
+        // 拒绝整份配置（`duplicate name`），不重名时分组指向不存在的成员。
+        // 导出 YAML（build_yaml）保持“raw 自带 name 不改写”的既有语义，这里只
+        // 收口运行配置；导入路径也已把消歧后的名字同步写进片段，双保险。
+        let name = client_name(n, privacies);
+        proxies.push(node_mapping(n, Some(&name), rules, servers, privacies)?);
     }
     let names: Vec<String> = enabled
         .iter()
@@ -776,6 +783,16 @@ fn vmess_mapping(n: &Node, name: &str, params: &serde_json::Value) -> Mapping {
     let tls = str_param(params, "tls");
     if !tls.is_empty() {
         m.insert(s("tls"), Value::Bool(tls == "tls"));
+    }
+    // VMess 的 SNI 字段名是 servername（与 vless/trojan 的 sni 不同）；
+    // sing-box 订阅导入后会把 TLS server_name 落到 sni，这里必须转一手，
+    // 否则经本程序导出的 VMess-WS 节点再导入时丢失 SNI。
+    let sni = str_param(params, "sni");
+    if !sni.is_empty() {
+        m.insert(s("servername"), s(&sni));
+    }
+    if skip_cert_verify_true(params) {
+        m.insert(s("skip-cert-verify"), Value::Bool(true));
     }
     if network == "ws" {
         let mut ws = Mapping::new();

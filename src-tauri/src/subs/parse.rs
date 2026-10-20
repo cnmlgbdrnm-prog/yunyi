@@ -1,6 +1,7 @@
-//! 订阅解析器：识别 base64 URI 列表与 Clash YAML 两种格式，解析为统一 ParsedNode。
-//! URI 列表支持 vmess/ss/ssr/trojan/vless/hysteria2 六类协议；Clash 来源节点保留
-//! 原始 YAML 片段（clash_raw），配置生成时原样输出以免协议信息失真。
+//! 订阅解析器：识别 base64 URI 列表、Clash YAML 与 sing-box JSON 三种格式，
+//! 解析为统一 ParsedNode。URI 列表支持 vmess/ss/ssr/trojan/vless/hysteria2 六类协议；
+//! Clash 来源节点保留原始 YAML 片段（clash_raw），配置生成时原样输出以免协议信息失真。
+//! sing-box JSON 解析 `outbounds` 里的代理出站（selector/urltest/direct/block 跳过）。
 
 use crate::subs::SubError;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -15,6 +16,8 @@ pub enum SubFormat {
     UriList,
     /// Clash/Mihomo YAML（proxies 列表）
     ClashYaml,
+    /// sing-box JSON（outbounds 列表）
+    SingBoxJson,
 }
 
 /// 解析后的统一节点表示。
@@ -38,6 +41,20 @@ pub fn detect(bytes: &[u8]) -> Result<SubFormat, SubError> {
     }
     if looks_like_uri_list(&text) {
         return Ok(SubFormat::UriList);
+    }
+    // sing-box 客户端配置：顶层是 JSON 对象且带 outbounds 数组。
+    // 必须真正解析一次，不能只看首字符 `{`——否则损坏的 JSON 会被判成
+    // sing-box 而报“没有出站”，掩盖真正的语法错误。JSON 语法错误直接报
+    // ParseFailed，而不是笼统的“不支持的订阅格式”（用户复制链接常截断）。
+    if trimmed.starts_with('{') {
+        let value: Value = serde_json::from_str(trimmed)
+            .map_err(|e| SubError::ParseFailed(format!("订阅返回的 JSON 无法解析: {e}")))?;
+        if value.get("outbounds").and_then(Value::as_array).is_some() {
+            return Ok(SubFormat::SingBoxJson);
+        }
+        return Err(SubError::ParseFailed(
+            "订阅返回的 JSON 缺少 outbounds 列表".into(),
+        ));
     }
     // 整体 base64 包裹的 URI 列表
     if let Ok(decoded) = STANDARD.decode(trimmed.replace(['\r', '\n'], "")) {
@@ -70,6 +87,7 @@ pub fn parse(bytes: &[u8], format: SubFormat) -> Result<Vec<ParsedNode>, SubErro
     match format {
         SubFormat::ClashYaml => parse_clash_yaml(bytes),
         SubFormat::UriList => parse_uri_list(bytes),
+        SubFormat::SingBoxJson => parse_singbox_json(bytes),
     }
 }
 
@@ -328,6 +346,293 @@ fn decode_ss_userinfo(s: &str) -> Result<Vec<u8>, SubError> {
         .decode(s)
         .or_else(|_| URL_SAFE_NO_PAD.decode(s))
         .map_err(|_| err())
+}
+
+/// 解析 sing-box 客户端配置里的 `outbounds`。
+///
+/// 只收代理出站：selector/urltest/direct/block/dns 等没有 `server`/`server_port`
+/// 的出站一律跳过。参数键统一折算成 config/mod.rs 与 config/singbox.rs 认识的
+/// 内部键名（如 ws 的 path/host、REALITY 的 public-key），保证「导入再导出」
+/// 不丢字段。
+fn parse_singbox_json(bytes: &[u8]) -> Result<Vec<ParsedNode>, SubError> {
+    let root: Value = serde_json::from_slice(bytes)
+        .map_err(|e| SubError::ParseFailed(format!("sing-box JSON 解析失败: {e}")))?;
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| SubError::ParseFailed("缺少 outbounds 列表".into()))?;
+    let mut out = vec![];
+    for ob in outbounds {
+        let Some(map) = ob.as_object() else {
+            continue;
+        };
+        let Some((protocol, params)) = singbox_proxy_params(map) else {
+            continue;
+        };
+        let addr = sb_str(map, "server").unwrap_or("").to_string();
+        let port = sb_port(map).unwrap_or(0);
+        if addr.is_empty() || port <= 0 {
+            continue;
+        }
+        let name = sb_str(map, "tag")
+            .filter(|s| !s.is_empty())
+            .unwrap_or("未命名节点")
+            .to_string();
+        out.push(ParsedNode {
+            name,
+            protocol,
+            addr,
+            port,
+            params,
+            clash_raw: None,
+        });
+    }
+    if out.is_empty() {
+        return Err(SubError::ParseFailed(
+            "sing-box 配置里没有可导入的代理出站".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// 单个 sing-box 出站 → 内部协议名与参数；非代理出站返回 None。
+fn singbox_proxy_params(ob: &Map<String, Value>) -> Option<(String, Map<String, Value>)> {
+    let ty = sb_str(ob, "type")?;
+    let mut p = Map::new();
+    let protocol = match ty {
+        "vless" => {
+            p.insert("uuid".into(), Value::from(sb_str(ob, "uuid").unwrap_or("")));
+            if let Some(flow) = sb_str(ob, "flow") {
+                if !flow.is_empty() {
+                    p.insert("flow".into(), Value::from(flow));
+                }
+            }
+            if let Some(reality) = sb_apply_tls(ob, &mut p) {
+                p.insert(
+                    "security".into(),
+                    Value::from(if reality { "reality" } else { "tls" }),
+                );
+            }
+            sb_apply_transport(ob, &mut p, "type");
+            "vless"
+        }
+        "vmess" => {
+            p.insert("uuid".into(), Value::from(sb_str(ob, "uuid").unwrap_or("")));
+            // sing-box 的 security 是加密方式（auto/aes-128-gcm…），内部键为 cipher；
+            // TLS 开关单独用 tls 字符串，不能复用 security——否则导出时会把
+            // "tls" 当成加密方式。
+            let security = sb_str(ob, "security").unwrap_or("auto");
+            p.insert("cipher".into(), Value::from(security));
+            p.insert(
+                "alterId".into(),
+                Value::from(sb_int(ob, "alter_id").unwrap_or(0)),
+            );
+            if sb_apply_tls(ob, &mut p).is_some() {
+                p.insert("tls".into(), Value::from("tls"));
+            }
+            sb_apply_transport(ob, &mut p, "network");
+            "vmess"
+        }
+        "trojan" => {
+            p.insert(
+                "password".into(),
+                Value::from(sb_str(ob, "password").unwrap_or("")),
+            );
+            if let Some(reality) = sb_apply_tls(ob, &mut p) {
+                p.insert(
+                    "security".into(),
+                    Value::from(if reality { "reality" } else { "tls" }),
+                );
+            }
+            sb_apply_transport(ob, &mut p, "type");
+            "trojan"
+        }
+        "shadowsocks" => {
+            p.insert(
+                "cipher".into(),
+                Value::from(sb_str(ob, "method").unwrap_or("")),
+            );
+            p.insert(
+                "password".into(),
+                Value::from(sb_str(ob, "password").unwrap_or("")),
+            );
+            "ss"
+        }
+        "hysteria2" => {
+            p.insert(
+                "password".into(),
+                Value::from(sb_str(ob, "password").unwrap_or("")),
+            );
+            for (sk, dk) in [("up_mbps", "up"), ("down_mbps", "down")] {
+                if let Some(v) = sb_int(ob, sk) {
+                    p.insert(dk.into(), Value::from(v));
+                }
+            }
+            if let Some(obfs) = ob.get("obfs").and_then(Value::as_object) {
+                if let Some(kind) = sb_str(obfs, "type") {
+                    p.insert("obfs".into(), Value::from(kind));
+                }
+                if let Some(pw) = sb_str(obfs, "password") {
+                    p.insert("obfs-password".into(), Value::from(pw));
+                }
+            }
+            // hysteria2 恒为 TLS；这里只吸收 sni/跳过校验等可选字段
+            sb_apply_tls(ob, &mut p);
+            "hysteria2"
+        }
+        "tuic" => {
+            p.insert("uuid".into(), Value::from(sb_str(ob, "uuid").unwrap_or("")));
+            p.insert(
+                "password".into(),
+                Value::from(sb_str(ob, "password").unwrap_or("")),
+            );
+            if let Some(cc) = sb_str(ob, "congestion_control") {
+                p.insert("congestion-control".into(), Value::from(cc));
+            }
+            if let Some(mode) = sb_str(ob, "udp_relay_mode") {
+                p.insert("udp-relay-mode".into(), Value::from(mode));
+            }
+            sb_apply_tls(ob, &mut p);
+            "tuic"
+        }
+        "wireguard" => {
+            p.insert(
+                "private-key".into(),
+                Value::from(sb_str(ob, "private_key").unwrap_or("")),
+            );
+            p.insert(
+                "public-key".into(),
+                Value::from(sb_str(ob, "peer_public_key").unwrap_or("")),
+            );
+            if let Some(psk) = sb_str(ob, "peer_pre_shared_key") {
+                p.insert("preshared-key".into(), Value::from(psk));
+            }
+            // local_address 允许字符串或数组；内部只保留首个地址
+            if let Some(ip) = ob.get("local_address").and_then(|v| match v {
+                Value::Array(a) => a.first().and_then(Value::as_str),
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            }) {
+                p.insert("ip".into(), Value::from(ip));
+            }
+            if let Some(mtu) = sb_int(ob, "mtu") {
+                p.insert("mtu".into(), Value::from(mtu));
+            }
+            "wireguard"
+        }
+        _ => return None,
+    };
+    Some((protocol.to_string(), p))
+}
+
+/// 吸收 sing-box `tls` 对象：sni/跳过校验/uTLS 指纹/REALITY 公钥与 short_id。
+/// 返回 Some(reality)：TLS 已启用；布尔值表示是否 REALITY。未启用返回 None。
+fn sb_apply_tls(ob: &Map<String, Value>, p: &mut Map<String, Value>) -> Option<bool> {
+    let tls = ob.get("tls").and_then(Value::as_object)?;
+    if !tls.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    if let Some(sni) = sb_str(tls, "server_name") {
+        if !sni.is_empty() {
+            p.insert("sni".into(), Value::from(sni));
+        }
+    }
+    if tls
+        .get("insecure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        p.insert("skip-cert-verify".into(), Value::from("true"));
+    }
+    if let Some(fp) = tls
+        .get("utls")
+        .and_then(Value::as_object)
+        .and_then(|u| sb_str(u, "fingerprint"))
+    {
+        if !fp.is_empty() {
+            p.insert("fingerprint".into(), Value::from(fp));
+        }
+    }
+    let reality = tls.get("reality").and_then(Value::as_object);
+    let reality_on = reality
+        .map(|r| r.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+        .unwrap_or(false);
+    if let Some(r) = reality {
+        if let Some(key) = sb_str(r, "public_key") {
+            if !key.is_empty() {
+                p.insert("public-key".into(), Value::from(key));
+            }
+        }
+        if let Some(sid) = sb_str(r, "short_id") {
+            if !sid.is_empty() {
+                p.insert("short-id".into(), Value::from(sid));
+            }
+        }
+    }
+    Some(reality_on)
+}
+
+/// 吸收 sing-box `transport` 对象：ws/grpc 折算回内部键。
+/// 内部两套键名：vmess 用 `network`，vless/trojan 用 `type`。
+fn sb_apply_transport(ob: &Map<String, Value>, p: &mut Map<String, Value>, key: &str) {
+    let Some(t) = ob.get("transport").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(kind) = sb_str(t, "type") else {
+        return;
+    };
+    if kind == "tcp" {
+        return;
+    }
+    p.insert(key.into(), Value::from(kind));
+    match kind {
+        "ws" => {
+            if let Some(path) = sb_str(t, "path") {
+                if !path.is_empty() {
+                    p.insert("path".into(), Value::from(path));
+                }
+            }
+            // headers.Host 可能是字符串或数组；内部只保留首个
+            if let Some(host) = t.get("headers").and_then(Value::as_object).and_then(|h| {
+                h.get("Host")
+                    .or_else(|| h.get("host"))
+                    .and_then(|v| match v {
+                        Value::Array(a) => a.first().and_then(Value::as_str),
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+            }) {
+                if !host.is_empty() {
+                    p.insert("host".into(), Value::from(host));
+                }
+            }
+        }
+        "grpc" => {
+            if let Some(sn) = sb_str(t, "service_name") {
+                if !sn.is_empty() {
+                    p.insert("serviceName".into(), Value::from(sn));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sb_str<'a>(ob: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    ob.get(key).and_then(Value::as_str)
+}
+
+/// sing-box 数值字段：宽容接受数字与数字字符串。
+fn sb_int(ob: &Map<String, Value>, key: &str) -> Option<i64> {
+    ob.get(key).and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().map(|n| n as i64))
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+fn sb_port(ob: &Map<String, Value>) -> Option<i64> {
+    sb_int(ob, "server_port")
 }
 
 fn parse_clash_yaml(bytes: &[u8]) -> Result<Vec<ParsedNode>, SubError> {

@@ -159,18 +159,40 @@ impl SubscriptionService {
         let tx = conn
             .transaction()
             .map_err(|e| SubError::FetchFailed(e.to_string()))?;
+        // 节点名是 mihomo 的代理名与分组引用键，必须全局唯一；同名会让
+        // `PUT /configs` 返回 400 `proxy xxx is the duplicate name`。自建节点与
+        // 机场/分享订阅完全可能叫同一个名字（分享导出的节点名就沿用源节点名），
+        // 所以导入时必须先避开其它来源已占用的名字。本订阅自己的旧行排除在外：
+        // 它们会在本轮末尾按 keep_ids 清理/覆盖，不能反过来把新名字挤掉。
+        let mut used_names: HashSet<String> = {
+            let mut stmt = tx
+                .prepare("SELECT name FROM nodes WHERE sub_id IS NULL OR sub_id <> ?1")
+                .map_err(|e| SubError::FetchFailed(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![sub.id], |r| r.get::<_, String>(0))
+                .map_err(|e| SubError::FetchFailed(e.to_string()))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| SubError::FetchFailed(e.to_string()))?
+        };
         let mut upserted = 0usize;
         let mut keep_ids = Vec::with_capacity(parsed.len());
         for p in parsed {
             let id = stable_node_id(sub, &p);
+            let name = unique_node_name(&p.name, sub, &mut used_names);
             let mut params = p.params.clone();
             if let Some(raw) = &p.clash_raw {
-                // Clash 来源：raw YAML 片段以字符串值并入 params_json，配置生成时原样输出
-                params.insert("clash_raw".into(), serde_json::Value::String(raw.clone()));
+                // Clash 来源：raw YAML 片段以字符串值并入 params_json，配置生成时原样输出。
+                // **消歧后的名字必须同步写进片段**：原样输出的是片段自带的 name，
+                // 而 proxy-groups 成员与 /proxies 的点选键用的都是节点名（见
+                // `repos::nodes::rename` 同一条注释）。只改数据库名会让两者分叉，
+                // mihomo 不是报 duplicate name，就是报分组成员不存在。
+                let raw =
+                    repos::nodes::rewrite_raw_yaml_name(raw, &name).unwrap_or_else(|| raw.clone());
+                params.insert("clash_raw".into(), serde_json::Value::String(raw));
             }
             let node = Node {
                 id: id.clone(),
-                name: p.name,
+                name,
                 source: "import".into(),
                 protocol: p.protocol,
                 addr: p.addr,
@@ -322,6 +344,41 @@ fn apply_filters(sub: &Subscription, parsed: Vec<ParsedNode>) -> Vec<ParsedNode>
             kept && !exc_re.iter().any(|r| r.is_match(&n.name))
         })
         .collect()
+}
+
+/// 给导入节点分配全局唯一的显示名。
+///
+/// 首选保留订阅源里的原名字；被本机其它节点占用时，追加订阅名区分，例如
+/// `ashura-vless（121）`；同一订阅内仍撞名则再追加序号。`used_names` 由调用方
+/// 持有并逐步写入，保证同一批导入内部也唯一。
+///
+/// 后缀刻意包含订阅名而不是节点 id：用户要能看出“这是订阅 121 的同名节点”。
+/// 订阅名为空时退回短 id，避免生成 `（）` 这种无法辨认的后缀。
+fn unique_node_name(base: &str, sub: &Subscription, used_names: &mut HashSet<String>) -> String {
+    let base = if base.trim().is_empty() {
+        "未命名节点"
+    } else {
+        base.trim()
+    };
+    if used_names.insert(base.to_string()) {
+        return base.to_string();
+    }
+    let tag = if sub.name.trim().is_empty() {
+        sub.id.chars().take(8).collect::<String>()
+    } else {
+        sub.name.trim().to_string()
+    };
+    let tagged = format!("{base}（{tag}）");
+    if used_names.insert(tagged.clone()) {
+        return tagged;
+    }
+    for n in 2u32.. {
+        let candidate = format!("{tagged} #{n}");
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("u32 序号空间耗尽")
 }
 
 /// 稳定节点 ID：订阅内按 URI/片段哈希，重同步不重复入库。
