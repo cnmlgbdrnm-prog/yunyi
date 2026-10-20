@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T2（in_progress）
-- 下一动作：写 `share/naming.rs` 与 `share/model.rs` 的失败测试
+- 当前：T3（in_progress）
+- 下一动作：写准入失败测试与 `share/plan.rs`
 - 阻塞：无
-- 已完成：T1（`c820609`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -374,9 +374,9 @@ git commit -m "feat(share): 增加服务器分享域名与 ACME 设置"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::naming` 绿；`cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::model` 绿。
 
-- **状态:** in_progress ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `234a13c`；`share::naming` 3 passed；`share::model` 4 passed。
 
-- [ ] **Step 1: 写命名测试**
+- [x] **Step 1: 写命名测试**
 
 `tests/rust/share/naming_tests.rs`：
 
@@ -680,7 +680,7 @@ git commit -m "feat(share): 分享模型、内部 id 与 token 规则"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::plan` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** in_progress ｜ **证据:**（完成时填）
 
 - [ ] **Step 1: 写准入失败测试**
 
