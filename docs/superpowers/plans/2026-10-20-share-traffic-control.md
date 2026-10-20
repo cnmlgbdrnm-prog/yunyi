@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T3（in_progress）
-- 下一动作：写准入失败测试与 `share/plan.rs`
+- 当前：T4（in_progress）
+- 下一动作：写配置克隆金样测试
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -680,9 +680,9 @@ git commit -m "feat(share): 分享模型、内部 id 与 token 规则"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::plan` 绿。
 
-- **状态:** in_progress ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `91ca458`；`share::plan` 2 passed（准入拒绝矩阵 + 端口探测命令不匹配表头）。
 
-- [ ] **Step 1: 写准入失败测试**
+- [x] **Step 1: 写准入失败测试**
 
 先把 `tests/rust/share/tests.rs` 的 `shared_state` / `seed_server` / `seed_node` / `connect` 改成 `pub(crate)`（兄弟测试模块要复用）。
 
@@ -836,7 +836,7 @@ git commit -m "feat(share): 节点准入与分享候选清单"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::clone` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** in_progress ｜ **证据:**（完成时填）
 
 - [ ] **Step 1: 写克隆金样测试**
 
