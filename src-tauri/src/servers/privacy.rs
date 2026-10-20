@@ -450,6 +450,9 @@ async fn sync_local_private(
     target: &Privacy,
     emit: &(dyn Fn(&str, &str, i64) + Send + Sync),
 ) -> Result<(), String> {
+    // 隐私生效后节点会改名（原始名 → 带「 [隐私]」后缀）。mihomo 的持久化选择按
+    // 代理名匹配，旧名字消失就会回落到「自动选择」，必须记下旧出口再补选回来。
+    let previous_selection = crate::net::runtime::manual_selection(state).await;
     let result = match state.subs.rebuild_config().await {
         Ok(()) => match crate::net::runtime::apply_config_change(state).await {
             Ok(crate::net::runtime::ConfigApply::NotRunning) => Ok(()),
@@ -474,6 +477,16 @@ async fn sync_local_private(
     };
     match result {
         Ok(()) => {
+            if let Err(e) = crate::net::runtime::restore_manual_selection(
+                state,
+                previous_selection.as_deref(),
+                &target.name,
+                &display_name(&target.name),
+            )
+            .await
+            {
+                eprintln!("[vpn-ctl] 隐私生效后恢复手动出口失败（保持现有出口）: {e}");
+            }
             repos::privacies::set_error(&state.db.lock(), target.id, None)
                 .map_err(|e| format!("清除隐私错误失败: {e}"))?;
             emit("完成", "隐私保护已开启且客户端可连接", 100);
@@ -1016,18 +1029,37 @@ pub async fn run_privacy_remove_job(
 
     remove_inner(&mut sess, cancel, &emit, &target).await?;
 
-    {
+    let restored_name = {
         let conn = state.db.lock();
         repos::privacies::delete(&conn, target.id).map_err(|e| e.to_string())?;
-    }
+        // 关闭隐私后的代理名是**节点当前名**（不是隐私记录里的旧快照）。
+        // 存量记录可能因旧版本改名不同步而落后，这里取库里的真名。
+        repos::nodes::get(&conn, &target.node_id, &state.creds)
+            .map_err(|e| e.to_string())?
+            .map(|n| n.name)
+            .unwrap_or_else(|| target.name.clone())
+    };
     state
         .subs
         .rebuild_config()
         .await
         .map_err(|e| format!("远端隐私入口已关闭，但重建本机配置失败：{e}"))?;
+    // 关闭隐私后代理名会去掉「 [隐私]」后缀，旧名字消失会让 mihomo 回落到
+    // 「自动选择」。取重载前的手动出口，重载成功后按新名字补选。
+    let previous_selection = crate::net::runtime::manual_selection(state).await;
     crate::net::runtime::apply_config_change(state)
         .await
         .map_err(|e| format!("远端隐私入口已关闭，但更新运行中客户端失败：{e}"))?;
+    if let Err(e) = crate::net::runtime::restore_manual_selection(
+        state,
+        previous_selection.as_deref(),
+        &display_name(&target.name),
+        &restored_name,
+    )
+    .await
+    {
+        eprintln!("[vpn-ctl] 关闭隐私后恢复手动出口失败（保持现有出口）: {e}");
+    }
 
     emit("完成", "隐私保护已关闭", 100);
     Ok(())

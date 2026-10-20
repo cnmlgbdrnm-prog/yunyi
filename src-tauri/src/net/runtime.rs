@@ -553,8 +553,13 @@ pub async fn start(state: &AppState, opts: StartOptions) -> Result<NetStatus, St
         std::time::Duration::from_secs(30),
     );
     let _ = geodata::ensure_geodata(state, geo_client).await;
-    let nodes =
-        crate::db::repos::nodes::list(&state.db.lock(), &state.creds).map_err(|e| e.to_string())?;
+    // 与 rebuild_config/导出共用「哪些节点进配置」的唯一口径：停用订阅下的节点
+    // 不在这里出现。否则「开启网络」会生成一份含不可见节点的配置，而导出、
+    // 分享与热重载后的缓存里都没有它们，两个口径永久漂移。
+    let nodes = state
+        .subs
+        .visible_nodes()
+        .map_err(|e| format!("读取可见节点失败: {e}"))?;
     // 上游闸门：没有可用节点就别开。否则会生成一份兜底为 MATCH,REJECT 的配置——
     // 那份配置**是对的**（fail-closed，绝不肯静默直连），但对用户毫无用处，且表现
     // 是「国内能上、墙外全被拒」，很容易被当成「代理坏了」而不是「没节点」。
@@ -784,8 +789,12 @@ pub async fn apply_config_change(state: &AppState) -> Result<ConfigApply, String
     );
     let direct = n.child.is_some();
 
-    let nodes =
-        crate::db::repos::nodes::list(&state.db.lock(), &state.creds).map_err(|e| e.to_string())?;
+    // 热重载必须与启动/导出读同一份可见节点；否则停用订阅后重载又会把它的节点
+    // 写回运行中的客户端，形成「清单没有、客户端却认识」的反向漂移。
+    let nodes = state
+        .subs
+        .visible_nodes()
+        .map_err(|e| format!("读取可见节点失败: {e}"))?;
     let rules = crate::relay::list_relay_rules(state).map_err(|e| e.to_string())?;
     let servers = crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
     let privacies =
@@ -1351,6 +1360,36 @@ pub async fn select(state: &AppState, proxy_name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 当前手动出口（仅 manual 模式；未运行/自动模式/查询失败均返回 None）。
+///
+/// 配置热重载会在节点名消失时让 mihomo 回退到「手动选择」组的第一项
+/// （本项目恒为「自动选择」）。因此改名 / 开关隐私这类**会改代理名**的动作，
+/// 必须在变更前后用这个函数记住用户原先钉住的出口，再在重载后显式选回。
+pub async fn manual_selection(state: &AppState) -> Option<String> {
+    if exit_mode_is_auto(state) {
+        return None;
+    }
+    current(state).await.ok().filter(|name| !name.is_empty())
+}
+
+/// 热重载后恢复手动出口：变更前选中的正是 `old_name` 时，改选 `new_name`。
+///
+/// 只做尽力而为的恢复，但**恢复失败要返回 Err 让调用方留痕**：静默停在
+/// 「自动选择」会让用户以为手动钉住的节点还在。调用方不应把这条错误升级成
+/// 「改名/隐私操作失败」——数据库与配置已经落地。
+pub async fn restore_manual_selection(
+    state: &AppState,
+    previous: Option<&str>,
+    old_name: &str,
+    new_name: &str,
+) -> Result<bool, String> {
+    if old_name == new_name || previous != Some(old_name) {
+        return Ok(false);
+    }
+    select(state, new_name).await?;
+    Ok(true)
+}
+
 /// 当前手动选择的分组出口名（仪表盘下拉回显）；未运行或获取失败给错误。
 pub async fn current(state: &AppState) -> Result<String, String> {
     let guard = state.net.lock().await;
@@ -1424,10 +1463,12 @@ pub async fn apply_fastest_measured(state: &AppState) -> Result<(), String> {
     if !exit_mode_is_auto(state) {
         return Ok(());
     }
+    let nodes = state
+        .subs
+        .visible_nodes()
+        .map_err(|e| format!("读取可见节点失败: {e}"))?;
     let (best, has_any_reading) = {
         let conn = state.db.lock();
-        let nodes =
-            crate::db::repos::nodes::list(&conn, &state.creds).map_err(|e| e.to_string())?;
         let privacies = crate::db::repos::privacies::list_all(&conn).map_err(|e| e.to_string())?;
         let nodes: Vec<Node> = nodes
             .into_iter()

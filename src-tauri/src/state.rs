@@ -95,6 +95,9 @@ impl AppState {
         // 代理名是 mihomo 配置里的全局键：升级前入库的重名节点会让整份配置被
         // `proxy xxx is the duplicate name` 拒绝——表现就是「开启网络」永远失败。
         let _ = crate::db::repos::nodes::ensure_unique_names(&db.lock(), &creds);
+        // 隐私记录的显示名跟随节点名（幂等；同上）。旧版本改名只改了 nodes.name，
+        // 升级后代理显示名仍停在旧名字，出口恢复与界面都会错位。
+        let _ = crate::db::repos::privacies::sync_names(&db.lock());
         // 生产超时：连接 15s、整体 30s，卡死端点不得永久挂起同步
         let client = crate::subs::service::http_client(
             std::time::Duration::from_secs(15),

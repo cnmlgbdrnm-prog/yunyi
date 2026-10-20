@@ -123,8 +123,9 @@ pub async fn update_subscription(
         filter_json,
     };
     repos::subs::update(&state.db.lock(), &updated).map_err(err)?;
-    // 订阅状态（启用/禁用）直接影响合并配置，立即重建缓存避免下发/导出读到旧数据
-    state.subs.rebuild_config().await.map_err(err)?;
+    // 订阅状态（启用/禁用）直接决定哪些节点可见：除重建下发/导出用的缓存外，
+    // 还必须让**正在跑的客户端**跟上——它手上是「开网络」那一刻渲出来的快照。
+    rebuild_and_apply(&state).await?;
     Ok(updated)
 }
 
@@ -137,27 +138,40 @@ pub async fn delete_subscription(state: Arc<AppState>, id: String) -> R<()> {
             .map_err(err)?;
     }
     repos::subs::delete(&state.db.lock(), &id).map_err(err)?;
-    // 删除订阅后立即重建合并配置缓存，避免继续服务已删订阅的节点
-    state.subs.rebuild_config().await.map_err(err)?;
-    Ok(())
+    // 删除订阅后立即重建缓存并热更新运行中的客户端，避免继续服务已删订阅的节点
+    rebuild_and_apply(&state).await
 }
 
 pub async fn sync_subscription(state: Arc<AppState>, id: String) -> R<SyncOutcome> {
     let outcome = state.subs.sync(&id).await.map_err(err)?;
+    // `sync` 内部已重建下发/导出缓存；这里补上**运行中客户端**的那一步。
+    // 漏掉它的表现（2026-10-19 实测）：订阅同步出 105 个节点，界面上都能选，
+    // 但跑着的 mihomo 还是开网络那一刻的 8 个——切到任意机场节点回
+    // `HTTP 400 Selector update error: proxy not exist`。
+    // 同步目前只有用户手动触发这一条路径（没有后台定时器）；将来若加定时同步，
+    // 那条路径应直接调 `SubService::sync`，别把这里的「立即生效」带过去。
+    crate::net::runtime::apply_config_change(&state)
+        .await
+        .map_err(err)?;
     Ok(outcome)
 }
 
 // ---------- 节点 ----------
 
 pub fn list_nodes(state: Arc<AppState>) -> R<Vec<Node>> {
-    repos::nodes::list(&state.db.lock(), &state.creds).map_err(err)
+    // 与导出/分享/运行配置同一口径：停用订阅下的节点不在任何配置里，也不该出现在
+    // 节点清单与出口下拉框里。否则用户能选中一个客户端根本不认识的代理名。
+    state.subs.visible_nodes().map_err(err)
 }
 
 /// 用户显式改了配置之后：先重建合并配置缓存（导出/下发读到新数据），
 /// 再让**正在运行**的本机上网客户端跟上（见 `net::runtime::apply_config_change`）。
 ///
-/// 只在用户显式动作的路径上用：后台的订阅同步不走这条——那会让客户端每同步一次
-/// 就重启一次（服务托管模式下连接要断），而同步结果并不急于立刻生效。
+/// 判据是「用户显式动作」而不是「这次改动涉不涉及订阅」：订阅的增删改与手动同步
+/// 同样要立刻生效，否则界面读库能选到节点、客户端却只认识启动那一刻的快照
+/// （切换回 `HTTP 400 Selector update error: proxy not exist`）。
+/// 将来若加**后台定时同步**，那条路径应直接调 `SubService::sync`——没必要每同步一次
+/// 就热重载一次用户正在用的客户端。
 async fn rebuild_and_apply(state: &Arc<AppState>) -> R<()> {
     state.subs.rebuild_config().await.map_err(err)?;
     crate::net::runtime::apply_config_change(state)
@@ -189,28 +203,65 @@ pub async fn rename_node(state: Arc<AppState>, id: String, name: String) -> R<()
     if name.is_empty() {
         return Err(AppError::Validation("节点名不能为空".into()));
     }
-    let changed = {
+    if let Some(reason) = crate::config::proxy_name_conflict(&name) {
+        return Err(AppError::Validation(format!(
+            "节点名「{name}」不可用：{reason}"
+        )));
+    }
+    // 必须在改库/热重载之前读：改完后「手动选择」可能已经回退到自动选择。
+    let previous_selection = crate::net::runtime::manual_selection(&state).await;
+    let (changed, old_effective, new_effective) = {
         let conn = state.db.lock();
         // 先判存在：repos::rename 对不存在的 id 返回 false，与「名字没变」不可区分
-        if repos::nodes::get(&conn, &id, &state.creds)
+        let old_node = repos::nodes::get(&conn, &id, &state.creds)
             .map_err(err)?
-            .is_none()
-        {
-            return Err(AppError::NotFound("节点不存在".into()));
-        }
-        if repos::nodes::list(&conn, &state.creds)
-            .map_err(err)?
-            .into_iter()
-            .any(|n| n.id != id && n.name == name)
-        {
+            .ok_or_else(|| AppError::NotFound("节点不存在".into()))?;
+        let nodes = repos::nodes::list(&conn, &state.creds).map_err(err)?;
+        let privacies = repos::privacies::list_all(&conn).map_err(err)?;
+        let private = crate::servers::privacy::effective_privacy(&old_node.id, &privacies).is_some();
+        let new_effective = if private {
+            crate::servers::privacy::display_name(&name)
+        } else {
+            name.clone()
+        };
+        if nodes.iter().any(|n| n.id != id && n.name == name) {
             return Err(AppError::Message(format!("已存在同名节点：{name}")));
         }
-        repos::nodes::rename(&conn, &id, &name, &state.creds).map_err(err)?
+        // 原始名不同也可能撞上代理名：隐私线的可见名是「原名 [隐私]」。
+        if let Some(other) = nodes
+            .iter()
+            .find(|n| n.id != id && crate::config::client_name(n, &privacies) == new_effective)
+        {
+            return Err(AppError::Message(format!(
+                "节点名与「{}」的生效名冲突：{new_effective}",
+                other.name
+            )));
+        }
+        let old_effective = crate::config::client_name(&old_node, &privacies);
+        let changed = repos::nodes::rename(&conn, &id, &name, &state.creds).map_err(err)?;
+        if changed {
+            // 隐私线的代理显示名由 privacies.name 派生；不同步会让节点页与仪表盘
+            // 各显示一个名字，且下次热重载仍用旧名。
+            repos::privacies::rename_for_node(&conn, &id, &name).map_err(err)?;
+        }
+        (changed, old_effective, new_effective)
     };
     if changed {
         // 名字进合并配置（proxies 名/tag/分组成员），也要让运行中的客户端跟着改名——
         // 否则客户端还挂着旧名，而「手动选择」组里已经没有那个成员了
         rebuild_and_apply(&state).await?;
+        // mihomo 按名字恢复选择；旧名消失时它会回退到组内第一项「自动选择」。
+        // 改名不是「取消选择」，恢复成新名才是用户预期。
+        if let Err(e) = crate::net::runtime::restore_manual_selection(
+            &state,
+            previous_selection.as_deref(),
+            &old_effective,
+            &new_effective,
+        )
+        .await
+        {
+            eprintln!("[vpn-ctl] 改名后恢复手动出口失败（保持现有出口）: {e}");
+        }
     }
     Ok(())
 }

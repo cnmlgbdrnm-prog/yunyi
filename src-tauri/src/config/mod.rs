@@ -241,6 +241,43 @@ pub const MANUAL_GROUP: &str = "手动选择";
 /// 看门狗会独立切换它，绝不改用户的 `手动选择` 出口。
 pub const TOR_UPSTREAM_GROUP: &str = "vpnctl-tor-route";
 
+/// 客户端保留的代理名/分组名。
+///
+/// 节点名会被原样写进 `proxies` 与 `proxy-groups` 成员，和使用这些名字的内置对象
+/// 撞上时 mihomo **拒绝加载整份配置**（分组名会造成自引用 `loop is detected`，
+/// 内置代理名会报 `duplicate name`），表现就是「开启网络」永远失败。导入路径
+/// 自动消歧，手动改名直接拒绝，存量数据在启动自愈里改名。
+pub const RESERVED_PROXY_NAMES: &[&str] = &[
+    MANUAL_GROUP,
+    AUTO_GROUP,
+    TOR_UPSTREAM_GROUP,
+    crate::servers::privacy::INTERNAL_TOR_PROXY,
+    // mihomo 内置代理（区分大小写；小写同名是普通代理，不冲突）
+    "DIRECT",
+    "REJECT",
+    "REJECT-DROP",
+    "PASS",
+    "COMPATIBLE",
+];
+
+/// 是否是 mihomo 内置代理名或本项目自建分组名。
+pub fn is_reserved_proxy_name(name: &str) -> bool {
+    RESERVED_PROXY_NAMES.contains(&name)
+}
+
+/// 名字为什么不能当节点名；None 表示可用。
+pub fn proxy_name_conflict(name: &str) -> Option<&'static str> {
+    if is_reserved_proxy_name(name) {
+        return Some("与客户端内置代理或分组同名");
+    }
+    // 隐私节点的代理显示名是「原名 [隐私]」。普通节点若也叫这个名字，两条代理
+    // 会重名，而用户无法从界面上看出冲突来自哪条隐私线。
+    if name.ends_with(crate::servers::privacy::NODE_SUFFIX) {
+        return Some("以隐私线路保留的后缀结尾");
+    }
+    None
+}
+
 /// 客户端专用分组：自动选择(url-test) + 手动选择(select，首项=自动选择可再挑单节点)。
 ///
 /// 两套成员列表：`url_test_names` 进自动选择，`manual_names` 进手动选择。

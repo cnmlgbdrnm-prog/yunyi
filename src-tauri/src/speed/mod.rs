@@ -82,17 +82,27 @@ pub async fn probe_egress_ip(state: &AppState, upstream_id: i64) -> Result<Strin
         let relays = crate::relay::list_relay_rules(state).unwrap_or_default();
         let servers = crate::db::repos::servers::list(&state.db.lock()).unwrap_or_default();
         let privacies = crate::db::repos::privacies::list_all(&state.db.lock()).unwrap_or_default();
-        // 带隐私：开了隐私的线在这里会被拒绝注入，从而不会被直连探测
+        // 带隐私：开了隐私的线在这里会被拒绝注入，从而不会被直连探测。
+        // 用探测专用别名而不是 node_id：出口探测可能和测速同时进行，两者共享
+        // 同一个 sidecar；同名条目会在探测结束时把测速中的节点一起删掉。
+        let probe_name = format!("probe-{node_id}");
         let proxy = crate::config::node_proxy_json_with_privacy(
-            &node, &node_id, &relays, &servers, &privacies,
+            &node,
+            &probe_name,
+            &relays,
+            &servers,
+            &privacies,
         )
         .map_err(|e| e.to_string())?;
-        engine.put_proxy(&node_id, proxy).await?;
+        engine.put_proxy(&probe_name, proxy).await?;
+        // 与测速同一口径：优先走该节点的独占 listener，避免与同时进行的
+        // 测速/另一个探测共用 mixed-port 时读到别人的出口 IP。
+        let port = engine.proxy_port(&probe_name).await.unwrap_or(mixed_port);
         let fetched = engine
-            .fetch_text(mixed_port, EGRESS_IP_URL, Duration::from_secs(20))
+            .fetch_text(port, EGRESS_IP_URL, Duration::from_secs(20))
             .await;
         // 无论成败都清理注入，避免污染后续测速的节点表
-        let _ = engine.delete_proxy(&node_id).await;
+        let _ = engine.delete_proxy(&probe_name).await;
         parse_egress_ip(&fetched?)
     }
     .await;
@@ -369,12 +379,18 @@ async fn test_one(
     // 失败只记 NULL：直连不通不代表经中转不可用，绝不能影响主路径的结果。
     let mut direct_latency: Option<i64> = None;
     if node.relay_rule_id.is_some() {
-        if let Ok(direct) = crate::config::node_proxy_json(&node, &node_id, &[], &[]) {
-            if engine.put_proxy(&node_id, direct).await.is_ok() {
+        // 直连对比必须用独立的代理名：若复用 node_id，随后注入经中转形态时
+        // 会覆盖掉直连条目；并发测速下还可能误删另一个任务的主条目。
+        let direct_name = format!("direct-{node_id}");
+        if let Ok(direct) = crate::config::node_proxy_json(&node, &direct_name, &[], &[]) {
+            if engine.put_proxy(&direct_name, direct).await.is_ok() {
                 direct_latency = engine
-                    .delay(&node_id, DELAY_URL, DELAY_TIMEOUT_MS)
+                    .delay(&direct_name, DELAY_URL, DELAY_TIMEOUT_MS)
                     .await
                     .ok();
+                // 直连对比只是一次性探测，测完立刻摘除，避免它留在 sidecar 配置里
+                // 占着 listener 端口、也被后续的批量清理误当成主条目。
+                let _ = engine.delete_proxy(&direct_name).await;
             }
         }
     }
@@ -384,6 +400,9 @@ async fn test_one(
     if let Err(e) = engine.put_proxy(&node_id, proxy).await {
         error = Some(e);
     }
+    // 真实引擎会给每个节点分配独占 listener；FakeEngine 没有端口概念，回退到
+    // 调用方传入的 mixed_port（其下载桩不读端口）。
+    let download_port = engine.proxy_port(&node_id).await.unwrap_or(mixed_port);
     if error.is_none() {
         // 延迟：串行 N 次**取最小**，与分跳/服务器延迟同一约定。单次采样在这条链路上
         // 噪声大到没法比节点——同一节点相邻两次测速 200ms 与 1347ms（2026-09-20 实测），
@@ -410,7 +429,7 @@ async fn test_one(
             DOWNLOAD_TIMEOUT,
             download_adaptive(
                 &engine,
-                mixed_port,
+                download_port,
                 SPEED_TEST_ENDPOINT,
                 DOWNLOAD_TIMEOUT,
                 cancel,

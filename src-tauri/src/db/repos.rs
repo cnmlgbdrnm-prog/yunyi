@@ -189,20 +189,48 @@ pub mod nodes {
         conn: &Connection,
         creds: &crate::crypto::CredentialService,
     ) -> rusqlite::Result<usize> {
+        // 隐私节点的配置代理名是 `privacies.name + " [隐私]"`。先把旧快照同步成
+        // 节点当前名，下面才能按「配置里真正出现的名字」判重。
+        crate::db::repos::privacies::sync_names(conn)?;
         let nodes = list(conn, creds)?;
+        let privacies = crate::db::repos::privacies::list_all(conn)?;
         let mut existing: std::collections::HashSet<String> =
             nodes.iter().map(|n| n.name.clone()).collect();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen_raw = std::collections::HashSet::new();
+        let mut seen_effective = std::collections::HashSet::new();
         let mut healed = 0usize;
         for n in nodes {
-            if seen.insert(n.name.clone()) {
+            let private = crate::servers::privacy::effective_privacy(&n.id, &privacies).is_some();
+            let effective = if private {
+                crate::servers::privacy::display_name(&n.name)
+            } else {
+                n.name.clone()
+            };
+            // 保留名即使不重也必须改：分组名/内置代理名会让 mihomo 拒绝整份配置。
+            // 原始名重复与「生效名重复」是两回事：普通节点 `A [隐私]` 与开了隐私的
+            // `A` 原始名不同，但配置里都叫 `A [隐私]`。
+            let reserved = crate::config::is_reserved_proxy_name(&n.name);
+            let raw_dup = !seen_raw.insert(n.name.clone());
+            let effective_dup = !seen_effective.insert(effective);
+            if !reserved && !raw_dup && !effective_dup {
                 continue;
             }
             let mut k = 2u32;
             loop {
                 let candidate = format!("{} #{k}", n.name);
-                if existing.insert(candidate.clone()) {
+                let candidate_effective = if private {
+                    crate::servers::privacy::display_name(&candidate)
+                } else {
+                    candidate.clone()
+                };
+                if !existing.contains(&candidate) && !seen_effective.contains(&candidate_effective)
+                {
                     rename(conn, &n.id, &candidate, creds)?;
+                    if private {
+                        crate::db::repos::privacies::rename_for_node(conn, &n.id, &candidate)?;
+                    }
+                    existing.insert(candidate);
+                    seen_effective.insert(candidate_effective);
                     healed += 1;
                     break;
                 }
@@ -1458,6 +1486,18 @@ pub mod privacies {
         Ok(conn.last_insert_rowid())
     }
 
+    /// 节点改名时同步显示名。
+    ///
+    /// 隐私线的客户端代理名由 `Privacy.name + NODE_SUFFIX` 派生；不同步的话
+    /// 节点页显示新名、仪表盘出口却仍是旧名，而且下一次开关/重建会继续用旧名。
+    pub fn rename_for_node(conn: &Connection, node_id: &str, name: &str) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE privacies SET name=?2 WHERE node_id=?1",
+            params![node_id, name],
+        )?;
+        Ok(())
+    }
+
     /// 回读到的 `.onion` 写回（部署 job 最后一步；中断则保持空串）。
     pub fn set_onion(conn: &Connection, id: i64, onion: &str) -> rusqlite::Result<()> {
         conn.execute(
@@ -1465,6 +1505,20 @@ pub mod privacies {
             params![id, onion],
         )?;
         Ok(())
+    }
+
+    /// 把隐私记录的显示名同步为节点当前名（幂等，返回改动行数）。
+    ///
+    /// 隐私节点的代理名由 `privacies.name + " [隐私]"` 派生；旧版本改名时没有
+    /// 同步这里，升级后会留下「节点页叫新名、客户端代理叫旧名」的分叉，节点改名
+    /// 后的出口恢复也会按错误的新名去选。装配期跑一次把存量拉齐。
+    pub fn sync_names(conn: &Connection) -> rusqlite::Result<usize> {
+        conn.execute(
+            "UPDATE privacies SET name=(SELECT name FROM nodes WHERE nodes.id=privacies.node_id)
+             WHERE EXISTS (SELECT 1 FROM nodes WHERE nodes.id=privacies.node_id)
+               AND name <> (SELECT name FROM nodes WHERE nodes.id=privacies.node_id)",
+            [],
+        )
     }
 
     /// 写回本条独享的 HiddenServiceDir。`tor_dir` 是行 id 的函数
