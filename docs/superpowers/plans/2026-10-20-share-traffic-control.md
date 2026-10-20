@@ -72,9 +72,9 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T13（pending）
-- 下一动作：补 CHANGELOG（新能力与已知限制），跑四道全量门禁，再做真机验证清单
-- 阻塞：无
+- 当前：T13（blocked）
+- 下一动作：用户指定分享域名与目标服务器并授权真机签发/创建验证后，逐项执行 T13 Step 3
+- 阻塞：真机 ACME 签发与创建验证被自动模式拒绝——代理自选 `203-0-113-11.sslip.io`（ashura）签发证书未经用户点名；需用户给出确切域名与主机后再执行。其余工作（CHANGELOG、四道门禁）已完成
 - 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）
 - 最后更新：2026-10-20
 
@@ -3469,9 +3469,9 @@ git commit -m "feat(share): 新建向导、编辑面板与 HTTPS 配置入口"
 
 - **验收:** 四道门禁全绿；CHANGELOG 记录新能力与已知限制；真机验证清单逐项有结论。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** blocked ｜ **证据:** CHANGELOG commit `b32f581`（只暂存新增节，原有未提交条目保留）；四道门禁：`cargo test --features local-tests -- --skip net::runtime_tests --skip net::runtime_service_tests` 964 passed / 0 failed / 23 filtered；`npx tsc --noEmit` 无输出；`npm test` 376 passed（33 files）；`python -m unittest discover -s tests/python -v` 4 passed。门禁首次运行暴露两条陈旧夹具（`domain_tests` 缺 `share_domain`、健康监控迁移断言仍为 v17），已在 gitignore 的 `tests/` 内修正后复跑全绿。**Step 3 未执行**：自动模式拒绝在用户未点名的域名/主机上签发 Let's Encrypt 证书（拟用 `203-0-113-11.sslip.io` @ ashura），需用户指定域名与服务器并明确授权。
 
-- [ ] **Step 1: CHANGELOG**
+- [x] **Step 1: CHANGELOG**
 
 新增版本节（不覆盖现有未提交内容）：
 
@@ -3485,7 +3485,7 @@ git commit -m "feat(share): 新建向导、编辑面板与 HTTPS 配置入口"
 - **限制**：分享只支持选定服务器上的自建节点；不支持跨服务器、隐私线、上游出口与挂中转节点；一条链接的配额由所有使用者共享；Python 网关吞吐有上限；HTTP-01 要求 80 端口可用。
 ```
 
-- [ ] **Step 2: 全量门禁**
+- [x] **Step 2: 全量门禁**
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --features local-tests -- --skip net::runtime_tests --skip net::runtime_service_tests
@@ -3509,13 +3509,15 @@ Expected: 全绿。若 `net::runtime_tests` 因用户开着网络自跳过（见
 7. 关闭应用、重启服务器后分享仍可用；防火墙规则恢复。
 8. 旧分享仍可列出/作废，YAML 链接不变，重启后不再失联。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add -p CHANGELOG.md
 git add docs/design/ipc-interface-reference.md README.md
 git commit -m "docs(share): 记录流量管控、sing-box 与 HTTPS 的行为与限制"
 ```
+
+已提交 `b32f581`（只含新增 CHANGELOG 节）；`ipc-interface-reference.md` 在 T10 已更新，README 本次无端口/测试说明变化，无需改动。
 
 ---
 
