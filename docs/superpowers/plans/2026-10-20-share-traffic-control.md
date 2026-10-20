@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T12（pending）
-- 下一动作：实现 `ShareWizard`/`ShareEditPanel`，接候选与 TLS 状态；补服务器分享域名与设置页 ACME 邮箱
+- 当前：T13（pending）
+- 下一动作：补 CHANGELOG（新能力与已知限制），跑四道全量门禁，再做真机验证清单
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -3427,25 +3427,25 @@ git commit -m "feat(share): 前端展示配额、状态与双格式链接"
 
 - **验收:** `npm test -- ShareWizard Shares Settings` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `dc98e14`；`npm test -- ShareWizard Shares Settings` 54 passed（4 files：向导 5、分享页 17、设置页 30、同名匹配的 MonitorSettings 2）；`npx tsc --noEmit` 与 `npm run test:typecheck` 均无输出；测试位于 gitignore 的 `tests/`，未随提交入库。`Servers.tsx` 的 `shareDomain` 透传已在 T1 提交，本次无需再改。
 
-- [ ] **Step 1: 向导**
+- [x] **Step 1: 向导**
 
 - 打开时 `listShareCandidates(serverId)`；不可分享节点置灰并显示 `reason`。
 - TLS 状态条：`share_tls_status_cmd`；未 ready 时显示「配置 HTTPS」按钮（调用 `prepare_share_tls_cmd`，显示进度/错误），并禁用生成。
 - 配额/速率/到期输入（默认 100 GB / 100 / 100 Mbps / 30 天），前端做同样的边界校验。
 - 生成按钮调用 `createShare`；成功后显示两个链接。
 
-- [ ] **Step 2: 编辑面板**
+- [x] **Step 2: 编辑面板**
 
 - 配额/速率/到期输入；保存调用 `updateShare`；「重置用量」二次确认后调用 `resetShareUsage`；到期停用需同时延长到期（提示）。
 
-- [ ] **Step 3: 服务器域名字段与 ACME 邮箱**
+- [x] **Step 3: 服务器域名字段与 ACME 邮箱**
 
 - `ServerFormPanel.tsx` 的 `shareDomain` 已在 T1 加；确认 `Servers.tsx` 的 `createServer/updateServer` 透传。
 - `Settings.tsx` 加「ACME 邮箱」输入，读写 `share_acme_email`，保存失败回滚。
 
-- [ ] **Step 4: 测试与提交**
+- [x] **Step 4: 测试与提交**
 
 Run: `npm test -- ShareWizard Shares Settings`
 Expected: PASS
