@@ -30,8 +30,10 @@ import type {
   Server,
   ServerPort,
   SettingsMap,
+  ShareCandidate,
   ShareInfo,
   ShareList,
+  ShareTlsStatus,
   Subscription,
   SyncOutcome,
   ThroughputTest,
@@ -135,14 +137,67 @@ export function listShares(): Promise<ShareList> {
   return invoke('list_shares_cmd')
 }
 
-/** 在指定服务器上安装一份分享。nodeIds 为空会被后端拒绝，前端不会走到 */
-export function createShare(serverId: number, nodeIds: string[]): Promise<ShareInfo> {
-  return invoke('create_share_cmd', { serverId, nodeIds })
+/** 向导候选：后端按服务器重算准入（自建/启用/非 ssr/非隐私/非上游/非中转）。 */
+export function listShareCandidates(serverId: number): Promise<ShareCandidate[]> {
+  return invoke('list_share_candidates_cmd', { serverId })
 }
 
-/** 作废一份分享：停服务 + 删文件 + 撤防火墙规则，各步幂等 */
-export function deleteShare(serverId: number, token: string): Promise<void> {
-  return invoke('delete_share_cmd', { serverId, token })
+/** 新建分享。TLS 未就绪、空列表或准入失败都会被后端拒绝，前端不会走到。 */
+export function createShare(
+  serverId: number,
+  nodeIds: string[],
+  quotaGb: number,
+  rateUpMbps: number,
+  rateDownMbps: number,
+  expiresInDays: number,
+): Promise<ShareInfo> {
+  return invoke('create_share_cmd', {
+    serverId,
+    nodeIds,
+    quotaGb,
+    rateUpMbps,
+    rateDownMbps,
+    expiresInDays,
+  })
+}
+
+/** 编辑配额/速率/到期：停-写-起网关，保留已用字节。 */
+export function updateShare(
+  serverId: number,
+  id: string,
+  quotaGb: number,
+  rateUpMbps: number,
+  rateDownMbps: number,
+  expiresInDays: number,
+): Promise<ShareInfo> {
+  return invoke('update_share_cmd', {
+    serverId,
+    id,
+    quotaGb,
+    rateUpMbps,
+    rateDownMbps,
+    expiresInDays,
+  })
+}
+
+/** 用量清零并解除停用；到期/配额设置不变。 */
+export function resetShareUsage(serverId: number, id: string): Promise<ShareInfo> {
+  return invoke('reset_share_usage_cmd', { serverId, id })
+}
+
+/** 作废一份分享：停单元 + 删文件 + 撤防火墙规则，各步幂等 */
+export function deleteShare(serverId: number, id: string): Promise<void> {
+  return invoke('delete_share_cmd', { serverId, id })
+}
+
+/** 申请/续期分享域名的 HTTPS 证书（DNS → 80 → certbot → 部署 → 钩子）。 */
+export function prepareShareTls(serverId: number): Promise<ShareTlsStatus> {
+  return invoke('prepare_share_tls_cmd', { serverId })
+}
+
+/** 读证书状态；未配域名/邮箱时返回 ready=false + 原因。 */
+export function shareTlsStatus(serverId: number): Promise<ShareTlsStatus> {
+  return invoke('share_tls_status_cmd', { serverId })
 }
 
 export function startSubServer(port: number, token: string): Promise<number> {

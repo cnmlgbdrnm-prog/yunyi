@@ -7,6 +7,31 @@ import ConfirmButton from '../components/ConfirmButton'
 import { copyText } from '../utils/clipboard'
 import type { ExportableNode, Server, ShareInfo } from '../api/types'
 
+const GB = 1024 ** 3
+
+/** 用量展示：GB 保留一位小数；旧版分享没有配额，显示「—」。 */
+function fmtBytes(n: number): string {
+  if (n >= GB) return `${(n / GB).toFixed(1)} GB`
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${n} B`
+}
+
+function statusView(s: ShareInfo): { label: string; className: string } {
+  switch (s.status) {
+    case 'active':
+      return { label: '运行中', className: 'text-emerald-400' }
+    case 'blocked_quota':
+      return { label: '已超额', className: 'text-amber-400' }
+    case 'blocked_expired':
+      return { label: '已到期', className: 'text-amber-400' }
+    case 'degraded':
+      return { label: '异常', className: 'text-red-400' }
+    case 'legacy':
+      return { label: '旧版·无管控', className: 'text-neutral-400' }
+  }
+}
+
 export default function Shares() {
   const [shares, setShares] = useState<ShareInfo[]>([])
   const [unreachable, setUnreachable] = useState<string[]>([])
@@ -73,7 +98,9 @@ export default function Shares() {
     setBusy(true)
     setError(null)
     try {
-      setCreated(await createShare(serverId, [...picked]))
+      // T12 的向导会带上用户填写的配额/速率/天数；这里先落默认值，
+      // 保证 API 签名切换后页面仍可编译与工作。
+      setCreated(await createShare(serverId, [...picked], 100, 100, 100, 30))
       setWizardOpen(false)
       await refresh()
     } catch (e) {
@@ -84,16 +111,16 @@ export default function Shares() {
   }
 
   // 复制失败必须说出来：剪贴板 API 的拒绝是静默的，不说用户就只会看到「点了没反应」
-  const handleCopy = async (s: ShareInfo) => {
+  const handleCopy = async (url: string) => {
     setError(null)
-    if (await copyText(s.url)) return
+    if (await copyText(url)) return
     setError('复制失败：剪贴板不可用。请手动选中链接复制')
   }
 
   const handleDelete = async (s: ShareInfo) => {
     setError(null)
     try {
-      await deleteShare(s.server_id, s.token)
+      await deleteShare(s.server_id, s.id)
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -112,9 +139,9 @@ export default function Shares() {
       {/* 只写用户要据此做决定的三件事（凭证 / 快照 / 格式），一句一条，不做解说、
          不加高亮。 */}
       <div className="space-y-1 text-xs text-neutral-500">
-        <p>链接即凭证：服务为明文 HTTP，被截获即可使用这些节点。</p>
+        <p>新分享强制 HTTPS；链接即凭证，泄露即可使用这些节点。</p>
         <p>快照：内容固定在生成那一刻，改节点或重新部署后需重新生成。</p>
-        <p>仅 YAML（mihomo / Clash）；sing-box 暂不支持。</p>
+        <p>同时提供 mihomo（YAML）与 sing-box（JSON）；旧版分享仍为明文 HTTP。</p>
       </div>
 
       {unreachable.length > 0 && (
@@ -191,6 +218,12 @@ export default function Shares() {
       {created && (
         <p className="rounded border border-emerald-800 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
           已生成：<code className="font-mono">{created.url}</code>
+          {created.url_singbox && (
+            <>
+              {' · '}
+              <code className="font-mono">{created.url_singbox}</code>
+            </>
+          )}
         </p>
       )}
 
@@ -201,43 +234,109 @@ export default function Shares() {
               <th className="px-3 py-2">链接</th>
               <th className="px-3 py-2">节点</th>
               <th className="px-3 py-2">服务器</th>
+              <th className="px-3 py-2">已用 / 配额</th>
+              <th className="px-3 py-2">速率</th>
+              <th className="px-3 py-2">到期</th>
               <th className="px-3 py-2">状态</th>
               <th className="px-3 py-2">操作</th>
             </tr>
           </thead>
           <tbody>
-            {shares.map((s) => (
-              <tr key={`${s.server_id}-${s.token}`} className="border-b border-neutral-900">
-                <td className="px-3 py-2 font-mono text-xs">{s.url}</td>
-                <td className="px-3 py-2 text-neutral-400">{s.node_names.join('、')}</td>
-                <td className="px-3 py-2 text-neutral-400">{s.server_name}</td>
-                <td className="px-3 py-2">
-                  {s.active ? (
-                    <span className="text-emerald-400">运行中</span>
-                  ) : (
-                    <span className="text-neutral-500">未运行</span>
-                  )}
-                </td>
-                <td className="px-3 py-2">
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleCopy(s)}
-                      className="rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700"
-                    >
-                      复制链接
-                    </button>
-                    <ConfirmButton
-                      label="作废"
-                      confirmLabel="确认作废"
-                      busyLabel="作废中…"
-                      busy={false}
-                      onConfirm={() => void handleDelete(s)}
-                    />
-                  </div>
-                </td>
-              </tr>
-            ))}
+            {shares.map((s) => {
+              const view = statusView(s)
+              const pct =
+                s.quota_bytes > 0
+                  ? Math.min(100, Math.round((s.used_bytes / s.quota_bytes) * 100))
+                  : 0
+              return (
+                <tr key={`${s.server_id}-${s.id}`} className="border-b border-neutral-900">
+                  <td className="px-3 py-2 align-top">
+                    <div className="space-y-1">
+                      <div className="break-all font-mono text-xs">{s.url}</div>
+                      <div className="flex flex-wrap gap-1">
+                        <button
+                          type="button"
+                          onClick={() => void handleCopy(s.url)}
+                          className="rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700"
+                        >
+                          复制链接
+                        </button>
+                        {!s.legacy && s.url_singbox && (
+                          <button
+                            type="button"
+                            onClick={() => void handleCopy(s.url_singbox)}
+                            className="rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700"
+                          >
+                            复制 sing-box
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 align-top text-neutral-400">
+                    {s.node_names.join('、')}
+                  </td>
+                  <td className="px-3 py-2 align-top text-neutral-400">{s.server_name}</td>
+                  <td className="px-3 py-2 align-top">
+                    {s.legacy ? (
+                      <span className="text-neutral-500">—</span>
+                    ) : (
+                      <div className="w-32 space-y-1">
+                        <div className="text-xs text-neutral-400">
+                          {fmtBytes(s.used_bytes)} / {fmtBytes(s.quota_bytes)}
+                        </div>
+                        <div
+                          role="progressbar"
+                          aria-label="已用配额"
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={pct}
+                          className="h-1.5 w-full rounded bg-neutral-800"
+                        >
+                          <div
+                            style={{ width: `${pct}%` }}
+                            className={
+                              s.status === 'blocked_quota' || s.status === 'blocked_expired'
+                                ? 'h-1.5 rounded bg-amber-500'
+                                : 'h-1.5 rounded bg-emerald-500'
+                            }
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 align-top text-xs text-neutral-400">
+                    {s.legacy
+                      ? '—'
+                      : `↑${s.rate_up_mbps || '不限'} ↓${s.rate_down_mbps || '不限'} Mbps`}
+                  </td>
+                  <td className="px-3 py-2 align-top text-xs text-neutral-400">
+                    {s.legacy || !s.expires_at ? '—' : s.expires_at.slice(0, 10)}
+                  </td>
+                  <td className="px-3 py-2 align-top">
+                    <span className={view.className} title={s.status_detail ?? undefined}>
+                      {view.label}
+                    </span>
+                    {s.last_access_at && (
+                      <div className="text-xs text-neutral-500" title={s.last_access_ip ?? ''}>
+                        最近取用 {s.last_access_at.slice(0, 10)}
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 align-top">
+                    <div className="flex items-center gap-2">
+                      <ConfirmButton
+                        label="作废"
+                        confirmLabel="确认作废"
+                        busyLabel="作废中…"
+                        busy={false}
+                        onConfirm={() => void handleDelete(s)}
+                      />
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
         {shares.length === 0 && (
