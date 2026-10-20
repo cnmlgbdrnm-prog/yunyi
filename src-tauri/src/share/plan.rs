@@ -82,3 +82,23 @@ pub fn tcp_port_probe_cmd(port: u16) -> String {
 pub fn udp_port_probe_cmd(port: u16) -> String {
     format!("ss -uln 'sport = :{port}' | grep -q '^UNCONN'")
 }
+
+/// 读出**已配置**分享占用的端口（含当前已停止的单元）。
+///
+/// 只看 `ss` 不够：停着的分享不监听，但它的单元/清单仍占着这个端口，新分享
+/// 一旦复用，旧分享下次启动就会 `bind: address already in use`。新格式读
+/// `share.json`，旧格式从单元 `ExecStart` 的 `share_server.py <port>` 里取。
+pub fn reserved_share_ports_cmd() -> String {
+    concat!(
+        "{ ",
+        "for f in /srv/vpnshare/*/share.json; do ",
+        "[ -f \"$f\" ] || continue; ",
+        "python3 -c 'import json,sys;m=json.load(open(sys.argv[1]));print(m.get(\"http_port\") or 0);",
+        "[print(n.get(k) or 0) for n in m.get(\"nodes\",[]) for k in (\"public_port\",\"internal_port\")]' ",
+        "\"$f\" 2>/dev/null; ",
+        "done; ",
+        "grep -hoE 'share_server\\.py [0-9]+' /etc/systemd/system/vpnshare-*.service 2>/dev/null | awk '{print $2}'; ",
+        "} | grep -v '^0$' | sort -un"
+    )
+    .to_string()
+}

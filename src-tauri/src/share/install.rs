@@ -18,7 +18,9 @@ use crate::share::clone::{clone_configs, ShareNodeSpec};
 use crate::share::model::*;
 use crate::share::naming::*;
 use crate::share::plan;
-use crate::share::plan::{tcp_port_probe_cmd, udp_port_probe_cmd};
+use crate::share::plan::{
+    reserved_share_ports_cmd, tcp_port_probe_cmd, udp_port_probe_cmd,
+};
 use crate::share::{scripts, tls};
 use crate::ssh::SshSession;
 use crate::state::AppState;
@@ -575,10 +577,14 @@ async fn find_free_port(
     cursor: &mut u16,
     end: u16,
     transport: &str,
+    reserved: &HashSet<u16>,
 ) -> Result<u16, String> {
     while *cursor <= end {
         let port = *cursor;
         *cursor += 1;
+        if reserved.contains(&port) {
+            continue;
+        }
         let mut free = true;
         if transport != "udp" {
             let out = run_cmd(
@@ -609,15 +615,51 @@ async fn find_free_port(
     Err(format!("端口段到 {end} 已耗尽"))
 }
 
+/// 读取已有分享占用的端口；输出为空表示没有历史分享。
+async fn reserved_share_ports(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+) -> Result<HashSet<u16>, String> {
+    let out = run_cmd(
+        sess,
+        cancel,
+        "探测",
+        &reserved_share_ports_cmd(),
+        PROBE_TIMEOUT,
+    )
+    .await?;
+    if out.exit_code != 0 {
+        return Err(format!(
+            "读取已有分享端口失败: {}",
+            out.stderr.trim()
+        ));
+    }
+    Ok(out
+        .stdout
+        .lines()
+        .filter_map(|s| s.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .collect())
+}
+
 /// 订阅端口、公网数据端口、回环内部端口三段各自独立分配；每段都从段首开始，
-/// 实际占用情况由远端 `ss` 探测决定。
+/// 实际占用情况由远端 `ss` 探测决定；已停止分享配置过的端口也跳过。
 pub async fn allocate_share_ports(
     sess: &mut SshSession,
     cancel: &AtomicBool,
     transports: &[&str],
 ) -> Result<AllocatedPorts, String> {
+    let reserved = reserved_share_ports(sess, cancel).await?;
     let mut http_cursor = PORT_RANGE_START;
-    let http = find_free_port(sess, cancel, &mut http_cursor, PORT_RANGE_END, "tcp").await?;
+    let http = find_free_port(
+        sess,
+        cancel,
+        &mut http_cursor,
+        PORT_RANGE_END,
+        "tcp",
+        &reserved,
+    )
+    .await?;
     let mut public_cursor = DATA_PORT_START;
     let mut internal_cursor = INTERNAL_PORT_START;
     let mut pairs = Vec::new();
@@ -628,6 +670,7 @@ pub async fn allocate_share_ports(
             &mut public_cursor,
             DATA_PORT_END,
             transport,
+            &reserved,
         )
         .await?;
         let internal = find_free_port(
@@ -636,6 +679,7 @@ pub async fn allocate_share_ports(
             &mut internal_cursor,
             INTERNAL_PORT_END,
             transport,
+            &reserved,
         )
         .await?;
         pairs.push((public, internal));
