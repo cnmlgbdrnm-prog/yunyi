@@ -2,10 +2,12 @@
 // 分享的真实状态在服务器上——本地不存记录，所以每次进页面都重新拉，
 // 某台连不上时只列不出那几条，并把服务器名摆在明面上（见 unreachable 提示）。
 import { useCallback, useEffect, useState } from 'react'
-import { createShare, deleteShare, listExportableNodes, listServers, listShares } from '../api'
+import { deleteShare, listServers, listShares } from '../api'
 import ConfirmButton from '../components/ConfirmButton'
+import ShareEditPanel from '../components/ShareEditPanel'
+import ShareWizard from '../components/ShareWizard'
 import { copyText } from '../utils/clipboard'
-import type { ExportableNode, Server, ShareInfo } from '../api/types'
+import type { Server, ShareInfo } from '../api/types'
 
 const GB = 1024 ** 3
 
@@ -38,12 +40,9 @@ export default function Shares() {
   const [servers, setServers] = useState<Server[]>([])
   const [error, setError] = useState<string | null>(null)
 
-  // 新建向导
+  // 新建向导与编辑面板
   const [wizardOpen, setWizardOpen] = useState(false)
-  const [serverId, setServerId] = useState<number | null>(null)
-  const [candidates, setCandidates] = useState<ExportableNode[]>([])
-  const [picked, setPicked] = useState<Set<string>>(new Set())
-  const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState<ShareInfo | null>(null)
   const [created, setCreated] = useState<ShareInfo | null>(null)
 
   const refresh = useCallback(async () => {
@@ -62,53 +61,9 @@ export default function Shares() {
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false))
     void listServers()
-      .then((s) => {
-        setServers(s)
-        setServerId(s[0]?.id ?? null)
-      })
+      .then(setServers)
       .catch((e) => setError(String(e)))
   }, [refresh])
-
-  // 向导打开时才拉候选清单（与导出同一口径：当前能进配置的那些）
-  useEffect(() => {
-    if (!wizardOpen) return
-    let alive = true
-    void listExportableNodes()
-      .then((list) => {
-        if (!alive) return
-        setCandidates(list)
-        setPicked(new Set(list.filter((e) => e.exportable).map((e) => e.node.id)))
-      })
-      .catch((e) => alive && setError(String(e)))
-    return () => {
-      alive = false
-    }
-  }, [wizardOpen])
-
-  const toggle = (id: string) =>
-    setPicked((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-
-  const handleCreate = async () => {
-    if (serverId == null || picked.size === 0) return
-    setBusy(true)
-    setError(null)
-    try {
-      // T12 的向导会带上用户填写的配额/速率/天数；这里先落默认值，
-      // 保证 API 签名切换后页面仍可编译与工作。
-      setCreated(await createShare(serverId, [...picked], 100, 100, 100, 30))
-      setWizardOpen(false)
-      await refresh()
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
 
   // 复制失败必须说出来：剪贴板 API 的拒绝是静默的，不说用户就只会看到「点了没反应」
   const handleCopy = async (url: string) => {
@@ -162,57 +117,26 @@ export default function Shares() {
       </button>
 
       {wizardOpen && (
-        <div className="space-y-2 rounded border border-neutral-700 bg-neutral-900 p-3 text-sm">
-          <label className="flex items-center gap-2">
-            服务器
-            <select
-              aria-label="分享服务器"
-              value={serverId ?? ''}
-              onChange={(e) => setServerId(Number(e.target.value))}
-              className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1"
-            >
-              {servers.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}（{s.host}）
-                </option>
-              ))}
-            </select>
-          </label>
-          <ul className="max-h-64 space-y-1 overflow-y-auto">
-            {candidates.map((e) => (
-              <li key={e.node.id} className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  aria-label={`选择 ${e.node.name}`}
-                  checked={picked.has(e.node.id)}
-                  disabled={!e.exportable}
-                  onChange={() => toggle(e.node.id)}
-                />
-                <span>{e.node.name}</span>
-                <span className="text-xs text-neutral-500">{e.node.protocol}</span>
-                {e.skip_reason && <span className="text-xs text-amber-500">{e.skip_reason}</span>}
-              </li>
-            ))}
-          </ul>
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => void handleCreate()}
-              disabled={busy || picked.size === 0 || serverId == null}
-              className="rounded bg-blue-600 px-3 py-1.5 text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {busy ? '生成中…' : `生成链接（${picked.size} 条）`}
-            </button>
-            <button
-              type="button"
-              onClick={() => setWizardOpen(false)}
-              disabled={busy}
-              className="rounded bg-neutral-800 px-3 py-1.5 hover:bg-neutral-700 disabled:opacity-50"
-            >
-              取消
-            </button>
-          </div>
-        </div>
+        <ShareWizard
+          servers={servers}
+          onClose={() => setWizardOpen(false)}
+          onCreated={(info) => {
+            setCreated(info)
+            setWizardOpen(false)
+            void refresh().catch((e) => setError(String(e)))
+          }}
+        />
+      )}
+
+      {editing && (
+        <ShareEditPanel
+          share={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null)
+            void refresh().catch((e) => setError(String(e)))
+          }}
+        />
       )}
 
       {created && (
@@ -325,6 +249,15 @@ export default function Shares() {
                   </td>
                   <td className="px-3 py-2 align-top">
                     <div className="flex items-center gap-2">
+                      {!s.legacy && (
+                        <button
+                          type="button"
+                          onClick={() => setEditing(s)}
+                          className="rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700"
+                        >
+                          编辑
+                        </button>
+                      )}
                       <ConfirmButton
                         label="作废"
                         confirmLabel="确认作废"

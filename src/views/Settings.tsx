@@ -69,6 +69,10 @@ export default function Settings() {
   const [updateState, setUpdateState] = useState<UpdateState>({ kind: 'idle' })
   // 导出智能分流开关（缺省开；设置表 export_smart_split "1"/"0"）
   const [smartSplit, setSmartSplit] = useState(true)
+  // 分享域名的 ACME 邮箱（空 = 未配置，新建分享会被后端拒绝）
+  const [acmeEmail, setAcmeEmail] = useState('')
+  const [savedAcmeEmail, setSavedAcmeEmail] = useState('')
+  const [acmeNotice, setAcmeNotice] = useState<string | null>(null)
   // 提权服务状态：null = 还没查到（禁用按钮，防止在未知状态下点了弹 UAC）
   const [svc, setSvc] = useState<ServiceState | null>(null)
   const [svcBusy, setSvcBusy] = useState(false)
@@ -90,11 +94,13 @@ export default function Settings() {
   }, [])
 
   useEffect(() => {
-    getSettings(['sub_port', 'sub_token', 'export_smart_split'])
+    getSettings(['sub_port', 'sub_token', 'export_smart_split', 'share_acme_email'])
       .then((s) => {
         if (s.sub_port) setPort(s.sub_port)
         if (s.sub_token) setToken(s.sub_token)
         setSmartSplit(s.export_smart_split !== '0')
+        setAcmeEmail(s.share_acme_email ?? '')
+        setSavedAcmeEmail(s.share_acme_email ?? '')
       })
       .catch((e) => setError(String(e)))
     // 视图切换后组件重新挂载，本地 running 态会重置：
@@ -230,6 +236,21 @@ export default function Settings() {
     }
   }
 
+  const handleSaveAcmeEmail = async () => {
+    setError(null)
+    setAcmeNotice(null)
+    const next = acmeEmail.trim()
+    try {
+      await setSetting('share_acme_email', next)
+      setSavedAcmeEmail(next)
+      setAcmeEmail(next)
+      setAcmeNotice(next ? '已保存' : '已清空：新建分享会被拒绝')
+    } catch (e) {
+      setAcmeEmail(savedAcmeEmail) // 保存失败回滚到上次成功的值
+      setError(String(e))
+    }
+  }
+
   // 不设宽度上限：窗口拉大时**内容跟着变宽**（分区铺满整行），而不是拆成两列或把
   // 单列钉死在中间留白。分区之间的间距靠 space-y。
   return (
@@ -274,6 +295,37 @@ export default function Settings() {
           >
             停止
           </button>
+        </div>
+      </section>
+
+      <section className="space-y-3 rounded border border-neutral-800 p-4">
+        <h3 className="font-medium">分享 HTTPS</h3>
+        <p className="text-sm text-neutral-400">
+          新分享强制 HTTPS。certbot 首次签发需要 ACME 邮箱；分享域名在「服务器 → 编辑」里配置。
+          留空 = 未配置，新建分享会被拒绝（不会退回 HTTP）。
+        </p>
+        <label className="block text-sm">
+          ACME 邮箱
+          <input
+            aria-label="ACME 邮箱"
+            value={acmeEmail}
+            onChange={(e) => {
+              setAcmeEmail(e.target.value)
+              setAcmeNotice(null)
+            }}
+            placeholder="you@example.com"
+            className="mt-1 w-72 rounded border border-neutral-700 bg-neutral-900 px-2 py-1"
+          />
+        </label>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => void handleSaveAcmeEmail()}
+            className="rounded bg-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-700"
+          >
+            保存邮箱
+          </button>
+          {acmeNotice && <span className="text-sm text-emerald-400">{acmeNotice}</span>}
         </div>
       </section>
 
