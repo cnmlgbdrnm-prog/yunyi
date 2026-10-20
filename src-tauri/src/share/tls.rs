@@ -4,9 +4,13 @@
 //! 读状态）。所有失败都显式返回——**绝不退回 HTTP**：没有证书就不允许新建分享，
 //! 调用方（T7）会先查 [`tls_status`]。
 //!
-//! 域名来源有两层：优先 `servers.share_domain`；为空时读取服务器上已有
-//! `/srv/vpnshare/tls/fullchain.pem` 的 DNS SAN。已有有效证书时不再要求 ACME
-//! 邮箱——邮箱只用于签发新证书。
+//! 域名来源有三层：优先 `servers.share_domain`；为空时读取服务器上已有
+//! `/srv/vpnshare/tls/fullchain.pem` 的 DNS SAN；仍然没有时按服务器 IP 推导
+//! `sslip.io` 域名（如 `207.57.183.127` → `207-57-183-127.sslip.io`）。
+//! 因此「配置 HTTPS」对新服务器也是一键的，不需要先手工填域名。
+//!
+//! ACME 邮箱是选填：配置了就传给 certbot 接收到期提醒；没配置则用
+//! `--register-unsafely-without-email` 照常签发（证书本身与续期不受影响）。
 //!
 //! 命令拼装的安全边界：
 //! - 域名先过 `servers::normalize_share_domain`，只允许标签字符；
@@ -82,6 +86,30 @@ pub(crate) async fn detect_cert_domain(
         .unwrap_or_default())
 }
 
+/// 未配置域名、服务器上也没有证书时的兜底域名：把服务器 IP 直接映射到
+/// [sslip.io](https://sslip.io)。
+///
+/// - IPv4：`207.57.183.127` → `207-57-183-127.sslip.io`
+/// - IPv6：`2001:db8::1` → `2001-db8--1.sslip.io`（冒号逐个换成短横线）
+///
+/// 只接受**IP 字面量**。主机名不做猜测：它可能已经是域名，也可能解析到别处，
+/// 猜出来的 sslip 域名反而会绕过用户自己的 DNS 规划。sslip.io 是公共通配 DNS，
+/// 不需要在服务器上装任何东西；签出的证书仍由本机 certbot 持有。
+pub(crate) fn auto_share_domain(server: &crate::domain::Server) -> Option<String> {
+    sslip_domain(effective_host(server))
+}
+
+/// [`auto_share_domain`] 的纯字符串版本，便于单测。
+pub(crate) fn sslip_domain(host: &str) -> Option<String> {
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(format!("{}.sslip.io", ip.to_string().replace('.', "-")));
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        return Some(format!("{}.sslip.io", ip.to_string().replace(':', "-")));
+    }
+    None
+}
+
 /// 单引号安全包装：shell 里唯一不能出现在单引号串中的字符就是 `'`。
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -130,11 +158,19 @@ pub fn certbot_install_script() -> String {
     .to_string()
 }
 
+/// 拼 certbot 签发命令。邮箱为空时显式使用 certbot 的免邮箱注册开关：
+/// Let's Encrypt 允许没有联系邮箱的账户，只是收不到证书到期提醒；证书有效期
+/// 与自动续期不受影响。
 pub fn certbot_issue_cmd(domain: &str, email: &str) -> String {
+    let contact = if email.is_empty() {
+        "--register-unsafely-without-email".to_string()
+    } else {
+        format!("-m {}", sh_quote(email))
+    };
     format!(
-        "certbot certonly --standalone -d {} --non-interactive --agree-tos -m {} --keep-until-expiring",
+        "certbot certonly --standalone -d {} --non-interactive --agree-tos {} --keep-until-expiring",
         sh_quote(domain),
-        sh_quote(email)
+        contact
     )
 }
 
@@ -188,8 +224,8 @@ async fn install_certbot(
 
 /// 为服务器的分享域名签发/续期证书，并部署到 `/srv/vpnshare/tls/`。
 ///
-/// 步骤：前置配置（邮箱必须有；不连服务器）→ 连接 → python3 → 域名（配置或
-/// 证书 SAN 自动检测）→ DNS 交集 → 80 空闲 →
+/// 步骤：校验已配置的邮箱（有才校验）→ 连接 → python3 → 域名（配置 → 证书
+/// SAN 自动检测 → IP 推导的 sslip.io 域名）→ DNS 交集 → 80 空闲 →
 /// 创建 vpnshare 用户与 TLS 目录 → 放行 80 → 安装 certbot → 签发 → 复制证书 →
 /// 续期钩子 → 校验到期时间 → **无论成败都撤回 80 放行**。
 pub async fn prepare_tls(
@@ -206,17 +242,10 @@ pub async fn prepare_tls(
         .unwrap_or_default()
         .trim()
         .to_string();
-    if email.is_empty() {
-        // 邮箱是签发新证书的硬前提；连服务器也改变不了这一点。域名可空——它可能
-        // 就在服务器已有证书的 SAN 里，等连上后再自动检测。
-        return Err(if configured.is_empty() {
-            "未配置分享域名，也未配置 ACME 邮箱（服务器 → 编辑 → 分享域名 / 设置 → 分享）"
-                .into()
-        } else {
-            "未配置 ACME 邮箱（设置 → 分享）".into()
-        });
+    // 邮箱选填：没配置就交给 certbot 的免邮箱注册开关。配置了才需要校验格式。
+    if !email.is_empty() {
+        validate_email(&email)?;
     }
-    validate_email(&email)?;
 
     let mut sess = SshSession::connect(
         effective_host(&server),
@@ -233,18 +262,26 @@ pub async fn prepare_tls(
 
     // 分享域名同样支持自动检测：续期场景下服务器上的证书可能刚好过期，但 SAN
     // 仍是有效信息，可直接用它重新签发，不必让用户手工再抄域名。
+    // 最后兜底是按 IP 推导 sslip.io 域名——首次为某台服务器配置 HTTPS 时，
+    // 前两层通常都是空的，没有这一层「配置 HTTPS」就还得先手工填域名。
     let domain = if configured.is_empty() {
-        cert_domains(&mut sess, &cancel)
+        let detected = cert_domains(&mut sess, &cancel)
             .await?
             .into_iter()
             .next()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if detected.is_empty() {
+            auto_share_domain(&server).unwrap_or_default()
+        } else {
+            detected
+        }
     } else {
         configured
     };
     if domain.is_empty() {
         return Err(
-            "该服务器未配置分享域名，服务器上也没有可自动检测的分享证书（服务器 → 编辑 → 分享域名）"
+            "该服务器未配置分享域名，服务器上也没有可自动检测的分享证书；\
+             主机名不是 IP，无法自动推导 sslip.io 域名（服务器 → 编辑 → 分享域名）"
                 .into(),
         );
     }
@@ -425,11 +462,13 @@ pub async fn prepare_tls(
 ///
 /// 域名解析顺序：
 /// 1. `servers.share_domain` 显式配置的值；
-/// 2. 为空时，从服务器 `/srv/vpnshare/tls/fullchain.pem` 的 DNS SAN 自动检测。
+/// 2. 为空时，从服务器 `/srv/vpnshare/tls/fullchain.pem` 的 DNS SAN 自动检测；
+/// 3. 仍为空且主机是 IP 时，推导 `sslip.io` 域名（供「配置 HTTPS」一键签发）。
 ///
 /// 因此 `share_domain` 为空**不再等于「不连服务器、直接失败」**：服务器上已有
-/// 有效证书时，向导仍应显示可用的 HTTPS 域名并允许创建。反过来，证书有效时
-/// 也不再要求 ACME 邮箱——邮箱只用于**签发新证书**，不影响已有证书的使用。
+/// 有效证书时，向导仍应显示可用的 HTTPS 域名并允许创建；首次配置时也能直接
+/// 用推导出的域名签发。ACME 邮箱只用于**签发新证书**（且为选填），不影响已有
+/// 证书的使用。
 pub async fn tls_status(
     state: &Arc<AppState>,
     server_id: i64,
@@ -444,6 +483,8 @@ pub async fn tls_status(
         .unwrap_or_default()
         .trim()
         .to_string();
+    // 没有配置、证书里也读不到时，向导要能提前告诉用户「点一下就会用哪个域名」。
+    let auto = auto_share_domain(&server);
 
     let mut sess = SshSession::connect(
         effective_host(&server),
@@ -466,15 +507,33 @@ pub async fn tls_status(
     )
     .await?;
     if check.exit_code != 0 {
-        let detail = if configured.is_empty() {
-            "未配置分享域名，且服务器上没有可用的分享证书".to_string()
-        } else if email.is_empty() {
-            "证书不存在或已过期，且未配置 ACME 邮箱（设置 → 分享）".to_string()
+        let detail = if !configured.is_empty() {
+            if email.is_empty() {
+                "证书不存在或已过期；点击「配置 HTTPS」即可签发（未填 ACME 邮箱不影响签发）"
+                    .to_string()
+            } else {
+                "证书不存在或已过期；点击「配置 HTTPS」即可签发".to_string()
+            }
+        } else if let Some(d) = &auto {
+            if email.is_empty() {
+                format!(
+                    "未配置分享域名与 ACME 邮箱；点击「配置 HTTPS」将自动使用 {d} 签发（无需邮箱）"
+                )
+            } else {
+                format!("未配置分享域名；点击「配置 HTTPS」将自动使用 {d} 签发")
+            }
         } else {
-            "证书不存在或已过期，请先准备 HTTPS 证书".to_string()
+            // 主机名既不是 IPv4 也不是 IPv6：没有可推导的 sslip.io 域名。
+            "未配置分享域名，且服务器上没有可用的分享证书；该服务器地址不是 IP，\
+             无法自动推导域名（服务器 → 编辑 → 分享域名）"
+                .to_string()
         };
         return Ok(ShareTlsStatus {
-            domain: configured,
+            domain: if configured.is_empty() {
+                auto.unwrap_or_default()
+            } else {
+                configured
+            },
             ready: false,
             cert_expires_at: None,
             detail,

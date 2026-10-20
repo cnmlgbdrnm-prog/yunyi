@@ -69,7 +69,7 @@ export default function Settings() {
   const [updateState, setUpdateState] = useState<UpdateState>({ kind: 'idle' })
   // 导出智能分流开关（缺省开；设置表 export_smart_split "1"/"0"）
   const [smartSplit, setSmartSplit] = useState(true)
-  // 分享域名的 ACME 邮箱（空 = 未配置，新建分享会被后端拒绝）
+  // 分享域名的 ACME 邮箱（选填；空 = 签发时不带邮箱，证书照常有效，只是收不到到期提醒）
   const [acmeEmail, setAcmeEmail] = useState('')
   const [savedAcmeEmail, setSavedAcmeEmail] = useState('')
   const [acmeNotice, setAcmeNotice] = useState<string | null>(null)
@@ -244,7 +244,7 @@ export default function Settings() {
       await setSetting('share_acme_email', next)
       setSavedAcmeEmail(next)
       setAcmeEmail(next)
-      setAcmeNotice(next ? '已保存' : '已清空：新建分享会被拒绝')
+      setAcmeNotice(next ? '已保存' : '已清空：签发时将不填写邮箱')
     } catch (e) {
       setAcmeEmail(savedAcmeEmail) // 保存失败回滚到上次成功的值
       setError(String(e))
@@ -301,8 +301,8 @@ export default function Settings() {
       <section className="space-y-3 rounded border border-neutral-800 p-4">
         <h3 className="font-medium">分享 HTTPS</h3>
         <p className="text-sm text-neutral-400">
-          新分享强制 HTTPS。certbot 首次签发需要 ACME 邮箱；分享域名在「服务器 → 编辑」里配置。
-          留空 = 未配置，新建分享会被拒绝（不会退回 HTTP）。
+          新分享强制 HTTPS。分享域名在「服务器 → 编辑」里配置；未配置时，IP 服务器会自动使用
+          sslip.io 域名签发。ACME 邮箱选填：不填也能签发，只是收不到证书到期提醒。
         </p>
         <label className="block text-sm">
           ACME 邮箱
