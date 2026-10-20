@@ -4,14 +4,23 @@
 //! 依赖：reqwest（控制器请求经 Bearer token）、tokio（下载超时）、async-trait。
 
 use async_trait::async_trait;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
-/// 测速引擎统一接口：注入/清理代理、延迟、经 mixed-port 代理下载（返回已成功下载的字节数）。
+/// 测速引擎统一接口：注入/清理代理、延迟、经 per-node 监听端口下载。
 #[async_trait]
 pub trait SpeedEngine: Send + Sync {
     async fn put_proxy(&self, name: &str, proxy: serde_json::Value) -> Result<(), String>;
     async fn delete_proxy(&self, name: &str) -> Result<(), String>;
+    /// 该代理独占的本地 mixed 端口；None = 引擎不提供（测试假引擎）。
+    ///
+    /// 真实引擎在 `put_proxy` 成功后必须返回 Some：并发测速若共用同一个
+    /// mixed-port，mihomo 的 `MATCH` 规则只会指向最后注入的节点，A 的下载会量到
+    /// B 的带宽。
+    async fn proxy_port(&self, _name: &str) -> Option<u16> {
+        None
+    }
     async fn delay(&self, name: &str, url: &str, timeout_ms: u64) -> Result<i64, String>;
     async fn download_bytes(
         &self,
@@ -23,7 +32,7 @@ pub trait SpeedEngine: Send + Sync {
     ) -> Result<f64, String>;
 
     /// 经当前节点取回一个 URL 的**正文**（出口 IP 探测用：请求 ipify 读回显）。
-    /// 与 download_bytes 走同一条 mixed-port 代理路径，区别只是要正文而不是字节数。
+    /// 与 download_bytes 走同一个 per-node listener，区别只是要正文而不是字节数。
     /// 不带取消标志：探测是即时的单次命令，没有 job 取消语义。
     async fn fetch_text(
         &self,
@@ -33,15 +42,49 @@ pub trait SpeedEngine: Send + Sync {
     ) -> Result<String, String>;
 }
 
-/// 真实引擎：mihomo 控制器 REST（Bearer token）+ mixed-port HTTP 代理下载。
-/// 注：mihomo 无运行时增删 proxy 的 API——注入/清理 = 经 /configs 热重载
-/// （render_sidecar_config(_with_proxy) 生成 payload，path 为 sidecar config.yaml）。
+/// 真实引擎：mihomo 控制器 REST（Bearer token）+ 每节点独立 listener 的 HTTP 代理下载。
+/// 注：mihomo 无运行时增删 proxy 的 API——注入/清理 = 经 /configs 热重载整份配置；
+/// 并发测速时配置里必须保留所有在测节点，见 [`SpeedEngine::proxy_port`]。
+#[derive(Clone)]
+struct SidecarEntry {
+    proxy: serde_json::Value,
+    port: u16,
+}
+
+/// 同一 sidecar 实例的代理表。按 (控制器端口, token) 共享：测速任务与
+/// `probe_egress_ip` 各自 `new` 一个引擎，但热重载的是同一个 mihomo 进程；
+/// 若各持一份表，A 的 `PUT /configs` 会把 B 刚注入的节点整份抹掉。
+type ProxyTable = tokio::sync::Mutex<BTreeMap<String, SidecarEntry>>;
+
+fn shared_proxy_table(controller_port: u16, token: &str) -> Arc<ProxyTable> {
+    static TABLES: OnceLock<std::sync::Mutex<HashMap<(u16, String), Weak<ProxyTable>>>> =
+        OnceLock::new();
+    let tables = TABLES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = crate::util::lock_ignore_poison(tables);
+    // 死引擎的表顺手清掉，避免长进程里按每次 sidecar 重启累积。
+    guard.retain(|_, weak| weak.strong_count() > 0);
+    let key = (controller_port, token.to_string());
+    if let Some(table) = guard.get(&key).and_then(Weak::upgrade) {
+        return table;
+    }
+    let table = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    guard.insert(key, Arc::downgrade(&table));
+    table
+}
+
 pub struct MihomoEngine {
     http: reqwest::Client,
     controller_port: u16,
     mixed_port: u16,
     token: String,
     config_path: std::path::PathBuf,
+    /// 当前在测代理 → (代理 JSON, 独占 mixed listener 端口)。
+    ///
+    /// 配置热重载必须先拿这把异步锁再渲染**全部**条目：mihomo 的
+    /// `PUT /configs` 是整份替换，两次并发 `put_proxy` 各自只写自己那一条时，
+    /// 后写者会把先写者从代理表里抹掉。锁只覆盖配置变更，不覆盖 delay/download，
+    /// 因而不同节点的实际测速仍可并行。
+    proxies: Arc<ProxyTable>,
 }
 
 impl MihomoEngine {
@@ -54,6 +97,7 @@ impl MihomoEngine {
         token: String,
         config_path: std::path::PathBuf,
     ) -> Self {
+        let proxies = shared_proxy_table(controller_port, &token);
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -63,7 +107,47 @@ impl MihomoEngine {
             mixed_port,
             token,
             config_path,
+            proxies,
         }
+    }
+
+    /// 为一条代理分配独占的本地 mixed listener 端口。
+    ///
+    /// bind 后立刻释放，随后由 mihomo 重新 bind；与 `alloc_local_ports` 同一
+    /// 取舍。排除控制器/混合端口与本次已分配的端口，避免同一配置里重复。
+    fn alloc_listener_port(&self, used: &BTreeMap<String, SidecarEntry>) -> Result<u16, String> {
+        for _ in 0..16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .map_err(|e| format!("分配测速监听端口失败: {e}"))?;
+            let port = listener
+                .local_addr()
+                .map_err(|e| format!("读取测速监听端口失败: {e}"))?
+                .port();
+            if port != self.controller_port
+                && port != self.mixed_port
+                && !used.values().any(|entry| entry.port == port)
+            {
+                return Ok(port);
+            }
+        }
+        Err("无法分配独立的测速监听端口".into())
+    }
+
+    fn render_locked(&self, proxies: &BTreeMap<String, SidecarEntry>) -> String {
+        let specs: Vec<crate::speed::sidecar::SidecarProxySpec<'_>> = proxies
+            .iter()
+            .map(|(name, entry)| crate::speed::sidecar::SidecarProxySpec {
+                name,
+                proxy: &entry.proxy,
+                port: entry.port,
+            })
+            .collect();
+        crate::speed::sidecar::render_sidecar_config_with_listeners(
+            self.controller_port,
+            self.mixed_port,
+            &self.token,
+            &specs,
+        )
     }
 
     fn controller(&self) -> String {
@@ -102,28 +186,40 @@ async fn http_error(action: &str, resp: reqwest::Response) -> String {
 #[async_trait]
 impl SpeedEngine for MihomoEngine {
     async fn put_proxy(&self, name: &str, proxy: serde_json::Value) -> Result<(), String> {
-        let yaml = crate::speed::sidecar::render_sidecar_config_with_proxy(
-            self.controller_port,
-            self.mixed_port,
-            &self.token,
-            name,
-            &proxy,
-        );
-        self.reload(&yaml)
-            .await
-            .map_err(|e| format!("注入代理失败: {e}"))
+        let mut guard = self.proxies.lock().await;
+        let previous = guard.clone();
+        if let Some(entry) = guard.get_mut(name) {
+            // 同一节点重注入（例如中转对比先直连、再经中转）保留端口，避免
+            // listener 在两次注入之间闪断。
+            entry.proxy = proxy;
+        } else {
+            let port = self.alloc_listener_port(&guard)?;
+            guard.insert(name.to_string(), SidecarEntry { proxy, port });
+        }
+        let yaml = self.render_locked(&guard);
+        if let Err(e) = self.reload(&yaml).await {
+            // 热重载被拒时 mihomo 仍跑旧配置；内存表也回退，后续 delete/render
+            // 才不会把一条从未生效的代理当成在测条目。
+            *guard = previous;
+            return Err(format!("注入代理失败: {e}"));
+        }
+        Ok(())
     }
 
     async fn delete_proxy(&self, name: &str) -> Result<(), String> {
-        let _ = name;
-        let yaml = crate::speed::sidecar::render_sidecar_config(
-            self.controller_port,
-            self.mixed_port,
-            &self.token,
-        );
-        self.reload(&yaml)
-            .await
-            .map_err(|e| format!("清理代理失败: {e}"))
+        let mut guard = self.proxies.lock().await;
+        let previous = guard.clone();
+        guard.remove(name);
+        let yaml = self.render_locked(&guard);
+        if let Err(e) = self.reload(&yaml).await {
+            *guard = previous;
+            return Err(format!("清理代理失败: {e}"));
+        }
+        Ok(())
+    }
+
+    async fn proxy_port(&self, name: &str) -> Option<u16> {
+        self.proxies.lock().await.get(name).map(|entry| entry.port)
     }
 
     async fn delay(&self, name: &str, url: &str, timeout_ms: u64) -> Result<i64, String> {

@@ -54,18 +54,52 @@ pub fn render_sidecar_config(controller_port: u16, mixed_port: u16, token: &str)
     )
 }
 
-/// 渲染注入单节点的 sidecar 配置：MATCH 规则指向该节点——mixed-port 上的
-/// 测速下载流量才真正走到被测代理（仅 /proxies/{name}/delay 有 proxy 不参与转发）。
-pub fn render_sidecar_config_with_proxy(
+/// 注入 sidecar 的一条代理：监听端口由引擎分配，供该节点独占测速。
+pub struct SidecarProxySpec<'a> {
+    /// 代理名（节点 id 或测速专用别名），必须与 `proxy.name` 一致。
+    pub name: &'a str,
+    pub proxy: &'a serde_json::Value,
+    /// 本节点专用的 mixed 监听端口；并发测速时每个任务一个，互不覆盖。
+    pub port: u16,
+}
+
+/// 渲染注入多条代理的 sidecar 配置。
+///
+/// **必须一次带上当前所有在测节点**：mihomo 的 `PUT /configs` 是整份替换，不是
+/// 「按名字追加」。并发测速若各自只渲染自己那一条，后到的任务会把先到的节点从
+/// 配置里抹掉（实测 A 注入后 B 注入，A 的 delay 直接 404，带宽还会走到 B）。
+/// 每个节点配一个 `listeners` 里的 mixed 端口，下载走自己的端口，`mixed-port`
+/// 本身不再承担测速流量。
+pub fn render_sidecar_config_with_listeners(
     controller_port: u16,
     mixed_port: u16,
     token: &str,
-    name: &str,
-    proxy: &serde_json::Value,
+    proxies: &[SidecarProxySpec<'_>],
 ) -> String {
-    format!(
-        "mixed-port: {mixed_port}\nexternal-controller: 127.0.0.1:{controller_port}\nsecret: {token}\nproxies:\n  - {proxy}\nrules:\n  - MATCH,{name}\n"
-    )
+    let mut yaml = format!(
+        "mixed-port: {mixed_port}\nexternal-controller: 127.0.0.1:{controller_port}\nsecret: {token}\nmode: rule\n"
+    );
+    if proxies.is_empty() {
+        yaml.push_str("proxies: []\n");
+    } else {
+        yaml.push_str("proxies:\n");
+        for p in proxies {
+            yaml.push_str("  - ");
+            yaml.push_str(&serde_json::to_string(p.proxy).expect("JSON Value 必然可序列化"));
+            yaml.push('\n');
+        }
+        yaml.push_str("listeners:\n");
+        for (index, p) in proxies.iter().enumerate() {
+            let proxy_name = serde_json::to_string(p.name).expect("代理名必然是合法 JSON 字符串");
+            yaml.push_str(&format!(
+                "  - {{name: \"vpnctl-test-{index}\", type: mixed, listen: 127.0.0.1, port: {}, proxy: {proxy_name}, udp: false}}\n",
+                p.port
+            ));
+        }
+    }
+    // mixed-port 只保留给兼容/排障；测速流量一律走上面的 per-node listener。
+    yaml.push_str("rules:\n  - MATCH,DIRECT\n");
+    yaml
 }
 
 /// sidecar config.yaml 路径（引擎热重载 payload 与 PUT /configs 的 path 同源）。

@@ -165,14 +165,31 @@ impl SubscriptionService {
         // 所以导入时必须先避开其它来源已占用的名字。本订阅自己的旧行排除在外：
         // 它们会在本轮末尾按 keep_ids 清理/覆盖，不能反过来把新名字挤掉。
         let mut used_names: HashSet<String> = {
-            let mut stmt = tx
-                .prepare("SELECT name FROM nodes WHERE sub_id IS NULL OR sub_id <> ?1")
+            let rows: Vec<(String, Option<String>, String)> = {
+                let mut stmt = tx
+                    .prepare("SELECT id, sub_id, name FROM nodes")
+                    .map_err(|e| SubError::FetchFailed(e.to_string()))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map_err(|e| SubError::FetchFailed(e.to_string()))?;
+                rows.collect::<Result<_, _>>()
+                    .map_err(|e| SubError::FetchFailed(e.to_string()))?
+            };
+            let privacies = repos::privacies::list_all(&tx)
                 .map_err(|e| SubError::FetchFailed(e.to_string()))?;
-            let rows = stmt
-                .query_map(rusqlite::params![sub.id], |r| r.get::<_, String>(0))
-                .map_err(|e| SubError::FetchFailed(e.to_string()))?;
-            rows.collect::<Result<_, _>>()
-                .map_err(|e| SubError::FetchFailed(e.to_string()))?
+            let mut names = HashSet::new();
+            for (id, sub_id, name) in rows {
+                // 本订阅自己的旧行不占原始名（它们会被本轮覆盖/清理），但它们的
+                // 隐私显示名仍在配置里，必须占位——否则新导入的普通节点若恰好
+                // 叫「某隐私节点 [隐私]」，两条代理会重名。
+                if sub_id.as_deref() != Some(sub.id.as_str()) {
+                    names.insert(name);
+                }
+                if let Some(p) = crate::servers::privacy::effective_privacy(&id, &privacies) {
+                    names.insert(crate::servers::privacy::display_name(&p.name));
+                }
+            }
+            names
         };
         let mut upserted = 0usize;
         let mut keep_ids = Vec::with_capacity(parsed.len());
@@ -360,7 +377,10 @@ fn unique_node_name(base: &str, sub: &Subscription, used_names: &mut HashSet<Str
     } else {
         base.trim()
     };
-    if used_names.insert(base.to_string()) {
+    // 保留名不能直接进配置：分组名会让 mihomo 报自引用 loop，内置代理名会报
+    // duplicate name，都是整份配置拒绝加载。导入时自动加订阅后缀消歧，不打断同步。
+    let reserved = crate::config::proxy_name_conflict(base).is_some();
+    if !reserved && used_names.insert(base.to_string()) {
         return base.to_string();
     }
     let tag = if sub.name.trim().is_empty() {
