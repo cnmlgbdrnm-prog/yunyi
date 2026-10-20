@@ -42,8 +42,18 @@ class Gateway:
         self.cfg = cfg
         self.usage_path = usage_path
         self.used = 0
+        self.used_up = 0
+        self.used_down = 0
+        # 新口径：上下行各自独立配额。两个字段都缺失时回落到旧的合计配额，
+        # 保证尚未编辑过的旧分享在共享脚本升级后仍按原方式运行。
+        self.quota_up = cfg.get("quota_up_bytes")
+        self.quota_down = cfg.get("quota_down_bytes")
+        self.split_quota = self.quota_up is not None or self.quota_down is not None
+        self.quota_up = int(self.quota_up or 0)
+        self.quota_down = int(self.quota_down or 0)
         self.blocked = None
         self.blocked_at = None
+        self.blocked_direction = None
         self.servers = []
         self.transports = []
         self.conns = set()  # 已建立的 TCP 客户端连接；停用时主动断开
@@ -56,16 +66,36 @@ class Gateway:
             with open(self.usage_path, "r", encoding="utf-8") as f:
                 u = json.load(f)
             self.used = int(u.get("used_bytes", 0))
+            has_split_usage = "used_up_bytes" in u or "used_down_bytes" in u
+            if has_split_usage:
+                self.used_up = int(u.get("used_up_bytes", 0) or 0)
+                self.used_down = int(u.get("used_down_bytes", 0) or 0)
+                if self.split_quota:
+                    self.used = self.used_up + self.used_down
+            elif self.split_quota:
+                # 旧 usage 只有合计，没有方向拆分：全部计入下行。历史流量以下载
+                # 为主，这样升级后不会凭空多出一份额度。
+                self.used_up = 0
+                self.used_down = self.used
             self.blocked = u.get("blocked")
             self.blocked_at = u.get("blocked_at")
+            self.blocked_direction = u.get("blocked_direction")
         except (OSError, ValueError, TypeError):
             self.used = 0
+            self.used_up = 0
+            self.used_down = 0
+            self.blocked = None
+            self.blocked_at = None
+            self.blocked_direction = None
 
     def flush(self):
         data = {
             "used_bytes": self.used,
+            "used_up_bytes": self.used_up,
+            "used_down_bytes": self.used_down,
             "blocked": self.blocked,
             "blocked_at": self.blocked_at,
+            "blocked_direction": self.blocked_direction,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         tmp = self.usage_path + ".tmp"
@@ -73,21 +103,45 @@ class Gateway:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, self.usage_path)
 
-    def charge(self, n):
+    def charge(self, n, direction):
+        """按方向计费；direction 只会是 "up" 或 "down"。"""
         if self.blocked:
             return False
+        if self.split_quota:
+            quota = self.quota_up if direction == "up" else self.quota_down
+            used = self.used_up if direction == "up" else self.used_down
+            if quota > 0 and used + n >= quota:
+                if direction == "up":
+                    self.used_up = quota
+                else:
+                    self.used_down = quota
+                self.used = self.used_up + self.used_down
+                self.block("quota", direction)
+                return False
+            if direction == "up":
+                self.used_up += n
+            else:
+                self.used_down += n
+            self.used = self.used_up + self.used_down
+            return True
+        # 旧版合计配额：保留原有行为，方向计数只用于展示。
         quota = int(self.cfg.get("quota_bytes", 0))
         if quota > 0 and self.used + n >= quota:
             self.used = quota
             self.block("quota")
             return False
         self.used += n
+        if direction == "up":
+            self.used_up += n
+        else:
+            self.used_down += n
         return True
 
-    def block(self, reason):
+    def block(self, reason, direction=None):
         if self.blocked:
             return
         self.blocked = reason
+        self.blocked_direction = direction
         self.blocked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.flush()
         for s in self.servers:
@@ -110,7 +164,7 @@ class Gateway:
         exp = int(self.cfg.get("expires_at_unix", 0))
         return exp > 0 and time.time() >= exp
 
-    async def pipe(self, reader, writer, bucket):
+    async def pipe(self, reader, writer, bucket, direction):
         try:
             while not self.blocked:
                 # 1s 超时只为定期检查 blocked；超时不会丢已缓冲数据。
@@ -120,7 +174,7 @@ class Gateway:
                     continue
                 if not data:
                     break
-                if not self.charge(len(data)):
+                if not self.charge(len(data), direction):
                     break
                 await bucket.take(len(data))
                 if self.blocked:
@@ -148,8 +202,8 @@ class Gateway:
             return
         try:
             await asyncio.gather(
-                self.pipe(reader, uw, self.up),
-                self.pipe(ur, writer, self.down),
+                self.pipe(reader, uw, self.up, "up"),
+                self.pipe(ur, writer, self.down, "down"),
                 return_exceptions=True,
             )
         finally:
@@ -167,7 +221,8 @@ class UdpUpstream(asyncio.DatagramProtocol):
         self.gateway = gateway
 
     def datagram_received(self, data, addr):
-        if not self.gateway.charge(len(data)):
+        # 目标返回客户端：下行。
+        if not self.gateway.charge(len(data), "down"):
             return
         if not self.gateway.down.try_take(len(data)):
             return
@@ -199,7 +254,8 @@ class UdpPublic(asyncio.DatagramProtocol):
             return tr
 
     def datagram_received(self, data, addr):
-        if self.gateway.blocked or not self.gateway.charge(len(data)):
+        # 客户端发往目标：上行。
+        if self.gateway.blocked or not self.gateway.charge(len(data), "up"):
             return
         if not self.gateway.up.try_take(len(data)):
             return

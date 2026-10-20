@@ -25,8 +25,20 @@ function validNumber(raw: string, min: number, max: number): boolean {
 }
 
 export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
-  const [quotaGb, setQuotaGb] = useState(
-    String(Math.max(1, Math.round(share.quota_bytes / GB))),
+  // 旧分享只有合计配额：首次编辑时把它当作下行配额，上行默认不限（0）。
+  // 这与网关的迁移规则一致——历史合计全部计入下行，避免凭空多出额度。
+  const [quotaUpGb, setQuotaUpGb] = useState(
+    share.split_quota ? String(Math.round(share.quota_up_bytes / GB)) : '0',
+  )
+  const [quotaDownGb, setQuotaDownGb] = useState(
+    String(
+      Math.max(
+        1,
+        Math.round(
+          (share.split_quota ? share.quota_down_bytes : share.quota_bytes) / GB,
+        ),
+      ),
+    ),
   )
   const [rateUp, setRateUp] = useState(String(share.rate_up_mbps))
   const [rateDown, setRateDown] = useState(String(share.rate_down_mbps))
@@ -35,7 +47,9 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
   const [error, setError] = useState<string | null>(null)
 
   const optionsValid =
-    validNumber(quotaGb, 1, Number.MAX_SAFE_INTEGER) &&
+    validNumber(quotaUpGb, 0, Number.MAX_SAFE_INTEGER) &&
+    validNumber(quotaDownGb, 0, Number.MAX_SAFE_INTEGER) &&
+    (Number(quotaUpGb) > 0 || Number(quotaDownGb) > 0) &&
     validNumber(rateUp, 0, 100_000) &&
     validNumber(rateDown, 0, 100_000) &&
     validNumber(days, 1, 3650)
@@ -49,7 +63,8 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
         await updateShare(
           share.server_id,
           share.id,
-          Number(quotaGb),
+          Number(quotaUpGb),
+          Number(quotaDownGb),
           Number(rateUp),
           Number(rateDown),
           Number(days),
@@ -93,6 +108,11 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
           已到期：保存时会按下面的「有效期」从现在重新计算到期时间。
         </p>
       )}
+      {!share.split_quota && (
+        <p className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-400">
+          旧口径：当前只有一个合计配额。保存后改为上下行分开配额，历史合计用量计入下行，上行默认不限。
+        </p>
+      )}
       {error && (
         <p role="alert" className="rounded bg-red-950 px-2 py-1 text-xs text-red-300">
           {error}
@@ -101,13 +121,24 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
 
       <div className="grid grid-cols-2 gap-2">
         <label className="flex flex-col gap-1 text-xs text-neutral-400">
-          配额（GB）
+          上行配额（GB，0 = 不限）
           <input
-            aria-label="配额（GB）"
+            aria-label="上行配额（GB）"
             type="number"
-            min={1}
-            value={quotaGb}
-            onChange={(e) => setQuotaGb(e.target.value)}
+            min={0}
+            value={quotaUpGb}
+            onChange={(e) => setQuotaUpGb(e.target.value)}
+            className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-100"
+          />
+        </label>
+        <label className="flex flex-col gap-1 text-xs text-neutral-400">
+          下行配额（GB，0 = 不限）
+          <input
+            aria-label="下行配额（GB）"
+            type="number"
+            min={0}
+            value={quotaDownGb}
+            onChange={(e) => setQuotaDownGb(e.target.value)}
             className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-100"
           />
         </label>

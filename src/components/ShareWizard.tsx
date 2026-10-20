@@ -15,8 +15,8 @@ interface Props {
   onCreated: (info: ShareInfo) => void
 }
 
-/** 默认值与后端一致：100 GB / 上下行 100 Mbps / 30 天。 */
-const DEFAULTS = { quotaGb: '100', up: '100', down: '100', days: '30' }
+/** 默认值与后端一致：上行 20 GB / 下行 80 GB（合计仍是原来的 100 GB）/ 上下行 100 Mbps / 30 天。 */
+const DEFAULTS = { quotaUpGb: '20', quotaDownGb: '80', up: '100', down: '100', days: '30' }
 
 function validNumber(raw: string, min: number, max: number): boolean {
   const n = Number(raw)
@@ -32,7 +32,8 @@ export default function ShareWizard({ servers, onClose, onCreated }: Props) {
   const [tlsBusy, setTlsBusy] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [quotaGb, setQuotaGb] = useState(DEFAULTS.quotaGb)
+  const [quotaUpGb, setQuotaUpGb] = useState(DEFAULTS.quotaUpGb)
+  const [quotaDownGb, setQuotaDownGb] = useState(DEFAULTS.quotaDownGb)
   const [rateUp, setRateUp] = useState(DEFAULTS.up)
   const [rateDown, setRateDown] = useState(DEFAULTS.down)
   const [days, setDays] = useState(DEFAULTS.days)
@@ -86,7 +87,9 @@ export default function ShareWizard({ servers, onClose, onCreated }: Props) {
   }
 
   const optionsValid =
-    validNumber(quotaGb, 1, Number.MAX_SAFE_INTEGER) &&
+    validNumber(quotaUpGb, 0, Number.MAX_SAFE_INTEGER) &&
+    validNumber(quotaDownGb, 0, Number.MAX_SAFE_INTEGER) &&
+    (Number(quotaUpGb) > 0 || Number(quotaDownGb) > 0) &&
     validNumber(rateUp, 0, 100_000) &&
     validNumber(rateDown, 0, 100_000) &&
     validNumber(days, 1, 3650)
@@ -101,7 +104,8 @@ export default function ShareWizard({ servers, onClose, onCreated }: Props) {
       const info = await createShare(
         serverId,
         [...picked],
-        Number(quotaGb),
+        Number(quotaUpGb),
+        Number(quotaDownGb),
         Number(rateUp),
         Number(rateDown),
         Number(days),
@@ -196,13 +200,24 @@ export default function ShareWizard({ servers, onClose, onCreated }: Props) {
 
       <div className="grid grid-cols-2 gap-2">
         <label className="flex flex-col gap-1 text-xs text-neutral-400">
-          配额（GB）
+          上行配额（GB，0 = 不限）
           <input
-            aria-label="配额（GB）"
+            aria-label="上行配额（GB）"
             type="number"
-            min={1}
-            value={quotaGb}
-            onChange={(e) => setQuotaGb(e.target.value)}
+            min={0}
+            value={quotaUpGb}
+            onChange={(e) => setQuotaUpGb(e.target.value)}
+            className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-100"
+          />
+        </label>
+        <label className="flex flex-col gap-1 text-xs text-neutral-400">
+          下行配额（GB，0 = 不限）
+          <input
+            aria-label="下行配额（GB）"
+            type="number"
+            min={0}
+            value={quotaDownGb}
+            onChange={(e) => setQuotaDownGb(e.target.value)}
             className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-100"
           />
         </label>

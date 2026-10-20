@@ -23,6 +23,45 @@ function fmtBytes(n: number): string {
   return `${n} B`
 }
 
+/** 单向配额条：0 = 不限，不画进度（但保留「不限」字样）。 */
+function QuotaBar({
+  label,
+  used,
+  quota,
+  ariaLabel,
+}: {
+  label: string
+  used: number
+  quota: number
+  ariaLabel: string
+}) {
+  const pct = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0
+  return (
+    <div className="space-y-0.5">
+      <div className="text-xs text-neutral-400">
+        {label} {fmtBytes(used)} / {quota > 0 ? fmtBytes(quota) : '不限'}
+      </div>
+      <div
+        role="progressbar"
+        aria-label={ariaLabel}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+        className="h-1.5 w-full rounded bg-neutral-800"
+      >
+        <div
+          style={{ width: `${pct}%` }}
+          className={
+            pct >= 100
+              ? 'h-1.5 rounded bg-amber-500'
+              : 'h-1.5 rounded bg-emerald-500'
+          }
+        />
+      </div>
+    </div>
+  )
+}
+
 function statusView(s: ShareInfo): { label: string; className: string } {
   switch (s.status) {
     case 'active':
@@ -223,6 +262,21 @@ export default function Shares() {
                   <td className="px-3 py-2 align-top">
                     {s.legacy ? (
                       <span className="text-neutral-500">—</span>
+                    ) : s.split_quota ? (
+                      <div className="w-44 space-y-2">
+                        <QuotaBar
+                          label="↑ 上行"
+                          used={s.used_up_bytes}
+                          quota={s.quota_up_bytes}
+                          ariaLabel="上行已用配额"
+                        />
+                        <QuotaBar
+                          label="↓ 下行"
+                          used={s.used_down_bytes}
+                          quota={s.quota_down_bytes}
+                          ariaLabel="下行已用配额"
+                        />
+                      </div>
                     ) : (
                       <div className="w-32 space-y-1">
                         <div className="text-xs text-neutral-400">
