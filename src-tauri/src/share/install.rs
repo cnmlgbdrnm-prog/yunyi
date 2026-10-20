@@ -1366,6 +1366,39 @@ pub async fn update_share_with_nodes(
             CONFIG_TIMEOUT,
         )
         .await?;
+        // 防火墙脚本是所有分享共用的；编辑时一并升级，旧分享无需重建即可获得
+        // IPv6 放行。write_remote_file 落盘默认 0644，必须补执行位。
+        write_remote_file(
+            &mut sess,
+            &cancel,
+            "写入",
+            &firewall_script_path(),
+            &scripts::firewall_script(),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        run_cmd_ok(
+            &mut sess,
+            &cancel,
+            "准备",
+            &format!("chmod 755 {}", firewall_script_path()),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        // 订阅单元在轻量编辑里不会重启，这里主动补一次 HTTP 端口放行：
+        // 升级后的脚本会同时维护 iptables/ip6tables，旧分享也能立刻获得 IPv6 订阅入口。
+        run_cmd_ok(
+            &mut sess,
+            &cancel,
+            "放行",
+            &format!(
+                "{} open vpnshare-{id} {}:tcp",
+                firewall_script_path(),
+                manifest.http_port
+            ),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
         write_remote_file(
             &mut sess,
             &cancel,
@@ -1656,6 +1689,23 @@ async fn update_share_node_set(
             "写入",
             &share_gateway_script_path(),
             &scripts::share_gateway_script(),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &firewall_script_path(),
+            &scripts::firewall_script(),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        run_cmd_ok(
+            sess,
+            cancel,
+            "准备",
+            &format!("chmod 755 {}", firewall_script_path()),
             CONFIG_TIMEOUT,
         )
         .await?;
