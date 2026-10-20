@@ -13,8 +13,9 @@ use crate::servers::deploy::{
     XRAY_CONFIG_PATH,
 };
 use crate::servers::remote_file::{read_remote_file, RemoteFile};
+use crate::servers::upstream::UPSTREAM_CONFIG_PATH;
 use crate::servers::{CONNECT_TIMEOUT, PROBE_TIMEOUT};
-use crate::share::clone::{clone_configs, ShareNodeSpec};
+use crate::share::clone::{clone_configs, ShareNodeSpec, ShareSource};
 use crate::share::model::*;
 use crate::share::naming::*;
 use crate::share::plan;
@@ -51,14 +52,25 @@ pub async fn create_share(
     if !tls.ready {
         return Err(format!("分享 HTTPS 未就绪: {}", tls.detail));
     }
-    create_share_inner(state, input).await
+    // 把刚刚核验/自动检测到的域名带进创建编排：服务器上可能没有显式配置
+    // `share_domain`，只有证书。若这里不带，下面会再次报「未配置分享域名」。
+    create_share_inner_with_domain(state, input, Some(&tls.domain)).await
 }
 
-/// 创建编排本体。测试直接调用以绕过 TLS 的外部依赖；生产路径必须经
-/// [`create_share`]（它会先查证书）。
+/// 创建编排本体。仅测试直接调用以绕过 TLS 外部依赖；生产路径必须经
+/// [`create_share`]（它会先查证书，并把自动检测到的域名传进来）。
+#[cfg(test)]
 pub(crate) async fn create_share_inner(
     state: &Arc<AppState>,
     input: CreateShareInput,
+) -> Result<ShareInfo, String> {
+    create_share_inner_with_domain(state, input, None).await
+}
+
+async fn create_share_inner_with_domain(
+    state: &Arc<AppState>,
+    input: CreateShareInput,
+    resolved_domain: Option<&str>,
 ) -> Result<ShareInfo, String> {
     validate_options(&input.options)?;
     if input.node_ids.is_empty() {
@@ -89,13 +101,24 @@ pub(crate) async fn create_share_inner(
         return Err("Shadowsocks 分享一次只允许一个节点".into());
     }
 
+    // 上游出口的入站不在主 Xray 配置里，而在专用的 `xray-upstream` 实例。
+    // 先按 node_id 认出哪些选中节点来自上游，克隆时才选对配置来源。
+    let upstream_node_ids: HashSet<String> = {
+        let conn = state.db.lock();
+        crate::db::repos::upstreams::list_by_server(&conn, input.server_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|u| u.node_id)
+            .collect()
+    };
+
     // 2. 读服务器/凭据并建立 SSH 会话。
     let (auth, server) =
         crate::servers::load_auth(state, input.server_id).map_err(|e| e.to_string())?;
-    let domain = crate::servers::normalize_share_domain(&server.share_domain)?;
-    if domain.is_empty() {
-        return Err("该服务器未配置分享域名（服务器 → 编辑 → 分享域名）".into());
-    }
+    let domain = match resolved_domain.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => crate::servers::normalize_share_domain(d)?,
+        None => crate::servers::normalize_share_domain(&server.share_domain)?,
+    };
     let mut sess = SshSession::connect(
         effective_host(&server),
         server.port as u16,
@@ -108,6 +131,20 @@ pub(crate) async fn create_share_inner(
     let cancel = AtomicBool::new(false);
     tls::probe_python3(&mut sess, &cancel).await?;
 
+    // 直接调用本函数（测试/旧调用）时没有 TLS 层传来的域名：再从服务器证书兜底
+    // 检测一次。生产入口已经由 `tls_status` 核验过证书，不会走到第二次 SSH 读取。
+    let domain = if domain.is_empty() {
+        tls::detect_cert_domain(&mut sess, &cancel).await?
+    } else {
+        domain
+    };
+    if domain.is_empty() {
+        return Err(
+            "该服务器未配置分享域名，服务器上也没有可自动检测的分享证书（服务器 → 编辑 → 分享域名）"
+                .into(),
+        );
+    }
+
     // 3. 端口分配与克隆规格（凭据在这里一次性生成）。
     let transports: Vec<&str> = chosen
         .iter()
@@ -118,9 +155,9 @@ pub(crate) async fn create_share_inner(
         })
         .collect();
     let allocated = allocate_share_ports(&mut sess, &cancel, &transports).await?;
-    let specs = build_specs(&chosen, &allocated.pairs)?;
+    let specs = build_specs(&chosen, &allocated.pairs, &upstream_node_ids)?;
 
-    // 4. 读主配置。需要哪个协议才读哪个；文件缺失即报错，不静默跳过。
+    // 4. 读配置。需要哪个协议/来源才读哪个；文件缺失即报错，不静默跳过。
     let id = new_id();
     let token = new_token();
     let main_xray = read_main(&mut sess, &cancel, &specs, "vless", XRAY_CONFIG_PATH).await?;
@@ -133,10 +170,13 @@ pub(crate) async fn create_share_inner(
     )
     .await?;
     let main_ss = read_main(&mut sess, &cancel, &specs, "ss", SS_CONFIG_PATH).await?;
+    let upstream_xray =
+        read_main(&mut sess, &cancel, &specs, "upstream", UPSTREAM_CONFIG_PATH).await?;
 
     // 5. 克隆：只改端口、监听地址与凭据，其余流设置/出站原样保留。
     let cloned = clone_configs(
         main_xray.as_deref(),
+        upstream_xray.as_deref(),
         main_sb.as_deref(),
         main_ss.as_deref(),
         &specs,
@@ -534,7 +574,10 @@ pub(crate) fn info_from_manifest(
     }
 }
 
-/// 只有当选中节点里出现该协议族时才读主配置；文件不存在即报错，不静默跳过。
+/// 只有当选中节点里出现该协议族/来源时才读配置；文件不存在即报错，不静默跳过。
+///
+/// `family = "upstream"` 读的是上游出口专用的 `xray-upstream` 配置；其余 family
+/// 只服务主服务配置，因此必须排除上游节点（它们的端口与协议在主配置里并不存在）。
 pub(crate) async fn read_main(
     sess: &mut SshSession,
     cancel: &AtomicBool,
@@ -543,15 +586,24 @@ pub(crate) async fn read_main(
     path: &str,
 ) -> Result<Option<String>, String> {
     let needed = specs.iter().any(|s| match family {
-        "vless" => matches!(s.protocol.as_str(), "vless" | "trojan" | "vmess"),
-        "hysteria2" => matches!(s.protocol.as_str(), "hysteria2" | "tuic"),
-        "ss" => s.protocol == "ss",
+        "upstream" => s.source == ShareSource::Upstream,
+        "vless" => {
+            s.source == ShareSource::Main
+                && matches!(s.protocol.as_str(), "vless" | "trojan" | "vmess")
+        }
+        "hysteria2" => {
+            s.source == ShareSource::Main && matches!(s.protocol.as_str(), "hysteria2" | "tuic")
+        }
+        "ss" => s.source == ShareSource::Main && s.protocol == "ss",
         _ => false,
     });
     if !needed {
         return Ok(None);
     }
     match read_remote_file(sess, cancel, "读取", path, PROBE_TIMEOUT).await? {
+        RemoteFile::Absent if family == "upstream" => Err(format!(
+            "上游出口配置不存在：{path}（请先在这台服务器上部署上游出口）"
+        )),
         RemoteFile::Absent => Err(format!("主服务配置不存在：{path}（请先部署对应协议）")),
         RemoteFile::Content(c) => Ok(Some(c)),
     }
@@ -688,7 +740,14 @@ pub async fn allocate_share_ports(
 }
 
 /// 由节点与端口对生成克隆规格；凭据在这里一次性生成。
-pub fn build_specs(nodes: &[Node], pairs: &[(u16, u16)]) -> Result<Vec<ShareNodeSpec>, String> {
+///
+/// `upstream_node_ids` 是这台服务器上由上游出口写回的节点 id。它们虽然也表现为
+/// `self-built` 的 VLESS 节点，入站却在专用 `xray-upstream` 配置里，克隆来源不同。
+pub fn build_specs(
+    nodes: &[Node],
+    pairs: &[(u16, u16)],
+    upstream_node_ids: &HashSet<String>,
+) -> Result<Vec<ShareNodeSpec>, String> {
     if nodes.len() != pairs.len() {
         return Err("端口数量与节点数量不一致".into());
     }
@@ -720,6 +779,19 @@ pub fn build_specs(nodes: &[Node], pairs: &[(u16, u16)]) -> Result<Vec<ShareNode
             } else {
                 (uuid::Uuid::new_v4().to_string(), None)
             };
+            let source = if upstream_node_ids.contains(&n.id) {
+                // 上游出口只有 VLESS+REALITY 一种客户端形态；真出现别的协议说明
+                // 节点被别处改过，宁可显式拒绝，也不要拿错来源的配置去猜。
+                if n.protocol != "vless" {
+                    return Err(format!(
+                        "上游出口节点 {} 的协议为 {}，当前只支持分享 VLESS 上游",
+                        n.name, n.protocol
+                    ));
+                }
+                ShareSource::Upstream
+            } else {
+                ShareSource::Main
+            };
             Ok(ShareNodeSpec {
                 name: n.name.clone(),
                 protocol: n.protocol.clone(),
@@ -730,6 +802,7 @@ pub fn build_specs(nodes: &[Node], pairs: &[(u16, u16)]) -> Result<Vec<ShareNode
                 original_params,
                 new_credential,
                 new_password,
+                source,
             })
         })
         .collect()

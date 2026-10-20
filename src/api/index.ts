@@ -137,7 +137,7 @@ export function listShares(): Promise<ShareList> {
   return invoke('list_shares_cmd')
 }
 
-/** 向导候选：后端按服务器重算准入（自建/启用/非 ssr/非隐私/非上游/非中转）。 */
+/** 向导候选：后端按服务器重算准入（自建/启用/非 ssr/非隐私/非中转；上游出口可分享）。 */
 export function listShareCandidates(serverId: number): Promise<ShareCandidate[]> {
   return invoke('list_share_candidates_cmd', { serverId })
 }

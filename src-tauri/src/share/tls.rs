@@ -4,6 +4,10 @@
 //! 读状态）。所有失败都显式返回——**绝不退回 HTTP**：没有证书就不允许新建分享，
 //! 调用方（T7）会先查 [`tls_status`]。
 //!
+//! 域名来源有两层：优先 `servers.share_domain`；为空时读取服务器上已有
+//! `/srv/vpnshare/tls/fullchain.pem` 的 DNS SAN。已有有效证书时不再要求 ACME
+//! 邮箱——邮箱只用于签发新证书。
+//!
 //! 命令拼装的安全边界：
 //! - 域名先过 `servers::normalize_share_domain`，只允许标签字符；
 //! - 邮箱先过 [`validate_email`]，拒绝空白/引号/元字符；
@@ -28,6 +32,55 @@ use std::sync::Arc;
 pub const CERT_ROOT: &str = "/etc/letsencrypt/live";
 /// certbot 续期成功后自动执行的 deploy hook。
 pub const DEPLOY_HOOK_PATH: &str = "/etc/letsencrypt/renewal-hooks/deploy/vpnshare.sh";
+
+/// 从**已在服务器上的分享证书**读取全部 DNS SAN（每行一个）。
+///
+/// 用途：用户在服务器上已经签过证书（例如上一轮真机验证留下的
+/// `50-114-236-17.sslip.io`），但本地 `servers.share_domain` 还是空。此时不必让
+/// 用户再手工抄一遍域名——证书本身就是事实源。
+///
+/// 同时尝试 `-ext subjectAltName` 与完整的 `-text`：前者在旧版本 OpenSSL 上可能
+/// 不支持，而后者从 1.0 起就有。命令只含常量路径，不拼接任何用户输入。
+pub fn cert_domain_cmd() -> String {
+    format!(
+        "{{ openssl x509 -noout -ext subjectAltName -in {}/fullchain.pem 2>/dev/null; \
+         openssl x509 -noout -text -in {}/fullchain.pem 2>/dev/null \
+         | grep -A1 'Subject Alternative Name'; }} \
+         | grep -oE 'DNS:[^,[:space:]]+' | cut -c5- | sort -u",
+        tls_dir(),
+        tls_dir()
+    )
+}
+
+/// 读取证书里**可用**的域名列表：非法标签与通配符 SAN 会被跳过。
+///
+/// 这里**不判断证书是否过期**：调用方已经用 `openssl x509 -checkend 0` 判过。
+/// 单独拆出来是为了让创建路径在极少数绕过 `tls_status` 的调用里也能兜底。
+pub(crate) async fn cert_domains(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+) -> Result<Vec<String>, String> {
+    let out = run_cmd(sess, cancel, "证书校验", &cert_domain_cmd(), PROBE_TIMEOUT).await?;
+    Ok(out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| crate::servers::normalize_share_domain(line).ok())
+        .collect())
+}
+
+/// 自动检测时取证书里第一个合法域名；没有则返回空串。
+pub(crate) async fn detect_cert_domain(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    Ok(cert_domains(sess, cancel)
+        .await?
+        .into_iter()
+        .next()
+        .unwrap_or_default())
+}
 
 /// 单引号安全包装：shell 里唯一不能出现在单引号串中的字符就是 `'`。
 fn sh_quote(s: &str) -> String {
@@ -135,7 +188,8 @@ async fn install_certbot(
 
 /// 为服务器的分享域名签发/续期证书，并部署到 `/srv/vpnshare/tls/`。
 ///
-/// 步骤：前置配置（不连服务器）→ 连接 → python3 → DNS 交集 → 80 空闲 →
+/// 步骤：前置配置（邮箱必须有；不连服务器）→ 连接 → python3 → 域名（配置或
+/// 证书 SAN 自动检测）→ DNS 交集 → 80 空闲 →
 /// 创建 vpnshare 用户与 TLS 目录 → 放行 80 → 安装 certbot → 签发 → 复制证书 →
 /// 续期钩子 → 校验到期时间 → **无论成败都撤回 80 放行**。
 pub async fn prepare_tls(
@@ -144,7 +198,7 @@ pub async fn prepare_tls(
 ) -> Result<ShareTlsStatus, String> {
     let (auth, server) =
         crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
-    let domain = crate::servers::normalize_share_domain(&server.share_domain)?;
+    let configured = crate::servers::normalize_share_domain(&server.share_domain)?;
     let email = state
         .settings
         .get(SHARE_ACME_EMAIL_KEY)
@@ -152,11 +206,15 @@ pub async fn prepare_tls(
         .unwrap_or_default()
         .trim()
         .to_string();
-    if domain.is_empty() {
-        return Err("该服务器未配置分享域名（服务器 → 编辑 → 分享域名）".into());
-    }
     if email.is_empty() {
-        return Err("未配置 ACME 邮箱（设置 → 分享）".into());
+        // 邮箱是签发新证书的硬前提；连服务器也改变不了这一点。域名可空——它可能
+        // 就在服务器已有证书的 SAN 里，等连上后再自动检测。
+        return Err(if configured.is_empty() {
+            "未配置分享域名，也未配置 ACME 邮箱（服务器 → 编辑 → 分享域名 / 设置 → 分享）"
+                .into()
+        } else {
+            "未配置 ACME 邮箱（设置 → 分享）".into()
+        });
     }
     validate_email(&email)?;
 
@@ -172,6 +230,24 @@ pub async fn prepare_tls(
     let cancel = AtomicBool::new(false);
 
     probe_python3(&mut sess, &cancel).await?;
+
+    // 分享域名同样支持自动检测：续期场景下服务器上的证书可能刚好过期，但 SAN
+    // 仍是有效信息，可直接用它重新签发，不必让用户手工再抄域名。
+    let domain = if configured.is_empty() {
+        cert_domains(&mut sess, &cancel)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    } else {
+        configured
+    };
+    if domain.is_empty() {
+        return Err(
+            "该服务器未配置分享域名，服务器上也没有可自动检测的分享证书（服务器 → 编辑 → 分享域名）"
+                .into(),
+        );
+    }
 
     // DNS：域名解析结果必须与本机登记地址有交集，否则 HTTP-01 必然失败。
     let mut server_ips = HashSet::new();
@@ -345,15 +421,22 @@ pub async fn prepare_tls(
     result
 }
 
-/// 读当前证书状态。未配置域名/邮箱时**不连服务器**，直接返回原因——向导据此
-/// 显示配置入口并禁用「生成」。
+/// 读当前证书状态。
+///
+/// 域名解析顺序：
+/// 1. `servers.share_domain` 显式配置的值；
+/// 2. 为空时，从服务器 `/srv/vpnshare/tls/fullchain.pem` 的 DNS SAN 自动检测。
+///
+/// 因此 `share_domain` 为空**不再等于「不连服务器、直接失败」**：服务器上已有
+/// 有效证书时，向导仍应显示可用的 HTTPS 域名并允许创建。反过来，证书有效时
+/// 也不再要求 ACME 邮箱——邮箱只用于**签发新证书**，不影响已有证书的使用。
 pub async fn tls_status(
     state: &Arc<AppState>,
     server_id: i64,
 ) -> Result<ShareTlsStatus, String> {
     let (auth, server) =
         crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
-    let domain = crate::servers::normalize_share_domain(&server.share_domain)?;
+    let configured = crate::servers::normalize_share_domain(&server.share_domain)?;
     let email = state
         .settings
         .get(SHARE_ACME_EMAIL_KEY)
@@ -361,31 +444,6 @@ pub async fn tls_status(
         .unwrap_or_default()
         .trim()
         .to_string();
-
-    if domain.is_empty() {
-        return Ok(ShareTlsStatus {
-            domain,
-            ready: false,
-            cert_expires_at: None,
-            detail: "未配置分享域名".into(),
-        });
-    }
-    if email.is_empty() {
-        return Ok(ShareTlsStatus {
-            domain,
-            ready: false,
-            cert_expires_at: None,
-            detail: "未配置 ACME 邮箱".into(),
-        });
-    }
-    if let Err(e) = validate_email(&email) {
-        return Ok(ShareTlsStatus {
-            domain,
-            ready: false,
-            cert_expires_at: None,
-            detail: e,
-        });
-    }
 
     let mut sess = SshSession::connect(
         effective_host(&server),
@@ -408,11 +466,45 @@ pub async fn tls_status(
     )
     .await?;
     if check.exit_code != 0 {
+        let detail = if configured.is_empty() {
+            "未配置分享域名，且服务器上没有可用的分享证书".to_string()
+        } else if email.is_empty() {
+            "证书不存在或已过期，且未配置 ACME 邮箱（设置 → 分享）".to_string()
+        } else {
+            "证书不存在或已过期，请先准备 HTTPS 证书".to_string()
+        };
+        return Ok(ShareTlsStatus {
+            domain: configured,
+            ready: false,
+            cert_expires_at: None,
+            detail,
+        });
+    }
+
+    let domains = cert_domains(&mut sess, &cancel).await?;
+    let detected = domains.first().cloned().unwrap_or_default();
+    let domain = if configured.is_empty() {
+        detected.clone()
+    } else {
+        configured.clone()
+    };
+    if domain.is_empty() {
         return Ok(ShareTlsStatus {
             domain,
             ready: false,
             cert_expires_at: None,
-            detail: "证书不存在或已过期，请先准备 HTTPS 证书".into(),
+            detail: "服务器证书有效，但证书里没有可用的 DNS 域名".into(),
+        });
+    }
+    // 配置值必须出现在证书 SAN 中，否则不能假装就绪：链接会用配置域名，而证书
+    // 只对 SAN 里的名字有效，客户端必然握手失败。空 SAN（老测试夹具/异常证书）
+    // 不触发此判。
+    if !configured.is_empty() && !domains.is_empty() && !domains.contains(&configured) {
+        return Ok(ShareTlsStatus {
+            domain: configured.clone(),
+            ready: false,
+            cert_expires_at: None,
+            detail: format!("服务器证书域名 {detected} 与配置的分享域名 {configured} 不一致"),
         });
     }
 
@@ -428,7 +520,11 @@ pub async fn tls_status(
         domain,
         ready: true,
         cert_expires_at: parse_cert_expiry(&out.stdout),
-        detail: "证书已就绪".into(),
+        detail: if configured.is_empty() {
+            "已从服务器证书自动检测到分享域名".into()
+        } else {
+            "证书已就绪".into()
+        },
     })
 }
 

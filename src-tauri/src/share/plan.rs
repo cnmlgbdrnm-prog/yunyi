@@ -5,14 +5,15 @@
 use crate::domain::{direct_addr, server_owns_addr, Node, Privacy, Server};
 use crate::share::model::ShareCandidate;
 use crate::state::AppState;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// 单节点准入。`Err` 直接作为前端置灰原因；创建时同样用它拒绝。
+///
+/// 上游出口节点**允许分享**：它们是本应用写回的 `self-built` VLESS 节点，克隆时
+/// 由 `install` 从专用 `xray-upstream` 配置取入站与出站。这里不再按上游身份排除。
 pub fn check_eligibility(
     node: &Node,
     server: &Server,
-    upstream_ids: &HashSet<String>,
     privacies: &[Privacy],
 ) -> Result<(), String> {
     if node.source != "self-built" {
@@ -30,9 +31,6 @@ pub fn check_eligibility(
     if crate::servers::privacy::effective_privacy(&node.id, privacies).is_some() {
         return Err("隐私线不可分享（需要本机 Tor）".into());
     }
-    if upstream_ids.contains(&node.id) {
-        return Err("上游出口节点不可分享".into());
-    }
     if node.relay_rule_id.is_some() {
         return Err("挂中转链路的节点不可分享（会绕过中转）".into());
     }
@@ -44,18 +42,13 @@ pub fn share_candidates(
     state: &Arc<AppState>,
     server_id: i64,
 ) -> Result<Vec<ShareCandidate>, String> {
-    let (server, upstream_ids, privacies) = {
+    let (server, privacies) = {
         let conn = state.db.lock();
         let server = crate::db::repos::servers::get(&conn, server_id)
             .map_err(|e| e.to_string())?
             .ok_or("服务器不存在")?;
-        let upstream_ids = crate::db::repos::upstreams::list_by_server(&conn, server_id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|u| u.node_id)
-            .collect::<HashSet<_>>();
         let privacies = crate::db::repos::privacies::list_all(&conn).map_err(|e| e.to_string())?;
-        (server, upstream_ids, privacies)
+        (server, privacies)
     };
     let nodes = state.subs.visible_nodes().map_err(|e| e.to_string())?;
     Ok(nodes
@@ -63,7 +56,7 @@ pub fn share_candidates(
         // 向导只列属于该服务器的节点；别把别的机器/机场节点混进来
         .filter(|node| server_owns_addr(&server, &direct_addr(node)))
         .map(|node| {
-            let reason = check_eligibility(&node, &server, &upstream_ids, &privacies).err();
+            let reason = check_eligibility(&node, &server, &privacies).err();
             ShareCandidate {
                 shareable: reason.is_none(),
                 reason,

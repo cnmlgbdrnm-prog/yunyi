@@ -3,7 +3,16 @@
 
 use crate::domain::{Node, Privacy};
 use crate::share::naming::share_dir;
+use std::collections::HashSet;
 
+/// 入站来自哪份服务配置。上游出口在独立的 `xray-upstream` 实例里，不能去主配置找。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareSource {
+    Main,
+    Upstream,
+}
+
+#[derive(Debug)]
 pub struct ShareNodeSpec {
     pub name: String,
     pub protocol: String,
@@ -14,6 +23,7 @@ pub struct ShareNodeSpec {
     pub original_params: serde_json::Value,
     pub new_credential: String,       // vless/vmess: uuid; trojan/hy2/ss: password; tuic: uuid
     pub new_password: Option<String>, // 仅 tuic 需要
+    pub source: ShareSource,
 }
 
 pub struct ClonedConfigs {
@@ -27,6 +37,7 @@ pub struct ClonedConfigs {
 
 pub fn clone_configs(
     main_xray: Option<&str>,
+    upstream_xray: Option<&str>,
     main_singbox: Option<&str>,
     main_ss: Option<&str>,
     specs: &[ShareNodeSpec],
@@ -47,10 +58,7 @@ pub fn clone_configs(
     let xray_config = if xray_specs.is_empty() {
         None
     } else {
-        Some(clone_xray(
-            main_xray.ok_or("缺少 Xray 主配置")?,
-            &xray_specs,
-        )?)
+        Some(clone_xray(main_xray, upstream_xray, &xray_specs)?)
     };
     let singbox_config = if sb_specs.is_empty() {
         None
@@ -125,24 +133,73 @@ pub fn clone_configs(
     })
 }
 
-fn clone_xray(main: &str, specs: &[&ShareNodeSpec]) -> Result<String, String> {
-    let root: serde_json::Value = serde_json::from_str(main).map_err(|e| e.to_string())?;
-    let main_inbounds = root
-        .get("inbounds")
+fn clone_xray(
+    main: Option<&str>,
+    upstream: Option<&str>,
+    specs: &[&ShareNodeSpec],
+) -> Result<String, String> {
+    let main_root = main
+        .map(|s| serde_json::from_str::<serde_json::Value>(s))
+        .transpose()
+        .map_err(|e| format!("Xray 主配置解析失败: {e}"))?;
+    let upstream_root = upstream
+        .map(|s| serde_json::from_str::<serde_json::Value>(s))
+        .transpose()
+        .map_err(|e| format!("上游出口配置解析失败: {e}"))?;
+    let main_inbounds = main_root
+        .as_ref()
+        .and_then(|r| r.get("inbounds"))
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    let upstream_inbounds = upstream_root
+        .as_ref()
+        .and_then(|r| r.get("inbounds"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
     let mut inbounds = Vec::new();
+    let mut inbound_tags = HashSet::new();
+    let mut upstream_tags = Vec::new();
     for s in specs {
-        let orig = main_inbounds
+        let (source_inbounds, label) = match s.source {
+            ShareSource::Main => (
+                &main_inbounds,
+                format!("主配置里找不到 {}:{} 入站", s.protocol, s.original_port),
+            ),
+            ShareSource::Upstream => (
+                &upstream_inbounds,
+                format!("上游配置里找不到 {}:{} 入站", s.protocol, s.original_port),
+            ),
+        };
+        let orig = source_inbounds
             .iter()
             .find(|ib| {
                 ib.get("protocol").and_then(|v| v.as_str()) == Some(s.protocol.as_str())
                     && ib.get("port").and_then(|v| v.as_u64()) == Some(s.original_port as u64)
             })
-            .ok_or_else(|| {
-                format!("主配置里找不到 {}:{} 入站", s.protocol, s.original_port)
-            })?;
+            .ok_or(label)?;
+        if s.source == ShareSource::Upstream {
+            let tag = orig
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "上游配置里 {}:{} 入站缺 tag，无法配对出站",
+                        s.protocol, s.original_port
+                    )
+                })?;
+            if !inbound_tags.insert(tag.to_string()) {
+                return Err(format!("入站 tag 重复: {tag}"));
+            }
+            upstream_tags.push(tag.to_string());
+        } else if let Some(tag) = orig.get("tag").and_then(|v| v.as_str()) {
+            if !inbound_tags.insert(tag.to_string()) {
+                return Err(format!("入站 tag 重复: {tag}"));
+            }
+        }
+
         let mut ib = orig.clone();
         ib["listen"] = serde_json::json!("127.0.0.1");
         ib["port"] = serde_json::json!(s.internal_port);
@@ -152,7 +209,8 @@ fn clone_xray(main: &str, specs: &[&ShareNodeSpec]) -> Result<String, String> {
                     .pointer("/settings/clients/0/flow")
                     .cloned()
                     .unwrap_or(serde_json::json!("xtls-rprx-vision"));
-                ib["settings"]["clients"] = serde_json::json!([{ "id": s.new_credential, "flow": flow }]);
+                ib["settings"]["clients"] =
+                    serde_json::json!([{ "id": s.new_credential, "flow": flow }]);
             }
             "trojan" => {
                 ib["settings"]["clients"] = serde_json::json!([{ "password": s.new_credential }]);
@@ -168,12 +226,101 @@ fn clone_xray(main: &str, specs: &[&ShareNodeSpec]) -> Result<String, String> {
         }
         inbounds.push(ib);
     }
-    let mut out = serde_json::json!({ "inbounds": inbounds });
-    if let Some(v) = root.get("outbounds") {
-        out["outbounds"] = v.clone();
+
+    // 主配置的出站/分流原样保留；上游只复制**被选中出口**对应的出站与路由，
+    // 绝不把同机其它出口的 SOCKS/HTTP 凭据带进分享实例。
+    let mut outbounds = Vec::new();
+    let mut outbound_tags = HashSet::new();
+    let mut main_rules = Vec::new();
+    let mut upstream_rules = Vec::new();
+    let mut domain_strategy = None;
+
+    if let Some(root) = &main_root {
+        if let Some(list) = root.get("outbounds").and_then(|v| v.as_array()) {
+            for ob in list {
+                if let Some(tag) = ob.get("tag").and_then(|v| v.as_str()) {
+                    if !outbound_tags.insert(tag.to_string()) {
+                        return Err(format!("出站 tag 重复: {tag}"));
+                    }
+                }
+                outbounds.push(ob.clone());
+            }
+        }
+        if let Some(routing) = root.get("routing") {
+            if domain_strategy.is_none() {
+                domain_strategy = routing.get("domainStrategy").cloned();
+            }
+            if let Some(rules) = routing.get("rules").and_then(|v| v.as_array()) {
+                main_rules.extend(rules.iter().cloned());
+            }
+        }
     }
-    if let Some(v) = root.get("routing") {
-        out["routing"] = v.clone();
+
+    if let Some(root) = &upstream_root {
+        let up_outbounds = root
+            .get("outbounds")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let up_rules = root
+            .pointer("/routing/rules")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for tag in &upstream_tags {
+            let mut matched = false;
+            for rule in &up_rules {
+                let hits = rule
+                    .get("inboundTag")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|v| v.as_str() == Some(tag.as_str())))
+                    .unwrap_or(false);
+                if !hits {
+                    continue;
+                }
+                matched = true;
+                let out_tag = rule
+                    .get("outboundTag")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("上游配置里入站 {tag} 的路由规则缺 outboundTag"))?;
+                let ob = up_outbounds
+                    .iter()
+                    .find(|o| o.get("tag").and_then(|v| v.as_str()) == Some(out_tag))
+                    .ok_or_else(|| {
+                        format!("上游配置里找不到路由指向的出站 {out_tag}（入站 {tag}）")
+                    })?;
+                if !outbound_tags.insert(out_tag.to_string()) {
+                    return Err(format!("出站 tag 重复: {out_tag}"));
+                }
+                outbounds.push(ob.clone());
+                upstream_rules.push(rule.clone());
+            }
+            if !matched {
+                return Err(format!("上游配置里找不到入站 {tag} 的路由规则"));
+            }
+        }
+        if domain_strategy.is_none() {
+            domain_strategy = root.pointer("/routing/domainStrategy").cloned();
+        }
+    }
+
+    // 上游规则放在主配置规则之前：Xray 首条匹配生效，主配置若带 catch-all，
+    // 放后面会让上游入站被主配置的直连规则抢走，住宅出口形同虚设。
+    let routing_rules: Vec<_> = upstream_rules.into_iter().chain(main_rules).collect();
+
+    let mut out = serde_json::json!({ "inbounds": inbounds });
+    if !outbounds.is_empty() {
+        out["outbounds"] = serde_json::json!(outbounds);
+    }
+    let mut routing = serde_json::json!({});
+    if let Some(ds) = domain_strategy {
+        routing["domainStrategy"] = ds;
+    }
+    if !routing_rules.is_empty() {
+        routing["rules"] = serde_json::json!(routing_rules);
+    }
+    if routing.as_object().is_some_and(|m| !m.is_empty()) {
+        out["routing"] = routing;
     }
     Ok(out.to_string())
 }
