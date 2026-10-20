@@ -18,8 +18,9 @@
   - 默认值：配额 100 GB（1 GB = 1024³）、上下行各 100 Mbps、有效期 30 天。
   - Python 网关只用标准库；不新增 Rust 依赖；不新增发布二进制。
   - 工作区已有未提交改动（`CHANGELOG.md`、`commands/mod.rs`、`servers/channels.rs`、`ChannelPanel.tsx`、`ServerRow.tsx`、`Servers.tsx`）。**只能按路径/按 hunk 暂存本次任务自己的改动，严禁 `git add -A` / `git add .`。**
+  - **`tests/` 整个目录被 `.gitignore` 的 `/tests/` 忽略**（Cargo.toml 也注明测试源码不随仓库上传）。所有提交命令里的 `git add ... tests/...` 都不执行；测试仍按验收命令在本机跑，提交只包含 `src*/docs/CHANGELOG` 等非忽略路径。
   - 注释、错误文案、README/CHANGELOG、提交信息一律中文。
-  - 测试门禁：`cargo test --manifest-path src-tauri/Cargo.toml`（带 `--skip net::runtime_tests --skip net::runtime_service_tests`）、`npx tsc --noEmit`、`npm test`、`python -m unittest discover -s tests/python`。
+  - 测试门禁：`cargo test --manifest-path src-tauri/Cargo.toml --features local-tests`（带 `--skip net::runtime_tests --skip net::runtime_service_tests`）、`npx tsc --noEmit`、`npm test`、`python -m unittest discover -s tests/python`。
 - **Acceptance Criteria:**
   - A1: 新分享同时提供 `https://<域名>:<端口>/sub/<token>`（YAML）与 `/singbox/<token>`（JSON）；两者都能导入 mihomo / sing-box 并实际连通。
   - A2: 跑流量后 `usage.json` 增长；达到配额、到期、手动作废三种情况下，已导入的旧配置立即连不上。
@@ -71,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T1（pending）
-- 下一动作：写迁移 v18 与 `Server.share_domain` 的失败测试
+- 当前：T2（in_progress）
+- 下一动作：写 `share/naming.rs` 与 `share/model.rs` 的失败测试
 - 阻塞：无
-- 已完成：（空）
+- 已完成：T1（`c820609`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -183,11 +184,11 @@ tests/frontend/views/Servers.test.tsx
 - Produces: `Server.share_domain: String`；`CreateServerInput.share_domain: String`；`UpdateServerInput.share_domain: Option<String>`；`settings::SHARE_ACME_EMAIL_KEY`。
 - Produces: `servers::normalize_share_domain(&str) -> Result<String, String>`。
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml migration_v18` 绿；`cargo test --manifest-path src-tauri/Cargo.toml share_domain` 绿；`npx tsc --noEmit` 绿。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests migration_v18` 绿；`cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share_domain` 绿；`npx tsc --noEmit` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `c820609`；`cargo test --features local-tests migration_v18` 1 passed；`share_domain` 3 passed；`npx tsc --noEmit` 无输出；`npm test -- Servers` 57 passed；`npm run test:typecheck` 无输出。
 
-- [ ] **Step 1: 写迁移失败测试**
+- [x] **Step 1: 写迁移失败测试**
 
 `tests/rust/db/tests.rs` 追加：
 
@@ -211,7 +212,7 @@ fn migration_v18_adds_share_domain_defaulting_to_empty() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml migration_v18`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests migration_v18`
 Expected: FAIL，`no such column: share_domain`
 
 - [ ] **Step 3: 加迁移与字段**
@@ -325,7 +326,7 @@ pub const SHARE_ACME_EMAIL_KEY: &str = "share_acme_email";
 
 - [ ] **Step 6: 跑测试与门禁**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share_domain`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share_domain`
 Expected: PASS
 
 补齐所有构造点（新增字段会让所有字面量编译失败）：
@@ -371,9 +372,9 @@ git commit -m "feat(share): 增加服务器分享域名与 ACME 设置"
   - `model::{ShareInfo, ShareStatus, ShareList, ShareCandidate, ShareTlsStatus, ShareOptions, ShareManifest, ShareNode, GatewayConfig, GatewayPort, UsageState}`
   - `model::{quota_gb_to_bytes, validate_options}`
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share::naming` 绿；`cargo test --manifest-path src-tauri/Cargo.toml share::model` 绿。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::naming` 绿；`cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::model` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** in_progress ｜ **证据:**（完成时填）
 
 - [ ] **Step 1: 写命名测试**
 
@@ -432,7 +433,7 @@ fn urls_use_https_and_bracket_ipv6() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::naming`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::naming`
 Expected: FAIL，`unresolved import crate::share::naming`
 
 - [ ] **Step 3: 实现 naming 与 model**
@@ -652,7 +653,7 @@ T10 切换 IPC 并删除旧实现后，才在 `share/mod.rs` 根部重导出新�
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::naming`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::naming`
 Expected: PASS
 
 - [ ] **Step 6: 提交**
@@ -677,7 +678,7 @@ git commit -m "feat(share): 分享模型、内部 id 与 token 规则"
 - Produces: `plan::{Eligibility, check_eligibility, share_candidates, tcp_port_probe_cmd, udp_port_probe_cmd}`
 - Consumes: `state.subs.visible_nodes()`, `repos::upstreams::list_by_server`, `repos::privacies::list_all`, `domain::server_owns_addr`, `domain::direct_addr`.
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share::plan` 绿。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::plan` 绿。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -732,7 +733,7 @@ async fn eligibility_rejects_non_shareable_nodes() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::plan`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::plan`
 Expected: FAIL，`unresolved import crate::share::plan`
 
 - [ ] **Step 3: 实现准入与候选**
@@ -808,7 +809,7 @@ pub fn udp_port_probe_cmd(port: u16) -> String {
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::plan`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::plan`
 Expected: PASS
 
 - [ ] **Step 6: 提交**
@@ -833,7 +834,7 @@ git commit -m "feat(share): 节点准入与分享候选清单"
 - Produces: `clone::{ShareNodeSpec, ClonedConfigs, clone_configs}`
 - Consumes: 主配置字符串（Xray/Sing-box/SS）、`Node` 原参数、`config::build_yaml_with_privacy`、`config::singbox::build_singbox_with_privacy`。
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share::clone` 绿。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::clone` 绿。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -909,7 +910,7 @@ fn clone_singbox_rebinds_and_points_cert_to_share_dir() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::clone`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::clone`
 Expected: FAIL，`unresolved import crate::share::clone`
 
 - [ ] **Step 3: 实现克隆**
@@ -1139,7 +1140,7 @@ fn clone_ss(main: &str, specs: &[&ShareNodeSpec]) -> Result<String, String> {
 
 - [ ] **Step 4: 跑测试与全量分享测试**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::clone`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::clone`
 Expected: PASS
 
 - [ ] **Step 5: 提交**
@@ -1172,7 +1173,7 @@ git commit -m "feat(share): 克隆主服务入站并生成分享专属配置"
 - Produces: `scripts::{SHARE_SERVER_PY, SHARE_GATEWAY_PY, SHARE_SUMMARY_PY, FIREWALL_SH}`，以及 `share_server_script()/share_gateway_script()/share_summary_script()/firewall_script()`。
 - Produces: 订阅服务路由 `/sub/<token>`、`/singbox/<token>`；网关 `--config --usage --bind`；摘要脚本输出 JSON 数组。
 
-- **验收:** `python -m unittest discover -s tests/python -v` 全绿；`cargo test --manifest-path src-tauri/Cargo.toml share::scripts` 绿。
+- **验收:** `python -m unittest discover -s tests/python -v` 全绿；`cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::scripts` 绿。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -1820,7 +1821,7 @@ pub fn firewall_script() -> String { FIREWALL_SH.to_string() }
 
 Run: `python -m unittest discover -s tests/python -v`
 Expected: PASS
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::scripts`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::scripts`
 Expected: PASS
 
 - [ ] **Step 6: 提交**
@@ -1845,7 +1846,7 @@ git commit -m "feat(share): 订阅 TLS 服务、入口网关与防火墙脚本"
 - Produces: `tls::{DEPLOY_HOOK_PATH, tls_status, prepare_tls, probe_python3, validate_email, dns_check_cmd, certbot_install_script, certbot_issue_cmd, renewal_hook_content}`
 - Consumes: `servers::load_auth`, `SshSession::connect`, `read_remote_file`, `write_remote_file`, `run_cmd`, `run_cmd_ok`, `scripts::firewall_script`.
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share::tls` 绿。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::tls` 绿。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -1890,7 +1891,7 @@ fn email_validation_rejects_shell_metacharacters() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::tls`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::tls`
 Expected: FAIL，`unresolved import crate::share::tls`
 
 - [ ] **Step 3: 实现纯函数**
@@ -2097,7 +2098,7 @@ Ok(ShareTlsStatus {
 
 - [ ] **Step 6: 跑测试与提交**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::tls`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::tls`
 Expected: PASS
 
 ```bash
@@ -2121,7 +2122,7 @@ git commit -m "feat(share): 域名校验与 certbot 自动 HTTPS"
 - Produces: `install::{CreateShareInput, create_share, create_share_inner, allocate_share_ports, build_specs, read_main, unit_contents, rollback_created}`
 - Produces: `install::create_share(state, input)` 供 T10 的 IPC 调用（T10 再决定是否在 `share` 根重导出）。
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share::install::create` 绿；失败用例断言回滚命令。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::create` 绿；失败用例断言回滚命令。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -2148,7 +2149,7 @@ async fn create_share_rejects_legacy_or_unshareable_nodes_before_ssh() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::install::create`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::create`
 Expected: FAIL，`unresolved import crate::share::install`
 
 - [ ] **Step 3: 实现创建流程**
@@ -2589,7 +2590,7 @@ pub async fn rollback_created(sess: &mut SshSession, cancel: &AtomicBool, id: &s
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::install`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install`
 Expected: PASS
 
 - [ ] **Step 6: 提交**
@@ -2615,7 +2616,7 @@ git commit -m "feat(share): 创建分享的完整编排与回滚"
 - Produces: `install::{list_shares, parse_summary, legacy_info}`；状态统一复用 T7 的 `install::status_from`。
 - Consumes: `share_summary.py` 输出。
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share::install::list` 绿。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::list` 绿。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -2714,7 +2715,7 @@ fn legacy_info(
 
 - [ ] **Step 3: 跑测试**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::install::list`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::list`
 Expected: PASS
 
 - [ ] **Step 4: 提交**
@@ -2738,7 +2739,7 @@ git commit -m "feat(share): 批量列举新旧分享与状态推导"
 **Interfaces:**
 - Produces: `install::{update_share, reset_usage, delete_share}`。
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share::install::manage` 绿。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::manage` 绿。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -3103,7 +3104,7 @@ pub async fn delete_share(
 
 - [ ] **Step 3: 跑测试与提交**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share::install::manage`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::manage`
 Expected: PASS
 
 ```bash
@@ -3128,7 +3129,7 @@ git commit -m "feat(share): 编辑配额、重置用量与作废"
 **Interfaces:**
 - Produces IPC：`list_share_candidates_cmd`、`create_share_cmd(server_id,node_ids,quota_gb,rate_up_mbps,rate_down_mbps,expires_in_days)`、`update_share_cmd(...)`、`reset_share_usage_cmd`、`delete_share_cmd(server_id,id)`、`prepare_share_tls_cmd`、`share_tls_status_cmd`。
 
-- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml share_cmd` 绿；命令注册无遗漏。
+- **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share_cmd` 绿；命令注册无遗漏。
 
 - **状态:** pending ｜ **证据:**（完成时填）
 
@@ -3282,7 +3283,7 @@ pub async fn share_tls_status_cmd(
 
 - [ ] **Step 4: 跑测试与提交**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml share_cmd`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share_cmd`
 Expected: PASS
 
 ```bash
@@ -3487,7 +3488,7 @@ git commit -m "feat(share): 新建向导、编辑面板与 HTTPS 配置入口"
 - [ ] **Step 2: 全量门禁**
 
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml -- --skip net::runtime_tests --skip net::runtime_service_tests
+cargo test --manifest-path src-tauri/Cargo.toml --features local-tests -- --skip net::runtime_tests --skip net::runtime_service_tests
 npx tsc --noEmit
 npm test
 python -m unittest discover -s tests/python -v
