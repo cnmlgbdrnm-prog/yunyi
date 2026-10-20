@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T10（pending）
-- 下一动作：收敛 `share/mod.rs` 根导出并注册 7 个 IPC 命令（`commands/ipc.rs`、`main.rs`），补 `ipc_tests.rs`
+- 当前：T11（pending）
+- 下一动作：更新前端 `api/types.ts`/`api/index.ts` 与 `Shares.tsx` 列表（新 `ShareInfo`/状态/用量/旧版标记），补 `Shares.test.tsx`
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -3131,7 +3131,7 @@ git commit -m "feat(share): 编辑配额、重置用量与作废"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share_cmd` 绿；命令注册无遗漏。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `9697201`；旧 `share/mod.rs` 上删除 738 行后收敛为模块声明 + 根导出 + 旧分享辅助；`cargo test --features local-tests share_cmd` 2 passed；新增 `list_share_candidates_cmd`/`prepare_share_tls_cmd` IPC 用例各 1 passed；`cargo test --features local-tests share::` 55 passed；`main.rs` 与 `ipc_tests` 的 invoke_handler 同步注册 8 条分享命令；`docs/design/ipc-interface-reference.md` 已更新。
 
 - [ ] **Step 1: 删除旧实现，建立根导出**
 
