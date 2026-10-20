@@ -146,7 +146,8 @@ export function listShareCandidates(serverId: number): Promise<ShareCandidate[]>
 export function createShare(
   serverId: number,
   nodeIds: string[],
-  quotaGb: number,
+  quotaUpGb: number,
+  quotaDownGb: number,
   rateUpMbps: number,
   rateDownMbps: number,
   expiresInDays: number,
@@ -154,7 +155,8 @@ export function createShare(
   return invoke('create_share_cmd', {
     serverId,
     nodeIds,
-    quotaGb,
+    quotaUpGb,
+    quotaDownGb,
     rateUpMbps,
     rateDownMbps,
     expiresInDays,
@@ -165,7 +167,8 @@ export function createShare(
 export function updateShare(
   serverId: number,
   id: string,
-  quotaGb: number,
+  quotaUpGb: number,
+  quotaDownGb: number,
   rateUpMbps: number,
   rateDownMbps: number,
   expiresInDays: number,
@@ -173,7 +176,8 @@ export function updateShare(
   return invoke('update_share_cmd', {
     serverId,
     id,
-    quotaGb,
+    quotaUpGb,
+    quotaDownGb,
     rateUpMbps,
     rateDownMbps,
     expiresInDays,

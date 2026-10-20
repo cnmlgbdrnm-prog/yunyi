@@ -212,7 +212,13 @@ async fn create_share_inner_with_domain(
         token: token.clone(),
         server_id: server.id,
         created_at: chrono::Utc::now().to_rfc3339(),
-        quota_bytes: input.options.quota_bytes,
+        // 旧字段写成上下行之和，便于降级展示；判停以 quota_up/down 为准。
+        quota_bytes: input
+            .options
+            .quota_up_bytes
+            .saturating_add(input.options.quota_down_bytes),
+        quota_up_bytes: Some(input.options.quota_up_bytes),
+        quota_down_bytes: Some(input.options.quota_down_bytes),
         rate_up_mbps: input.options.rate_up_mbps,
         rate_down_mbps: input.options.rate_down_mbps,
         expires_at_unix,
@@ -222,6 +228,8 @@ async fn create_share_inner_with_domain(
     };
     let gateway = GatewayConfig {
         quota_bytes: manifest.quota_bytes,
+        quota_up_bytes: manifest.quota_up_bytes,
+        quota_down_bytes: manifest.quota_down_bytes,
         rate_up_mbps: manifest.rate_up_mbps,
         rate_down_mbps: manifest.rate_down_mbps,
         expires_at_unix,
@@ -528,7 +536,14 @@ async fn create_share_inner_with_domain(
 /// 展示用状态：配额按 `used >= quota` 判定（不依赖时钟）；到期用本机时钟近似，
 /// 真正的断开由网关按服务器时钟执行。
 pub(crate) fn status_from(m: &ShareManifest, u: &UsageState, active: bool) -> ShareStatus {
-    let quota_hit = m.quota_bytes > 0 && u.used_bytes >= m.quota_bytes;
+    let split = m.uses_split_quota();
+    let (used_up, used_down) = u.direction_counts(split);
+    let quota_hit = if split {
+        (m.quota_up() > 0 && used_up >= m.quota_up())
+            || (m.quota_down() > 0 && used_down >= m.quota_down())
+    } else {
+        m.quota_bytes > 0 && u.used_bytes >= m.quota_bytes
+    };
     let expired =
         m.expires_at_unix > 0 && chrono::Utc::now().timestamp() >= m.expires_at_unix;
     if u.blocked.as_deref() == Some("quota") || quota_hit {
@@ -542,6 +557,16 @@ pub(crate) fn status_from(m: &ShareManifest, u: &UsageState, active: bool) -> Sh
     }
 }
 
+/// 状态提示：配额停用时点名是哪个方向超了，其它停用原因保持原样。
+pub(crate) fn status_detail_from(u: &UsageState) -> Option<String> {
+    match (u.blocked.as_deref(), u.blocked_direction.as_deref()) {
+        (Some("quota"), Some("up")) => Some("上行配额已用完".to_string()),
+        (Some("quota"), Some("down")) => Some("下行配额已用完".to_string()),
+        (Some("quota"), _) => Some("配额已用完".to_string()),
+        (other, _) => other.map(str::to_string),
+    }
+}
+
 pub(crate) fn info_from_manifest(
     m: &ShareManifest,
     u: &UsageState,
@@ -549,6 +574,19 @@ pub(crate) fn info_from_manifest(
     active: bool,
 ) -> ShareInfo {
     let status = status_from(m, u, active);
+    let split = m.uses_split_quota();
+    let (used_up, used_down) = u.direction_counts(split);
+    let used_bytes = if split {
+        used_up.saturating_add(used_down)
+    } else {
+        u.used_bytes
+    };
+    let quota_bytes = if split {
+        m.quota_up().saturating_add(m.quota_down())
+    } else {
+        m.quota_bytes
+    };
+    let status_detail = status_detail_from(u);
     ShareInfo {
         id: m.id.clone(),
         server_id: m.server_id,
@@ -562,9 +600,14 @@ pub(crate) fn info_from_manifest(
         node_names: m.nodes.iter().map(|n| n.name.clone()).collect(),
         legacy: false,
         status,
-        status_detail: u.blocked.clone(),
-        quota_bytes: m.quota_bytes,
-        used_bytes: u.used_bytes,
+        status_detail,
+        quota_bytes,
+        used_bytes,
+        quota_up_bytes: m.quota_up(),
+        quota_down_bytes: m.quota_down(),
+        used_up_bytes: used_up,
+        used_down_bytes: used_down,
+        split_quota: split,
         rate_up_mbps: m.rate_up_mbps,
         rate_down_mbps: m.rate_down_mbps,
         expires_at: chrono::DateTime::from_timestamp(m.expires_at_unix, 0)
@@ -1215,6 +1258,11 @@ pub(crate) fn legacy_info(
         status_detail: Some("旧版·无管控".into()),
         quota_bytes: 0,
         used_bytes: 0,
+        quota_up_bytes: 0,
+        quota_down_bytes: 0,
+        used_up_bytes: 0,
+        used_down_bytes: 0,
+        split_quota: false,
         rate_up_mbps: 0,
         rate_down_mbps: 0,
         expires_at: None,
@@ -1259,7 +1307,11 @@ pub async fn update_share(
 
     let expires_at_unix =
         server_now_unix(&mut sess, &cancel).await? + options.expires_in_days as i64 * 86400;
-    manifest.quota_bytes = options.quota_bytes;
+    manifest.quota_bytes = options
+        .quota_up_bytes
+        .saturating_add(options.quota_down_bytes);
+    manifest.quota_up_bytes = Some(options.quota_up_bytes);
+    manifest.quota_down_bytes = Some(options.quota_down_bytes);
     manifest.rate_up_mbps = options.rate_up_mbps;
     manifest.rate_down_mbps = options.rate_down_mbps;
     manifest.expires_at_unix = expires_at_unix;
@@ -1267,6 +1319,7 @@ pub async fn update_share(
 
     usage.blocked = None;
     usage.blocked_at = None;
+    usage.blocked_direction = None;
     usage.updated_at = chrono::Utc::now().to_rfc3339();
 
     let gw_unit = gateway_unit_name(id);
@@ -1280,6 +1333,17 @@ pub async fn update_share(
     .await?;
 
     let write_result = async {
+        // 网关脚本是所有分享共用的。旧分享在服务器重启/单元重启后也会加载它，
+        // 因此升级脚本必须保持对旧 gateway.json（只有 quota_bytes）的兼容。
+        write_remote_file(
+            &mut sess,
+            &cancel,
+            "写入",
+            &share_gateway_script_path(),
+            &scripts::share_gateway_script(),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
         write_remote_file(
             &mut sess,
             &cancel,
@@ -1608,6 +1672,8 @@ async fn read_usage(
 fn gateway_from_manifest(m: &ShareManifest) -> GatewayConfig {
     GatewayConfig {
         quota_bytes: m.quota_bytes,
+        quota_up_bytes: m.quota_up_bytes,
+        quota_down_bytes: m.quota_down_bytes,
         rate_up_mbps: m.rate_up_mbps,
         rate_down_mbps: m.rate_down_mbps,
         expires_at_unix: m.expires_at_unix,

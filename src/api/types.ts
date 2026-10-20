@@ -242,8 +242,16 @@ export interface ShareInfo {
   legacy: boolean
   status: ShareStatus
   status_detail: string | null
+  /** 旧口径合计配额；新分享为上下行配额之和 */
   quota_bytes: number
   used_bytes: number
+  /** 上下行各自独立配额；0 = 该方向不限 */
+  quota_up_bytes: number
+  quota_down_bytes: number
+  used_up_bytes: number
+  used_down_bytes: number
+  /** true = 上下行分别判停；false = 旧分享的合计口径 */
+  split_quota: boolean
   rate_up_mbps: number
   rate_down_mbps: number
   expires_at: string | null
