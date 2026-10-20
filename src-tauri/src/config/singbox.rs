@@ -12,8 +12,10 @@
 //! 来源策略：clash_raw 是 Clash 字段体系，不能透传——解析 YAML 片段后按映射表取
 //! 基础字段（type 改名 ss→shadowsocks、server、port→server_port、cipher→method 仅 ss、
 //! password/uuid 直传），其余键忽略不映射（原始 params_json 不丢失）；URI 来源按
-//! 协议映射基础字段。传输层（ws/grpc 等 transport 对象）与 reality 选项属 P7 规格
-//! 范围外：只映射 tls 基础（enabled/server_name/insecure），未知键一律忽略。
+//! 协议映射基础字段。传输层（ws/grpc 等 transport 对象）属 P7 规格范围外；tls 映射
+//! enabled/server_name/insecure，REALITY 节点另映射 `tls.reality` 与 uTLS 指纹——
+//! 少了它们客户端握手会直接失败。DNS 采用 sing-box 1.12+ 的对象形式（字符串形式在
+//! 1.13 起 FATAL）。未知键一律忽略。
 //!
 //! ssr 协议（sing-box 自 1.6.0 起移除 SSR 支持）与 build_yaml 同策略跳过并计数，
 //! clash_raw type 为 ssr 同样不豁免。
@@ -74,7 +76,13 @@ pub fn build_singbox_with_privacy(
 
     let root = serde_json::json!({
         "log": { "level": "info" },
-        "dns": { "servers": ["1.1.1.1", "tls://dns.google"] },
+        // sing-box 1.12+ 只接受对象形式的 DNS server；字符串形式在 1.13 起直接
+        // FATAL（真机用 1.13.20 / 1.14.3 验证）。用 IP 避免 TLS 域名需要额外
+        // domain_resolver。
+        "dns": { "servers": [
+            { "type": "udp", "server": "1.1.1.1" },
+            { "type": "udp", "server": "8.8.8.8" },
+        ] },
         "inbounds": [{
             "type": "mixed",
             "listen": "127.0.0.1",
@@ -340,6 +348,9 @@ fn wireguard_outbound(n: &Node, params: &Value) -> Value {
 
 /// tls 基础对象：enabled 恒 true，server_name 取 sni，insecure 由
 /// skip-cert-verify/allowInsecure/insecure 任一为 "true"/"1" 判定；只输出可确定的字段。
+///
+/// REALITY 节点必须带 `tls.reality`（公钥/short_id），否则 sing-box 会把它当普通
+/// TLS 握手，连接在证书阶段就失败。uTLS 指纹也只在参数里明确给出时输出。
 fn tls_basic(params: &Value) -> Value {
     let mut t = Map::new();
     t.insert("enabled".into(), Value::Bool(true));
@@ -349,6 +360,29 @@ fn tls_basic(params: &Value) -> Value {
     }
     if skip_cert_verify_true(params) {
         t.insert("insecure".into(), Value::Bool(true));
+    }
+    let mut fingerprint = str_param(params, "fingerprint");
+    if fingerprint.is_empty() {
+        fingerprint = str_param(params, "client-fingerprint");
+    }
+    if !fingerprint.is_empty() {
+        t.insert(
+            "utls".into(),
+            serde_json::json!({ "enabled": true, "fingerprint": fingerprint }),
+        );
+    }
+    if str_param(params, "security") == "reality" {
+        let mut r = Map::new();
+        r.insert("enabled".into(), Value::Bool(true));
+        let public_key = str_param(params, "public-key");
+        if !public_key.is_empty() {
+            r.insert("public_key".into(), Value::String(public_key));
+        }
+        let short_id = str_param(params, "short-id");
+        if !short_id.is_empty() {
+            r.insert("short_id".into(), Value::String(short_id));
+        }
+        t.insert("reality".into(), Value::Object(r));
     }
     Value::Object(t)
 }
