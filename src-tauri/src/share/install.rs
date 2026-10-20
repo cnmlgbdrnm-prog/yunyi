@@ -1103,3 +1103,425 @@ pub(crate) fn legacy_info(
         last_access_ip: None,
     }
 }
+
+// ---------- 编辑 / 重置用量 / 作废 ----------
+
+/// 编辑配额、速率与到期。**保留已用字节**，只清除「已停用」标记——用户提高配额
+/// 或续期后网关重新开始转发；若新配额仍低于已用量，状态仍会显示超额（下次计费
+/// 时网关会立刻再次停用）。
+pub async fn update_share(
+    state: &Arc<AppState>,
+    server_id: i64,
+    id: &str,
+    options: ShareOptions,
+) -> Result<ShareInfo, String> {
+    if !is_valid_id(id) {
+        return Err("分享 id 非法".into());
+    }
+    validate_options(&options)?;
+    let (auth, server) =
+        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
+    let mut sess = SshSession::connect(
+        effective_host(&server),
+        server.port as u16,
+        &server.user,
+        &auth,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("连接服务器失败: {e}"))?;
+    let cancel = AtomicBool::new(false);
+
+    let mut manifest = read_new_manifest(&mut sess, &cancel, id).await?;
+    if manifest.server_id != server_id {
+        return Err("分享不属于该服务器".into());
+    }
+    let mut usage = read_usage(&mut sess, &cancel, id).await?;
+
+    let expires_at_unix =
+        server_now_unix(&mut sess, &cancel).await? + options.expires_in_days as i64 * 86400;
+    manifest.quota_bytes = options.quota_bytes;
+    manifest.rate_up_mbps = options.rate_up_mbps;
+    manifest.rate_down_mbps = options.rate_down_mbps;
+    manifest.expires_at_unix = expires_at_unix;
+    let gateway = gateway_from_manifest(&manifest);
+
+    usage.blocked = None;
+    usage.blocked_at = None;
+    usage.updated_at = chrono::Utc::now().to_rfc3339();
+
+    let gw_unit = gateway_unit_name(id);
+    run_cmd_ok(
+        &mut sess,
+        &cancel,
+        "停止网关",
+        &format!("systemctl stop {gw_unit}"),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+
+    let write_result = async {
+        write_remote_file(
+            &mut sess,
+            &cancel,
+            "写入",
+            &manifest_path(id),
+            &serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            &mut sess,
+            &cancel,
+            "写入",
+            &gateway_config_path(id),
+            &serde_json::to_string_pretty(&gateway).map_err(|e| e.to_string())?,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            &mut sess,
+            &cancel,
+            "写入",
+            &usage_path(id),
+            &serde_json::to_string(&usage).map_err(|e| e.to_string())?,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        Ok::<(), String>(())
+    }
+    .await;
+    // 配置写失败也要试着把网关拉起来：半成品配置可能起不来，但让它一直停着
+    // 更糟（用户失去所有连接且没有任何自动恢复）。
+    let start_result = run_cmd_ok(
+        &mut sess,
+        &cancel,
+        "启动网关",
+        &format!("systemctl start {gw_unit}"),
+        CONFIG_TIMEOUT,
+    )
+    .await;
+    if let Err(e) = write_result {
+        return Err(format!("更新分享配置失败：{e}（已尝试重启网关）"));
+    }
+    start_result.map_err(|e| format!("启动网关失败：{e}"))?;
+    ensure_gateway_active(&mut sess, &cancel, &gw_unit).await?;
+
+    Ok(info_from_manifest(&manifest, &usage, &server, true))
+}
+
+/// 重置用量：把 `usage.json` 归零并重启网关。到期时间与配额不变；已到期的分享
+/// 会在网关启动时立刻再次停用。
+pub async fn reset_usage(
+    state: &Arc<AppState>,
+    server_id: i64,
+    id: &str,
+) -> Result<ShareInfo, String> {
+    if !is_valid_id(id) {
+        return Err("分享 id 非法".into());
+    }
+    let (auth, server) =
+        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
+    let mut sess = SshSession::connect(
+        effective_host(&server),
+        server.port as u16,
+        &server.user,
+        &auth,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("连接服务器失败: {e}"))?;
+    let cancel = AtomicBool::new(false);
+    let manifest = read_new_manifest(&mut sess, &cancel, id).await?;
+    if manifest.server_id != server_id {
+        return Err("分享不属于该服务器".into());
+    }
+    let usage = UsageState::default();
+    let gw_unit = gateway_unit_name(id);
+    run_cmd_ok(
+        &mut sess,
+        &cancel,
+        "停止网关",
+        &format!("systemctl stop {gw_unit}"),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    let write_result = write_remote_file(
+        &mut sess,
+        &cancel,
+        "重置用量",
+        &usage_path(id),
+        &serde_json::to_string(&usage).map_err(|e| e.to_string())?,
+        CONFIG_TIMEOUT,
+    )
+    .await;
+    let start_result = run_cmd_ok(
+        &mut sess,
+        &cancel,
+        "启动网关",
+        &format!("systemctl start {gw_unit}"),
+        CONFIG_TIMEOUT,
+    )
+    .await;
+    if let Err(e) = write_result {
+        return Err(format!("重置用量失败：{e}（已尝试重启网关）"));
+    }
+    start_result.map_err(|e| format!("启动网关失败：{e}"))?;
+    ensure_gateway_active(&mut sess, &cancel, &gw_unit).await?;
+    Ok(info_from_manifest(&manifest, &usage, &server, true))
+}
+
+/// 作废分享：停单元、删单元/目录、撤端口放行。幂等——重复调用不报错。
+/// 旧分享没有 `share.json`，端口从单元文件解析；新旧两种防火墙注释都清。
+pub async fn delete_share(
+    state: &Arc<AppState>,
+    server_id: i64,
+    id: &str,
+) -> Result<(), String> {
+    if !is_valid_id(id) {
+        return Err("分享 id 非法".into());
+    }
+    let (auth, server) =
+        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
+    let mut sess = SshSession::connect(
+        effective_host(&server),
+        server.port as u16,
+        &server.user,
+        &auth,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("连接服务器失败: {e}"))?;
+    let cancel = AtomicBool::new(false);
+
+    let manifest: Option<ShareManifest> = match read_remote_file(
+        &mut sess,
+        &cancel,
+        "读取",
+        &manifest_path(id),
+        PROBE_TIMEOUT,
+    )
+    .await?
+    {
+        RemoteFile::Absent => None,
+        RemoteFile::Content(c) => serde_json::from_str(&c).ok(),
+    };
+    let mut ports: Vec<(u16, &'static str)> = Vec::new();
+    match &manifest {
+        Some(m) => {
+            for n in &m.nodes {
+                match n.transport.as_str() {
+                    "tcp_and_udp" => {
+                        ports.push((n.public_port, "tcp"));
+                        ports.push((n.public_port, "udp"));
+                    }
+                    "tcp" => ports.push((n.public_port, "tcp")),
+                    "udp" => ports.push((n.public_port, "udp")),
+                    _ => {}
+                }
+            }
+        }
+        None => {
+            // 旧分享：端口的事实源是单元文件。
+            if let RemoteFile::Content(unit) = read_remote_file(
+                &mut sess,
+                &cancel,
+                "读取",
+                &unit_path(&unit_name(id)),
+                PROBE_TIMEOUT,
+            )
+            .await?
+            {
+                if let Some(p) = crate::share::parse_port_from_unit(&unit) {
+                    ports.push((p, "tcp"));
+                }
+            }
+        }
+    }
+    // 单元文件也没了（旧分享被手工清理过）时，从残留的防火墙规则里找回端口，
+    // 否则那条 ACCEPT 会永远留在链上。
+    if ports.is_empty() {
+        let rules = run_cmd(
+            &mut sess,
+            &cancel,
+            "读取",
+            &format!("iptables -S INPUT | grep -- 'vpnshare-{id}'"),
+            PROBE_TIMEOUT,
+        )
+        .await
+        .map(|o| o.stdout)
+        .unwrap_or_default();
+        for line in rules.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let proto = words
+                .iter()
+                .position(|w| *w == "-p")
+                .and_then(|i| words.get(i + 1))
+                .copied();
+            let port = words
+                .iter()
+                .position(|w| *w == "--dport")
+                .and_then(|i| words.get(i + 1))
+                .and_then(|p| p.parse().ok());
+            match (proto, port) {
+                (Some("tcp"), Some(p)) => ports.push((p, "tcp")),
+                (Some("udp"), Some(p)) => ports.push((p, "udp")),
+                _ => {}
+            }
+        }
+    }
+    ports.sort();
+    ports.dedup();
+
+    for unit in [
+        unit_name(id),
+        gateway_unit_name(id),
+        instance_unit_name(id, "xray"),
+        instance_unit_name(id, "singbox"),
+        instance_unit_name(id, "ss"),
+    ] {
+        // 单元可能本来就不存在，所以 disable 失败可以忽略；但**停没停**必须核验：
+        // 进程还在跑就删目录会把「作废」变成一句空话（已下载配置仍能连）。
+        run_cmd_ok(
+            &mut sess,
+            &cancel,
+            "作废",
+            &format!("systemctl disable --now {unit} 2>/dev/null || true"),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        let state = run_cmd(
+            &mut sess,
+            &cancel,
+            "作废",
+            &format!("systemctl is-active {unit}"),
+            PROBE_TIMEOUT,
+        )
+        .await?
+        .stdout
+        .trim()
+        .to_string();
+        if state == "active" || state == "activating" || state == "deactivating" {
+            return Err(format!(
+                "单元 {unit} 未能停止（systemctl：{state}），作废中止，请稍后重试"
+            ));
+        }
+        run_cmd_ok(
+            &mut sess,
+            &cancel,
+            "作废",
+            &format!("rm -f {}", unit_path(&unit)),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+    }
+    run_cmd_ok(
+        &mut sess,
+        &cancel,
+        "作废",
+        &format!("rm -rf {}", share_dir(id)),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+
+    for (port, proto) in ports {
+        // 新格式注释带端口/proto；旧格式注释只有 vpnshare-<id>。两种都清，
+        // 否则升级过的旧分享会在端口上留一条永久放行规则。
+        for comment in [
+            format!("vpnshare-{id}-{port}-{proto}"),
+            format!("vpnshare-{id}"),
+        ] {
+            let _ = run_cmd(
+                &mut sess,
+                &cancel,
+                "撤防火墙",
+                &format!(
+                    "while iptables -C INPUT -p {proto} --dport {port} -m comment --comment \"{comment}\" -j ACCEPT 2>/dev/null; do \
+                     iptables -D INPUT -p {proto} --dport {port} -m comment --comment \"{comment}\" -j ACCEPT || break; done"
+                ),
+                CONFIG_TIMEOUT,
+            )
+            .await;
+        }
+    }
+    run_cmd_ok(
+        &mut sess,
+        &cancel,
+        "作废",
+        "systemctl daemon-reload",
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn read_new_manifest(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    id: &str,
+) -> Result<ShareManifest, String> {
+    match read_remote_file(sess, cancel, "读取", &manifest_path(id), PROBE_TIMEOUT).await? {
+        RemoteFile::Absent => Err("分享不存在或不是新版分享".into()),
+        RemoteFile::Content(c) => {
+            let manifest: ShareManifest =
+                serde_json::from_str(&c).map_err(|e| format!("分享清单损坏: {e}"))?;
+            if manifest.id != id {
+                return Err("分享清单与 id 不一致".into());
+            }
+            Ok(manifest)
+        }
+    }
+}
+
+/// 用量文件缺失或内容损坏时按 0 处理；**读取命令本身失败必须上报**——把读失败
+/// 当成 0 会在编辑时静默清空已用字节。
+async fn read_usage(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    id: &str,
+) -> Result<UsageState, String> {
+    match read_remote_file(sess, cancel, "读取", &usage_path(id), PROBE_TIMEOUT).await? {
+        RemoteFile::Content(c) => Ok(serde_json::from_str(&c).unwrap_or_default()),
+        RemoteFile::Absent => Ok(UsageState::default()),
+    }
+}
+
+fn gateway_from_manifest(m: &ShareManifest) -> GatewayConfig {
+    GatewayConfig {
+        quota_bytes: m.quota_bytes,
+        rate_up_mbps: m.rate_up_mbps,
+        rate_down_mbps: m.rate_down_mbps,
+        expires_at_unix: m.expires_at_unix,
+        ports: m
+            .nodes
+            .iter()
+            .map(|n| GatewayPort {
+                public: n.public_port,
+                target: n.internal_port,
+                proto: n.transport.clone(),
+            })
+            .collect(),
+    }
+}
+
+async fn ensure_gateway_active(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    gw_unit: &str,
+) -> Result<(), String> {
+    let out = run_cmd(
+        sess,
+        cancel,
+        "确认",
+        &format!("systemctl is-active {gw_unit}"),
+        PROBE_TIMEOUT,
+    )
+    .await?;
+    if out.stdout.trim() != "active" {
+        return Err(format!(
+            "网关 {gw_unit} 未进入 active 状态（systemctl：{}）",
+            out.stdout.trim()
+        ));
+    }
+    Ok(())
+}
