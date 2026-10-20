@@ -213,18 +213,42 @@ export interface ExportableNode {
   skip_reason: string | null
 }
 
-/** 一份已安装到服务器上的分享链接（状态实读自服务器，本地不存记录） */
+export type ShareStatus =
+  | 'active'
+  | 'blocked_quota'
+  | 'blocked_expired'
+  | 'degraded'
+  | 'legacy'
+
+/** 一份已安装到服务器上的分享（状态/用量实读自服务器，本地不存记录） */
 export interface ShareInfo {
+  /** 内部 id：路径与单元名用它，不出现在 URL 里 */
+  id: string
   server_id: number
   server_name: string
   host: string
+  /** URL token（新分享 32 位；旧分享 = id） */
   token: string
+  /** 订阅服务端口 */
   port: number
-  /** http://<host>:<port>/sub/<token> */
+  active: boolean
+  /** 新分享：https://<域名>:<端口>/sub/<token>；旧分享：明文 HTTP */
   url: string
+  /** 新分享的 sing-box JSON 链接；旧分享为空串 */
+  url_singbox: string
   /** 快照里的节点名（解析不出时为空数组） */
   node_names: string[]
-  active: boolean
+  /** true = 旧版分享：无配额/限速/到期，只能复制 YAML 或作废 */
+  legacy: boolean
+  status: ShareStatus
+  status_detail: string | null
+  quota_bytes: number
+  used_bytes: number
+  rate_up_mbps: number
+  rate_down_mbps: number
+  expires_at: string | null
+  last_access_at: string | null
+  last_access_ip: string | null
 }
 
 /**
@@ -235,6 +259,21 @@ export interface ShareInfo {
 export interface ShareList {
   shares: ShareInfo[]
   unreachable: string[]
+}
+
+/** 新建向导的节点候选：`shareable=false` 时 `reason` 说明置灰原因。 */
+export interface ShareCandidate {
+  node: Node
+  shareable: boolean
+  reason: string | null
+}
+
+/** 分享 HTTPS 状态：`ready=false` 时 `detail` 给出配置入口/失败原因。 */
+export interface ShareTlsStatus {
+  domain: string
+  ready: boolean
+  cert_expires_at: string | null
+  detail: string
 }
 
 /** 应用更新信息：check 到的新版本与下载安装入口；downloadAndInstall 成功后由 updater 自动重启应用 */
