@@ -140,15 +140,20 @@ Server(("0.0.0.0", int(sys.argv[1])), H).serve_forever()
 /// 等于把 token 公示给任何扫到端口的人（#1）。
 /// 参数顺序与脚本约定一致：`<port> <dir>`（见 `share_server_script` 的 argv 说明）。
 /// 用 `/usr/bin/env python3` 而非硬编码路径——python3 装在哪儿由 PATH 说了算。
-pub fn unit_content(token: &str, port: u16) -> String {
+pub(crate) fn unit_content(token: &str, port: u16) -> String {
     let dir = share_dir(token);
     let script = share_server_script_path();
+    // 旧分享仍以 root 明文 HTTP 运行；这里只补防火墙持久化：重启后由
+    // ExecStartPost 以 root 重新放行端口，停止时自动撤回（A5）。
+    let firewall = crate::share::naming::firewall_script_path();
     format!(
         "[Unit]\n\
          Description=vpn-ctl share {token}\n\
          \n\
          [Service]\n\
          ExecStart=/usr/bin/env python3 {script} {port} {dir}\n\
+         ExecStartPost=+{firewall} open vpnshare-{token} {port}:tcp\n\
+         ExecStopPost=+{firewall} close vpnshare-{token} {port}:tcp\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -203,7 +208,7 @@ pub fn url_for(host: &str, port: u16, token: &str) -> String {
 /// - 旧形态 `… python3 -m http.server <port> --directory <dir> …`
 ///   ——旧形态只在**升级既有分享**时用到：升级必须沿用原端口，换端口等于把已经
 ///   发出去的链接当场作废。升级动作本身会把旧形态改成新形态（见 `read_server_shares`）。
-pub fn parse_port_from_unit(unit: &str) -> Option<u16> {
+pub(crate) fn parse_port_from_unit(unit: &str) -> Option<u16> {
     let markers = [
         format!("{SHARE_SERVER_SCRIPT_NAME} "),
         "-m http.server ".to_string(),
@@ -218,13 +223,16 @@ pub fn parse_port_from_unit(unit: &str) -> Option<u16> {
     None
 }
 
-/// 单元是不是**旧形态**（还在跑会列目录的 `python3 -m http.server`）。
+/// 单元是不是**旧形态**：还在跑会列目录的 `python3 -m http.server`，
+/// 或者缺少防火墙持久化（重启后端口不会自动重新放行）。
 ///
-/// 判据是「ExecStart 里有没有指向我们的脚本」而不是逐字比对模板：模板将来再动
-/// （加 Environment、换 Restart 策略）不会把已升级的分享误判成要升级、反复重启。
-/// 读不到单元内容（空串）时返回 false——没有单元就没有端口，无从升级。
-pub fn unit_needs_upgrade(unit: &str) -> bool {
-    unit.contains("ExecStart=") && !unit.contains(SHARE_SERVER_SCRIPT_NAME)
+/// 判据是「ExecStart 里有没有指向我们的脚本」「有没有防火墙助手」而不是逐字比对
+/// 模板：模板将来再动（加 Environment、换 Restart 策略）不会把已升级的分享误判成
+/// 要升级、反复重启。读不到单元内容（空串）时返回 false——没有单元就没有端口，
+/// 无从升级。
+pub(crate) fn unit_needs_upgrade(unit: &str) -> bool {
+    unit.contains("ExecStart=")
+        && (!unit.contains(SHARE_SERVER_SCRIPT_NAME) || !unit.contains("vpnshare-firewall.sh"))
 }
 
 /// 从服务器本地把链接真取一次，返回 HTTP 状态码。
@@ -641,7 +649,7 @@ async fn read_server_shares(
 /// **端口与 iptables 规则一律不动**：已发出去的链接必须继续可用，升级只是把文档根的
 /// 服务从会列目录的 `http.server` 换成 [`share_server_script`]。
 /// 幂等：调用点先用 [`unit_needs_upgrade`] 判定，已是新形态的分享不会被反复重启。
-async fn upgrade_share_unit(
+pub(crate) async fn upgrade_share_unit(
     sess: &mut SshSession,
     cancel: &AtomicBool,
     token: &str,
@@ -656,12 +664,43 @@ async fn upgrade_share_unit(
         CONFIG_TIMEOUT,
     )
     .await?;
+    // 新单元用防火墙助手做启动放行/停止撤回，脚本必须先落盘再重启。
+    let firewall = crate::share::naming::firewall_script_path();
+    write_remote_file(
+        sess,
+        cancel,
+        "升级",
+        &firewall,
+        &scripts::firewall_script(),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    run_cmd_ok(
+        sess,
+        cancel,
+        "升级",
+        &format!("chmod 755 {firewall}"),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
     write_remote_file(
         sess,
         cancel,
         "升级",
         &unit_path(token),
         &unit_content(token, port),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    // 旧规则用 `vpnshare-<token>` 注释；新单元由 ExecStartPost 用
+    // `vpnshare-<token>-<port>-tcp` 重开。先删旧规则，避免同一端口叠两条。
+    run_cmd_ok(
+        sess,
+        cancel,
+        "升级",
+        &format!(
+            "iptables -D INPUT -p tcp --dport {port} -m comment --comment \"vpnshare-{token}\" -j ACCEPT 2>/dev/null || true"
+        ),
         CONFIG_TIMEOUT,
     )
     .await?;
@@ -791,7 +830,7 @@ fn new_token() -> String {
 
 /// 从生成的 YAML 里取 proxies 的名字，用于 UI 展示「这条链接里有哪几条线」。
 /// 解析不出来就返回空——列表少一列信息，好过整页报错。
-fn proxy_names(yaml: &str) -> Vec<String> {
+pub(crate) fn proxy_names(yaml: &str) -> Vec<String> {
     let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
         return vec![];
     };
