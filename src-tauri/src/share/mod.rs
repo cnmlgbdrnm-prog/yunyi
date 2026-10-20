@@ -28,6 +28,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+pub mod model;
+pub mod naming;
+
 /// 服务器上所有分享的根目录。
 pub const SHARE_ROOT: &str = "/srv/vpnshare";
 /// systemd 单元名前缀（完整名：`vpnshare-<token>`）。
