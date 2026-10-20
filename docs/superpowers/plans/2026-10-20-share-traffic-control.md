@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T7（pending）
-- 下一动作：实现 `share/install.rs` 的创建编排（端口分配、配置克隆、单元生成、健康校验、失败回滚）并写 `install_tests.rs`
+- 当前：T8（pending）
+- 下一动作：实现 `share/install.rs` 的列举（`share_summary.py` 新格式 + 旧分享只读入口）并写 `list_tests.rs`
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -2124,7 +2124,7 @@ git commit -m "feat(share): 域名校验与 certbot 自动 HTTPS"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::create` 绿；失败用例断言回滚命令。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `ccd8fb1`；`cargo test --features local-tests share::install` 9 passed（准入先于 SSH、TLS 未就绪拒绝、缺主配置不写文件、端口顺延、凭据轮换、成功落盘 manifest/gateway/YAML/JSON/单元、写失败与启动失败均回滚并撤端口）。
 
 - [ ] **Step 1: 写创建失败测试**
 
