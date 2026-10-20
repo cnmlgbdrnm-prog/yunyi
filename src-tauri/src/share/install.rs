@@ -22,7 +22,8 @@ use crate::share::plan::{tcp_port_probe_cmd, udp_port_probe_cmd};
 use crate::share::{scripts, tls};
 use crate::ssh::SshSession;
 use crate::state::AppState;
-use std::collections::HashSet;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -832,4 +833,273 @@ pub(crate) async fn rollback_created(
     )
     .await;
     leftovers
+}
+
+// ---------- 列举 ----------
+
+/// `share_summary.py` 的一条记录。新分享带 manifest/usage/last_access/units；
+/// 旧分享只有 unit/snapshot/active。
+#[derive(Debug, Deserialize)]
+pub struct SummaryEntry {
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub manifest: Option<ShareManifest>,
+    #[serde(default)]
+    pub usage: Option<UsageState>,
+    #[serde(default)]
+    pub last_access: Option<LastAccess>,
+    #[serde(default)]
+    pub units: Option<HashMap<String, Option<String>>>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub snapshot: Option<String>,
+    #[serde(default)]
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LastAccess {
+    pub at: String,
+    pub ip: String,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+pub fn parse_summary(json: &str) -> Result<Vec<SummaryEntry>, String> {
+    serde_json::from_str(json).map_err(|e| format!("分享摘要解析失败: {e}"))
+}
+
+/// 逐服务器并发列举。某台连不上不整体失败：好那台照常列出，坏那台进
+/// `unreachable` 并带原因——否则用户会以为分享凭空消失了。
+pub async fn list_shares(state: &Arc<AppState>) -> Result<ShareList, String> {
+    let servers =
+        crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
+
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, server) in servers.into_iter().enumerate() {
+        let state = state.clone();
+        set.spawn(async move {
+            let cancel = AtomicBool::new(false);
+            let name = server.name.clone();
+            (
+                idx,
+                name,
+                read_server_summaries(&state, &server, &cancel).await,
+            )
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(t) => results.push(t),
+            Err(e) => return Err(format!("读取分享的任务异常结束: {e}")),
+        }
+    }
+    results.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut shares = Vec::new();
+    let mut unreachable = Vec::new();
+    for (_, name, r) in results {
+        match r {
+            Ok(mut list) => shares.append(&mut list),
+            Err(reason) => unreachable.push(format!("{name}：{reason}")),
+        }
+    }
+    Ok(ShareList {
+        shares,
+        unreachable,
+    })
+}
+
+async fn read_server_summaries(
+    state: &Arc<AppState>,
+    server: &Server,
+    cancel: &AtomicBool,
+) -> Result<Vec<ShareInfo>, String> {
+    let (auth, _) = crate::servers::load_auth(state, server.id).map_err(|e| e.to_string())?;
+    let mut sess = SshSession::connect(
+        effective_host(server),
+        server.port as u16,
+        &server.user,
+        &auth,
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("连接服务器失败: {e}"))?;
+
+    // 摘要脚本只读；每次列举幂等重写，服务器重装/首次列举都能自愈。
+    let summary_script = share_summary_script_path();
+    write_remote_file(
+        &mut sess,
+        cancel,
+        "写入",
+        &summary_script,
+        &scripts::share_summary_script(),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    run_cmd_ok(
+        &mut sess,
+        cancel,
+        "准备",
+        &format!("chmod 755 {summary_script}"),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    let out = run_cmd_ok(
+        &mut sess,
+        cancel,
+        "列举",
+        &format!("python3 {summary_script} {SHARE_ROOT}"),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    let entries = parse_summary(&out.stdout)?;
+
+    let mut shares = Vec::new();
+    for entry in entries {
+        match entry.kind.as_str() {
+            "new" => {
+                if let Some(info) = new_info(server, entry) {
+                    shares.push(info);
+                }
+            }
+            "legacy" => {
+                // `/srv/vpnshare/tls` 等非分享目录也会出现在摘要里；不是 16 位 id
+                // 的一律不是旧分享。
+                if !is_valid_id(&entry.id) {
+                    continue;
+                }
+                let unit = entry.unit.clone().unwrap_or_default();
+                let mut active = entry.active.unwrap_or(false);
+                if !unit.is_empty() && crate::share::unit_needs_upgrade(&unit) {
+                    let port = crate::share::parse_port_from_unit(&unit).unwrap_or(0);
+                    if port != 0 {
+                        crate::share::upgrade_share_unit(&mut sess, cancel, &entry.id, port)
+                            .await?;
+                        active = run_cmd(
+                            &mut sess,
+                            cancel,
+                            "确认",
+                            &format!("systemctl is-active {}", unit_name(&entry.id)),
+                            PROBE_TIMEOUT,
+                        )
+                        .await
+                        .map(|o| o.stdout.trim() == "active")
+                        .unwrap_or(false);
+                        // 升级替换了正在服务的进程：必须验链接真取得到，不能只看
+                        // restart 退出码（2026-09-21 的死链就是只看了进程状态）。
+                        let code = run_cmd(
+                            &mut sess,
+                            cancel,
+                            "升级",
+                            &format!(
+                                "curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 \
+                                 http://127.0.0.1:{port}/sub/{}",
+                                entry.id
+                            ),
+                            PROBE_TIMEOUT,
+                        )
+                        .await?
+                        .stdout;
+                        if code.trim() != "200" {
+                            return Err(format!(
+                                "旧分享 {} 升级后链接自测返回 {}（期望 200）",
+                                entry.id,
+                                code.trim()
+                            ));
+                        }
+                    }
+                }
+                shares.push(legacy_info(
+                    server,
+                    &entry.id,
+                    &unit,
+                    entry.snapshot.as_deref(),
+                    active,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(shares)
+}
+
+fn new_info(server: &Server, entry: SummaryEntry) -> Option<ShareInfo> {
+    let manifest = entry.manifest?;
+    // 清单里的 id/token 会进 URL 与命令；非法值直接跳过，不显示也不执行。
+    if !is_valid_id(&manifest.id) || !is_valid_token(&manifest.token) {
+        return None;
+    }
+    let usage = entry.usage.unwrap_or_default();
+    let units = entry.units.unwrap_or_default();
+    let active = required_units(&manifest)
+        .iter()
+        .all(|unit| units.get(unit).and_then(|v| v.as_deref()) == Some("active"));
+    let mut info = info_from_manifest(&manifest, &usage, server, active);
+    if let Some(last) = entry.last_access {
+        info.last_access_at = Some(last.at);
+        info.last_access_ip = Some(last.ip);
+    }
+    Some(info)
+}
+
+/// 一份分享需要同时处于 active 的单元。清单里没有的实例单元（例如 SS 分享没有
+/// xray/singbox）不参与判断——摘要脚本对不存在的单元返回 null。
+fn required_units(m: &ShareManifest) -> Vec<String> {
+    let mut units = vec![unit_name(&m.id), gateway_unit_name(&m.id)];
+    if m.nodes
+        .iter()
+        .any(|n| matches!(n.protocol.as_str(), "vless" | "trojan" | "vmess"))
+    {
+        units.push(instance_unit_name(&m.id, "xray"));
+    }
+    if m.nodes
+        .iter()
+        .any(|n| matches!(n.protocol.as_str(), "hysteria2" | "tuic"))
+    {
+        units.push(instance_unit_name(&m.id, "singbox"));
+    }
+    if m.nodes.iter().any(|n| n.protocol == "ss") {
+        units.push(instance_unit_name(&m.id, "ss"));
+    }
+    units
+}
+
+/// 旧分享：明文 HTTP、无配额/限速/到期，只有端口与快照有意义。
+/// 状态固定为 [`ShareStatus::Legacy`]——UI 用「旧版·无管控」明确区分。
+pub(crate) fn legacy_info(
+    server: &Server,
+    id: &str,
+    unit: &str,
+    snapshot: Option<&str>,
+    active: bool,
+) -> ShareInfo {
+    let port = crate::share::parse_port_from_unit(unit).unwrap_or(0);
+    let host = effective_host(server).to_string();
+    ShareInfo {
+        id: id.to_string(),
+        server_id: server.id,
+        server_name: server.name.clone(),
+        host: host.clone(),
+        token: id.to_string(),
+        port,
+        active,
+        url: legacy_url(&host, port, id),
+        url_singbox: String::new(), // 旧分享没有 sing-box 与 HTTPS
+        node_names: snapshot.map(crate::share::proxy_names).unwrap_or_default(),
+        legacy: true,
+        status: ShareStatus::Legacy,
+        status_detail: Some("旧版·无管控".into()),
+        quota_bytes: 0,
+        used_bytes: 0,
+        rate_up_mbps: 0,
+        rate_down_mbps: 0,
+        expires_at: None,
+        last_access_at: None,
+        last_access_ip: None,
+    }
 }
