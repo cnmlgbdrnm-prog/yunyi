@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 pub mod model;
 pub mod naming;
+pub mod plan;
 
 /// 服务器上所有分享的根目录。
 pub const SHARE_ROOT: &str = "/srv/vpnshare";
