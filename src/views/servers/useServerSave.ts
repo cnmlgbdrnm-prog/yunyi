@@ -40,6 +40,7 @@ export function useServerSave(
           notes: form.notes,
           credential: form.credential === '' ? null : form.credential,
           egressFamily: form.egressFamily,
+          shareDomain: form.shareDomain,
         })
         if (result.deploy_job_id != null) {
           // 前端以为没变、后端仍排了任务（列表读旧了）：补个占位再绑定。
@@ -67,6 +68,7 @@ export function useServerSave(
         kind: form.kind,
         notes: form.notes,
         credential: form.credential,
+        shareDomain: form.shareDomain,
       })
       onDone()
       await refresh()

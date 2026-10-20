@@ -65,6 +65,29 @@ fn clean_host_v6(s: &str) -> String {
         .to_string()
 }
 
+/// 分享域名归一化：只接受裸域名（可空）。空串 = 未配置。
+/// 统一小写；拒绝 scheme、路径、端口、空格与非法标签，避免把 URL 当域名拼进
+/// certbot/iptables 命令。
+pub fn normalize_share_domain(raw: &str) -> Result<String, String> {
+    let d = clean_text(raw).to_ascii_lowercase();
+    if d.is_empty() {
+        return Ok(d);
+    }
+    if d.len() > 253 || d.contains("://") || d.contains('/') || d.contains(':') || d.contains(' ') {
+        return Err("分享域名只能是裸域名，例如 share.example.com".into());
+    }
+    let ok = d.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    });
+    if !ok {
+        return Err("分享域名格式不合法".into());
+    }
+    Ok(d)
+}
+
 /// 校验输入并返回规整后的 Server 行（不含 id/created_at 的派生字段）。
 fn validate_fields(
     name: &str,
@@ -203,6 +226,8 @@ pub fn create_server(state: &AppState, input: CreateServerInput) -> Result<Serve
         bandwidth: None,
         last_checked_at: None,
         last_check_error: None,
+        share_domain: normalize_share_domain(&input.share_domain)
+            .map_err(ServersError::Validation)?,
     };
     {
         // 凭据与服务器行同事务写入，避免孤儿凭据
@@ -276,6 +301,11 @@ pub fn update_server(state: &AppState, input: UpdateServerInput) -> Result<Serve
         }
         None => existing.egress_family.clone(),
     };
+    // 分享域名：None = 保留原值；Some("") = 清除。入库前归一化。
+    let share_domain = match input.share_domain.as_deref() {
+        Some(v) => normalize_share_domain(v).map_err(ServersError::Validation)?,
+        None => existing.share_domain.clone(),
+    };
     // 生效地址可能因这次编辑改变（改 host / host_v6 / 清空 host_v6）：节点必须一起跟。
     // 必须在把 existing 的字段搬进 row 之前算——否则 last_check_error 已被移走，借用失败。
     let old_effective = crate::domain::effective_host(&existing).to_string();
@@ -298,6 +328,7 @@ pub fn update_server(state: &AppState, input: UpdateServerInput) -> Result<Serve
         bandwidth: existing.bandwidth,
         last_checked_at: existing.last_checked_at,
         last_check_error: existing.last_check_error,
+        share_domain,
     };
     let new_effective = crate::domain::effective_host(&row).to_string();
     // 凭据密文与数据库事务无关，先算好；事务里只做数据库写。

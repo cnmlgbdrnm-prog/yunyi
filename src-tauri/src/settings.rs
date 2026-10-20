@@ -8,6 +8,8 @@ use std::sync::Arc;
 pub const DEFAULT_SUB_PORT: &str = "8731";
 /// 导出订阅是否携带智能分流规则（"1" 开，"0" 关）。
 pub const DEFAULT_SMART_SPLIT: &str = "1";
+/// 分享域名的 ACME 邮箱（签发证书时使用；空 = 未配置）。
+pub const SHARE_ACME_EMAIL_KEY: &str = "share_acme_email";
 
 /// 设置服务：薄封装 settings 表。
 pub struct SettingsService {

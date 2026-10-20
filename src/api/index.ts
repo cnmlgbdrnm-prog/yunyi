@@ -262,6 +262,7 @@ export function createServer(input: {
   kind: 'relay' | 'landing'
   notes: string
   credential: string
+  shareDomain: string
 }): Promise<Server> {
   return invoke('create_server_cmd', { ...input })
 }
@@ -278,6 +279,7 @@ export function updateServer(input: {
   notes: string
   credential: string | null
   egressFamily: 'v4' | 'v6'
+  shareDomain: string
 }): Promise<UpdateServerResult> {
   return invoke('update_server_cmd', { ...input })
 }

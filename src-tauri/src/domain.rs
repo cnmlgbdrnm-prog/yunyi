@@ -121,6 +121,8 @@ pub struct Server {
     pub last_checked_at: Option<String>,
     /// 最近一次测速失败原因（成功置 NULL；IPC 序列化后前端红字展示）。
     pub last_check_error: Option<String>,
+    /// 分享域名（解析到该机）；空串 = 未配置。新分享强制 HTTPS。
+    pub share_domain: String,
 }
 
 /// 服务器当前用于 SSH、测速与节点写回的地址：只有登记了 IPv6 且选了 v6 才用它，
@@ -224,6 +226,8 @@ pub struct CreateServerInput {
     pub kind: String,
     pub notes: String,
     pub credential: String,
+    /// 分享域名（裸域名；空串 = 未配置）。
+    pub share_domain: String,
 }
 
 /// 更新服务器输入（credential 为 None=保留原凭据）。
@@ -242,6 +246,8 @@ pub struct UpdateServerInput {
     pub credential: Option<String>,
     /// 出站地址族；None = 保留原值（兼容只改其它字段的调用方）。
     pub egress_family: Option<String>,
+    /// 分享域名；None = 保留原值，Some("") = 清除。
+    pub share_domain: Option<String>,
 }
 
 /// 更新服务器的结果：保存一定成功才返回；出口变化且该服务器已有部署时，

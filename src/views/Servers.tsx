@@ -361,6 +361,7 @@ export default function Servers() {
       notes: s.notes,
       credential: '',
       egressFamily: s.egress_family,
+      shareDomain: s.share_domain,
     })
     setExpand({ type: 'edit', id: s.id })
   }

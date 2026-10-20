@@ -253,6 +253,7 @@ pub async fn create_server_cmd(
     kind: String,
     notes: String,
     credential: String,
+    share_domain: String,
 ) -> R<Server> {
     create_server(
         state.inner().clone(),
@@ -266,6 +267,7 @@ pub async fn create_server_cmd(
             kind,
             notes,
             credential,
+            share_domain,
         },
     )
 }
@@ -285,6 +287,7 @@ pub async fn update_server_cmd(
     notes: String,
     credential: Option<String>,
     egress_family: Option<String>,
+    share_domain: Option<String>,
 ) -> R<UpdateServerResult> {
     update_server(
         state.inner().clone(),
@@ -300,6 +303,7 @@ pub async fn update_server_cmd(
             notes,
             credential,
             egress_family,
+            share_domain,
         },
     )
 }

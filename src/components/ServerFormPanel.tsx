@@ -20,6 +20,8 @@ export interface ServerFormState {
   credential: string
   /** 出口地址族：VPS → 目标域名时优先/限定哪一族。与入口（host/hostV6）独立。 */
   egressFamily: 'v4' | 'v6'
+  /** 分享域名（裸域名）；空串 = 未配置。新分享强制 HTTPS。 */
+  shareDomain: string
 }
 
 export const EMPTY_SERVER_FORM: ServerFormState = {
@@ -33,6 +35,7 @@ export const EMPTY_SERVER_FORM: ServerFormState = {
   notes: '',
   credential: '',
   egressFamily: 'v4',
+  shareDomain: '',
 }
 
 interface Props {
@@ -126,6 +129,16 @@ export default function ServerFormPanel({ form: f, editing, serverId, onChange, 
           </p>
         </div>
       )}
+      <label className="block text-sm">
+        分享域名（可选）
+        <input
+          aria-label="分享域名"
+          className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 font-mono text-xs"
+          value={f.shareDomain}
+          onChange={(e) => onChange({ ...f, shareDomain: e.target.value })}
+          placeholder="share.example.com（新分享强制 HTTPS，需解析到本机）"
+        />
+      </label>
       {editing && <p className="text-xs text-neutral-500">编辑时凭据留空表示保留原凭据</p>}
       <label className="block text-sm">
         备注
