@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T13（blocked）
-- 下一动作：用户指定分享域名与目标服务器并授权真机签发/创建验证后，逐项执行 T13 Step 3
-- 阻塞：真机 ACME 签发与创建验证被自动模式拒绝——代理自选 `203-0-113-11.sslip.io`（ashura）签发证书未经用户点名；需用户给出确切域名与主机后再执行。其余工作（CHANGELOG、四道门禁）已完成
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）
+- 当前：T13（completed）
+- 下一动作：按 superpowers:finishing-a-development-branch 收尾（验证/呈现合并或保留选项）
+- 阻塞：无。真机遗留两项已如实记录：整机重启未执行（以 enabled + stop/start 验证）、真机无旧版分享可复验（单测覆盖）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）、T13（`b32f581`、`1df0511`、`e339bed`、`fe66cd1`、`23b12e9`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -3469,7 +3469,7 @@ git commit -m "feat(share): 新建向导、编辑面板与 HTTPS 配置入口"
 
 - **验收:** 四道门禁全绿；CHANGELOG 记录新能力与已知限制；真机验证清单逐项有结论。
 
-- **状态:** blocked ｜ **证据:** CHANGELOG commit `b32f581`（只暂存新增节，原有未提交条目保留）；四道门禁：`cargo test --features local-tests -- --skip net::runtime_tests --skip net::runtime_service_tests` 964 passed / 0 failed / 23 filtered；`npx tsc --noEmit` 无输出；`npm test` 376 passed（33 files）；`python -m unittest discover -s tests/python -v` 4 passed。门禁首次运行暴露两条陈旧夹具（`domain_tests` 缺 `share_domain`、健康监控迁移断言仍为 v17），已在 gitignore 的 `tests/` 内修正后复跑全绿。**Step 3 未执行**：自动模式拒绝在用户未点名的域名/主机上签发 Let's Encrypt 证书（拟用 `203-0-113-11.sslip.io` @ ashura），需用户指定域名与服务器并明确授权。
+- **状态:** completed ｜ **证据:** CHANGELOG `b32f581`，REALITY/DNS 修复条目随 `23b12e9`；四道门禁最终值：`cargo test --features local-tests -- --skip net::runtime_tests --skip net::runtime_service_tests` 967 passed / 0 failed / 5 ignored / 23 filtered；`npx tsc --noEmit` 与 `npm run test:typecheck` 无输出；`npm test` 376 passed（33 files）；`python -m unittest discover -s tests/python -v` 4 passed（连跑 10 次全绿）。门禁暴露并修复的测试夹具问题：`domain_tests` 缺 `share_domain`、健康监控迁移断言仍为 v17、Python 网关测试的 echo 线程闭包捕获循环变量导致随机失败（后者连跑 10 次验证）。真机（ashura `203.0.113.11` + 用户点名的 `203-0-113-11.sslip.io`）结果见 Step 3 与「最终验收」；过程中发现并修复 3 个真实缺陷：网关 SIGTERM 退出码 1（`e339bed`）、端口分配复用已停止分享的端口（`fe66cd1`）、sing-box JSON 缺 REALITY 且 DNS 格式过期（`23b12e9`）。
 
 - [x] **Step 1: CHANGELOG**
 
@@ -3496,18 +3496,18 @@ python -m unittest discover -s tests/python -v
 
 Expected: 全绿。若 `net::runtime_tests` 因用户开着网络自跳过（见既有约定），先用「注册表 + 端口 + 经代理 curl」三项核实，再记录实际结果。
 
-- [ ] **Step 3: 真机验证清单**
+- [x] **Step 3: 真机验证清单**
 
-在真实服务器逐项执行并记录：
+在真实服务器逐项执行并记录（ashura `203.0.113.11`，域名 `203-0-113-11.sslip.io`，用户点名授权）：
 
-1. `prepare_share_tls_cmd` 签发成功，证书到期时间可读。
-2. `create_share_cmd` 返回 HTTPS YAML/sing-box 链接；`curl` 证书校验通过。
-3. mihomo 与 sing-box 各导入一次并连通。
-4. 跑流量后 `usage.json` 增长；配额耗尽后连接失败；调高配额并重置后恢复。
-5. 到期后连接失败；延长到期后恢复。
-6. 作废后旧配置立即失败。
-7. 关闭应用、重启服务器后分享仍可用；防火墙规则恢复。
-8. 旧分享仍可列出/作废，YAML 链接不变，重启后不再失联。
+1. **通过**：`prepare_tls` 首次签发成功，返回到期 `Jan 18 09:08:10 2027 GMT`；签发后 80 端口规则已撤回，续期钩子 `/etc/letsencrypt/renewal-hooks/deploy/vpnshare.sh` 可执行，TLS 目录 700、证书 600。
+2. **通过**：创建 6 份分享；YAML/JSON 均为 HTTPS 200，`curl --ssl_verify_result=0`（证书校验通过）；端口按 18080→18081→18082 顺延。
+3. **通过**：mihomo 导入后 `generate_204` 返回 204、2MB 下载成功；sing-box 1.13.20 `check` 通过，1.14.3 实际运行后 204、1MB 下载成功（修复 REALITY/DNS 后）。
+4. **通过**：`usage.json` 从 6,969 增至 2,135,931；把配额降到 2.2MB 后连接中断并写 `blocked:"quota"`；`update_share` 调回 1GB + `reset_usage` 后恢复（随后 1MB 下载成功）。
+5. **通过**：把 `expires_at_unix` 置为过去并重启网关后端口关闭、`blocked:"expired"`、客户端握手失败；`update_share` 续 1 天后 204 恢复。
+6. **通过**：`delete_share` 后旧链接超时、目录删除、单元消失、数据端口防火墙规则撤回。
+7. **部分通过**：单元均 `enabled`；手动 stop 全部单元后端口/防火墙规则关闭，start 后规则自动恢复（18080/18200）且数据路径 204；所有操作在桌面应用之外完成，证明不依赖应用进程。**未实际重启整台服务器**（避免中断线上节点），以 enabled + stop/start 代替。
+8. **未在真机复验**：ashura 与其他可达服务器上没有旧版分享（`list_shares` 为空，仅有旧 iptables 残留规则）；旧分享列举/升级/作废由 `list_tests` / `manage_tests` 覆盖。
 
 - [x] **Step 4: 提交**
 
@@ -3518,6 +3518,32 @@ git commit -m "docs(share): 记录流量管控、sing-box 与 HTTPS 的行为与
 ```
 
 已提交 `b32f581`（只含新增 CHANGELOG 节）；`ipc-interface-reference.md` 在 T10 已更新，README 本次无端口/测试说明变化，无需改动。
+
+---
+
+## 最终验收
+
+结论：**条件通过**。A1-A3、A6-A10 有真机或门禁证据；A4 的「整机重启」与 A5 的真机旧分享因环境限制未执行，已在下方注明替代证据。
+
+| AC | 结论 | 证据 |
+|---|---|---|
+| A1 | 通过 | ashura 实测 YAML 经 mihomo 导入，`generate_204` 204、2MB 下载成功；JSON 经 sing-box 1.13.20 `check`、1.14.3 运行，204 + 1MB 下载成功（需 `23b12e9` 的 REALITY/DNS 修复）。 |
+| A2 | 通过 | 用量 6,969→2,135,931；配额耗尽连接中断并写 `blocked:"quota"`；到期端口关闭、`blocked:"expired"`；作废后旧链接超时。 |
+| A3 | 通过 | 下行限 1 Mbps，1MB 实测 8.78s、113,907 B/s（≈0.91 Mbps，令牌桶/背压偏差合理）。 |
+| A4 | 部分 | 服务器侧单元不依赖桌面应用（全部操作在应用外完成）；单元 `enabled`，stop/start 后防火墙与端口自动恢复、数据路径 204。**未实际重启整台服务器**（避免中断线上节点）。 |
+| A5 | 部分 | 真机无可列出的旧分享（仅残留旧 iptables 规则），未做真机复验；`list_tests`/`manage_tests` 覆盖列举、升级、作废与幂等。 |
+| A6 | 通过 | 真机向导候选对隐私线/上游出口/挂中转节点置灰并给出原因；后端 `create_share_inner` 在连服务器前拒绝（单测）。 |
+| A7 | 通过 | cargo 967 passed / 0 failed（5 ignored 为真机用例、23 filtered）；tsc/test:typecheck 无输出；npm 376 passed；Python 4 passed（连跑 10 次）。 |
+| A8 | 通过 | certbot 签发成功，到期 2027-01-18；HTTPS YAML/JSON 均 200 且证书校验通过；80 端口签发后撤回；续期钩子存在且可执行。 |
+| A9 | 通过（单测） | 写失败/启动失败均触发统一回滚并核验无残留（`install_tests`）；真机成功路径无残留，未故意制造失败。 |
+| A10 | 通过 | 本地无分享表；用生产库副本（不含分享记录）仍从服务器列出分享与状态。 |
+
+### 已知遗留（本次不改）
+
+- 整机重启后的真实恢复未演练；当前证据为 systemd `enabled` + 手工 stop/start 后端口与防火墙规则恢复。
+- 真机没有旧版分享，A5 的旧分享行为只有单元测试证据。
+- Python 网关吞吐未做压力测试；CHANGELOG 已声明吞吐有上限。
+- sing-box JSON 采用 1.12+ 的 DNS 对象格式，更老客户端需升级（1.13.20/1.14.3 已实测）。
 
 ---
 
