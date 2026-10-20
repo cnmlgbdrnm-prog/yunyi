@@ -5,7 +5,7 @@
 // 当前进程内存里（不落盘：链接本身就是凭证），进页面先显示旧列表，同时后台
 // 刷新，服务器始终是唯一事实源。某台连不上时只列不出那几条，并把服务器名
 // 摆在明面上（见 unreachable 提示）。
-import { useCallback, useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useState } from 'react'
 import { deleteShare, listServers, listShares } from '../api'
 import ConfirmButton from '../components/ConfirmButton'
 import ShareEditPanel from '../components/ShareEditPanel'
@@ -157,17 +157,6 @@ export default function Shares() {
         />
       )}
 
-      {editing && (
-        <ShareEditPanel
-          share={editing}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
-            setEditing(null)
-            void refresh().catch((e) => setError(String(e)))
-          }}
-        />
-      )}
-
       {created && (
         <p className="rounded border border-emerald-800 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
           已生成：<code className="font-mono">{created.url}</code>
@@ -202,7 +191,8 @@ export default function Shares() {
                   ? Math.min(100, Math.round((s.used_bytes / s.quota_bytes) * 100))
                   : 0
               return (
-                <tr key={`${s.server_id}-${s.id}`} className="border-b border-neutral-900">
+                <Fragment key={`${s.server_id}-${s.id}`}>
+                  <tr className="border-b border-neutral-900">
                   <td className="px-3 py-2 align-top">
                     <div className="space-y-1">
                       <div className="break-all font-mono text-xs">{s.url}</div>
@@ -296,7 +286,26 @@ export default function Shares() {
                       />
                     </div>
                   </td>
-                </tr>
+                  </tr>
+                  {/* 编辑框必须紧跟被编辑的这一行：放到表格上方会让用户来回找，
+                      尤其列表滚动后根本不知道改的是哪条。 */}
+                  {editing &&
+                    editing.server_id === s.server_id &&
+                    editing.id === s.id && (
+                      <tr className="border-b border-neutral-900 bg-neutral-950/40">
+                        <td colSpan={8} className="px-3 py-3">
+                          <ShareEditPanel
+                            share={editing}
+                            onClose={() => setEditing(null)}
+                            onSaved={() => {
+                              setEditing(null)
+                              void refresh().catch((e) => setError(String(e)))
+                            }}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                </Fragment>
               )
             })}
           </tbody>
