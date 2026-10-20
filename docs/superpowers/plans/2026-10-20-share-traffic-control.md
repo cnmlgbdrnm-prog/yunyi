@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T11（pending）
-- 下一动作：更新前端 `api/types.ts`/`api/index.ts` 与 `Shares.tsx` 列表（新 `ShareInfo`/状态/用量/旧版标记），补 `Shares.test.tsx`
+- 当前：T12（pending）
+- 下一动作：实现 `ShareWizard`/`ShareEditPanel`，接候选与 TLS 状态；补服务器分享域名与设置页 ACME 邮箱
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -3308,7 +3308,7 @@ git commit -m "feat(share): 分享管控 IPC 命令"
 
 - **验收:** `npx tsc --noEmit` 绿；`npm test -- Shares` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `1897223`；`npx tsc --noEmit` 无输出；`npm test -- Shares` 15 passed（双格式复制、用量进度条、超额文案、旧版行只读/无 sing-box、作废与失联提示）；向导暂以默认 100GB/100Mbps/30 天调用新 API，T12 接入用户输入。
 
 - [ ] **Step 1: 更新 TS 类型与 API**
 
