@@ -91,6 +91,10 @@ impl AppState {
         // 与 migrate_params 同理放在装配期：配置生成、测速、导出都读 nodes.addr，
         // 治晚了就有一段时间量的是错的链路。
         let _ = crate::db::repos::nodes::heal_direct_addresses(&db.lock(), &creds);
+        // 存量重名节点消歧（幂等；同上，失败不阻断启动，下次启动重试）。
+        // 代理名是 mihomo 配置里的全局键：升级前入库的重名节点会让整份配置被
+        // `proxy xxx is the duplicate name` 拒绝——表现就是「开启网络」永远失败。
+        let _ = crate::db::repos::nodes::ensure_unique_names(&db.lock(), &creds);
         // 生产超时：连接 15s、整体 30s，卡死端点不得永久挂起同步
         let client = crate::subs::service::http_client(
             std::time::Duration::from_secs(15),

@@ -1,6 +1,10 @@
 // 分享视图：列出服务器上的分享链接、新建（选服务器 + 勾节点）、作废。
-// 分享的真实状态在服务器上——本地不存记录，所以每次进页面都重新拉，
-// 某台连不上时只列不出那几条，并把服务器名摆在明面上（见 unreachable 提示）。
+// 分享的真实状态在服务器上——本地不存记录，每次进页面都向服务器重新拉；
+// 但列表要跨视图切换保留一份**会话级内存快照**：读一次要 SSH 逐台服务器
+// （实测 ~14 秒），每次切回来都空白「读取中…」既慢又像数据丢了。快照只活在
+// 当前进程内存里（不落盘：链接本身就是凭证），进页面先显示旧列表，同时后台
+// 刷新，服务器始终是唯一事实源。某台连不上时只列不出那几条，并把服务器名
+// 摆在明面上（见 unreachable 提示）。
 import { useCallback, useEffect, useState } from 'react'
 import { deleteShare, listServers, listShares } from '../api'
 import ConfirmButton from '../components/ConfirmButton'
@@ -34,11 +38,25 @@ function statusView(s: ShareInfo): { label: string; className: string } {
   }
 }
 
+/** 会话级快照：模块作用域，视图卸载后仍在；应用退出即丢，不落盘。 */
+type ShareSnapshot = { shares: ShareInfo[]; unreachable: string[] }
+let lastSnapshot: ShareSnapshot | null = null
+
+/** 仅供测试清空快照，避免用例之间互相污染（生产代码不应调用）。 */
+export function clearShareSnapshot() {
+  lastSnapshot = null
+}
+
 export default function Shares() {
-  const [shares, setShares] = useState<ShareInfo[]>([])
-  const [unreachable, setUnreachable] = useState<string[]>([])
+  // 有快照就先渲染旧列表，避免每次切回来都空白「读取中…」；
+  // 真实数据仍然由下面的后台刷新拿服务器结果覆盖。
+  const [shares, setShares] = useState<ShareInfo[]>(() => lastSnapshot?.shares ?? [])
+  const [unreachable, setUnreachable] = useState<string[]>(
+    () => lastSnapshot?.unreachable ?? [],
+  )
   const [servers, setServers] = useState<Server[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
 
   // 新建向导与编辑面板
   const [wizardOpen, setWizardOpen] = useState(false)
@@ -46,15 +64,23 @@ export default function Shares() {
   const [created, setCreated] = useState<ShareInfo | null>(null)
 
   const refresh = useCallback(async () => {
-    const list = await listShares()
-    setShares(list.shares)
-    setUnreachable(list.unreachable)
+    setRefreshing(true)
+    try {
+      const list = await listShares()
+      // 只有成功结果才更新快照；失败时保留旧列表（服务器不可达不代表分享没了）
+      lastSnapshot = { shares: list.shares, unreachable: list.unreachable }
+      setShares(list.shares)
+      setUnreachable(list.unreachable)
+    } finally {
+      setRefreshing(false)
+    }
   }, [])
 
   // 首次取数期间**不能**渲染「还没有分享」：分享在服务器上，这台要 SSH 逐台读，
   // 实测一次 ~14 秒。那 14 秒里界面说「没有分享」就是在撒谎——用户切一下视图
   // 回来看到它，会以为分享被删了（2026-09-21 实际发生）。
-  const [loading, setLoading] = useState(true)
+  // 有会话快照时不再进入这个空窗：直接显示上次结果，后台刷新。
+  const [loading, setLoading] = useState(() => lastSnapshot === null)
 
   useEffect(() => {
     void refresh()
@@ -84,7 +110,10 @@ export default function Shares() {
 
   return (
     <div className="space-y-4">
-      <h2 className="text-xl font-semibold">分享</h2>
+      <div className="flex items-center gap-3">
+        <h2 className="text-xl font-semibold">分享</h2>
+        {refreshing && <span className="text-xs text-neutral-500">更新中…</span>}
+      </div>
       {error && (
         <p role="alert" className="rounded bg-red-950 px-3 py-2 text-sm text-red-300">
           {error}
@@ -274,7 +303,7 @@ export default function Shares() {
         </table>
         {shares.length === 0 && (
           <p className="p-4 text-sm text-neutral-500">
-            {loading ? '读取中…' : '还没有分享。'}
+            {loading ? '读取中…' : error ? '读取失败，列表未知。' : '还没有分享。'}
           </p>
         )}
       </div>

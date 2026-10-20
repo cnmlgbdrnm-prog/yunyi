@@ -5,8 +5,10 @@
 //! 拖进 reqwest 加一个隐式运行时，等于给一个 SYSTEM 服务平添攻击面。控制器的流量
 //! 就是 127.0.0.1 上的明文 HTTP，手写够用且每一行都可审。
 //!
-//! 输入输出：PUT 一个 JSON body → HTTP 状态码。**失败一律 Err，绝不猜**——
+//! 输入输出：PUT 一个 JSON body → HTTP 状态码 + 响应体片段。**失败一律 Err，绝不猜**——
 //! 静默当成 200 会让「热重载失败」伪装成成功，开关回弹但没人知道为什么。
+//! 带响应体是为了让 mihomo 的 400 不再是光秃秃的 HTTP 400：它的
+//! `{"message":"proxy xxx is the duplicate name"}` 才是可诊断的那句话。
 //! 依赖：std::net / std::io / serde_json。
 
 use std::io::{Read, Write};
@@ -31,13 +33,18 @@ pub(super) fn parse_status(head: &str) -> Result<u16, String> {
         .map_err(|e| format!("状态码不是数字: {e}"))
 }
 
-/// `PUT {addr}{path}`，带 Bearer token 与 JSON body，返回状态码。
+/// 响应体最多保留这么多字符：错误信息只要够说明原因，不把整份配置灌进日志。
+const BODY_SNIPPET_CHARS: usize = 300;
+/// 整个响应（头 + 体）的读取上限，防止对端不回 EOF 时无限读。
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// `PUT {addr}{path}`，带 Bearer token 与 JSON body，返回 (状态码, 响应体片段)。
 pub(super) fn put_json(
     addr: &str,
     path: &str,
     token: &str,
     body: &serde_json::Value,
-) -> Result<u16, String> {
+) -> Result<(u16, String), String> {
     let payload = serde_json::to_string(body).map_err(|e| format!("序列化请求体失败: {e}"))?;
     let mut stream =
         TcpStream::connect(addr).map_err(|e| format!("连接控制器 {addr} 失败: {e}"))?;
@@ -58,15 +65,51 @@ pub(super) fn put_json(
         .write_all(req.as_bytes())
         .map_err(|e| format!("发送请求失败: {e}"))?;
 
-    let mut buf = String::new();
-    let mut chunk = [0u8; 1024];
-    // 状态行在首段里；读不到内容（对端直接关）就是错误，不能当成功
-    let n = stream
-        .read(&mut chunk)
-        .map_err(|e| format!("读响应失败: {e}"))?;
-    if n == 0 {
+    // 读到头 + 体（Connection: close，正常情况对端答完就关）。允许分多次读：
+    // 控制器报错时状态行与 JSON 体可能落在不同的 TCP 段里。
+    let mut raw = Vec::new();
+    loop {
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.len() >= MAX_RESPONSE_BYTES {
+                    break;
+                }
+                // 有 Content-Length 时按长度收口，避免等服务端关连接拖到读超时
+                if content_length_complete(&raw) {
+                    break;
+                }
+            }
+            // 已经读到响应就先用现有内容；一个字都没有才算通信失败
+            Err(_) if !raw.is_empty() => break,
+            Err(e) => return Err(format!("读响应失败: {e}")),
+        }
+    }
+    if raw.is_empty() {
         return Err("控制器没回任何内容就关闭了连接".to_string());
     }
-    buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-    parse_status(&buf)
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+    let code = parse_status(head)?;
+    let snippet: String = body.trim().chars().take(BODY_SNIPPET_CHARS).collect();
+    Ok((code, snippet))
+}
+
+/// 响应是否已按 Content-Length 收全（头里没有该字段则永远返回 false，交给 EOF/上限收口）。
+fn content_length_complete(raw: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let len = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    });
+    matches!(len, Some(n) if body.len() >= n)
 }

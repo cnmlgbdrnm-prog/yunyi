@@ -5,8 +5,11 @@
 
 use crate::servers::deploy::{run_cmd, run_cmd_ok};
 use crate::ssh::SshSession;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
+
+/// 同进程内原子写的临时文件名序号（配合进程 id，跨进程也不撞车）。
+static TEMP_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 远端文件读取结果：区分「文件不存在」（正常）与「读取失败」（异常）。
 ///
@@ -96,6 +99,15 @@ pub(crate) async fn write_remote_file(
     );
     let parent = remote_path.rsplit_once('/').map(|(p, _)| p).unwrap_or(".");
     let (mode, dir_mode) = remote_perms(remote_path);
+    // 临时文件名必须每次不同：固定 `.new` 时，两次并发写同一路径会一胜一败，
+    // 败的那次 `mv` 报 `cannot stat '…new'`——而最终文件其实已经被对方换好，
+    // 表面看像“服务器上的分享读不到”，实际只是一次同路径写入撞车。列举分享
+    // （每次进分享页都会重写 share_summary.py）与后台刷新重叠时就会踩到。
+    let tmp_path = format!(
+        "{remote_path}.new.{}.{}",
+        std::process::id(),
+        TEMP_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let mut cmd = format!("mkdir -p '{parent}' && ");
     if let Some(dm) = dir_mode {
         // 显式 chmod 而非 `mkdir -p -m`：后者只对**新建**目录生效，已存在却是 755 的
@@ -105,9 +117,9 @@ pub(crate) async fn write_remote_file(
         cmd.push_str(&format!("chmod {dm:o} '{parent}' && "));
     }
     cmd.push_str(&format!(
-        "echo '{b64}' | base64 -d > '{remote_path}.new' \
-         && chmod {mode:o} '{remote_path}.new' \
-         && mv -f '{remote_path}.new' '{remote_path}'"
+        "echo '{b64}' | base64 -d > '{tmp_path}' \
+         && chmod {mode:o} '{tmp_path}' \
+         && mv -f '{tmp_path}' '{remote_path}'"
     ));
     run_cmd_ok(sess, cancel, step, &cmd, timeout).await?;
     Ok(())
