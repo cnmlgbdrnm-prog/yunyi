@@ -5,8 +5,9 @@
 **Goal Contract**
 
 - **Original Goal:** 「现在分享的链接不支持流量管控。不支持sing-box ，现在分享的链接看一下，是什么问题？还有安全管理能不做好？」（后续确认：配额 + 上下行限速 + 到期 + 吊销全套；域名 + 自动 HTTPS；独立实例 + 独立凭据；旧分享不自动迁移；限速在网关内做；分享是快照。）
+- **范围变更（2026-10-20 第二轮，用户原话）：** 「让程序自动，检测，还有这个上游节点访问应该做成可以分享的！」据此解除「非上游出口」这一条限制，并新增分享域名自动检测。其余约束不变。
 - **Hard Constraints:**
-  - 一条分享只属于一台服务器；只允许该机上 `source=self-built`、`enabled`、非 ssr、非隐私线、非上游出口、未挂中转链路的节点。后端必须重新校验，不能只信前端。
+  - 一条分享只属于一台服务器；只允许该机上 `source=self-built`、`enabled`、非 ssr、非隐私线、未挂中转链路的节点。后端必须重新校验，不能只信前端。**上游出口节点自第二轮起允许分享**：必须从专用 `xray-upstream` 配置读取对应入站，只复制被选中出口的出站与路由，不得把同机其它出口的凭据带进分享实例。
   - 新分享强制 HTTPS：每台服务器 `share_domain` + 全局 `share_acme_email`；未配置或 ACME 失败即拒绝创建，**不退回 HTTP**。
   - 管控口径：配额 = 上下行网关转发字节之和；限速单位 Mbps、按分享聚合、0 = 不限；到期按服务器时钟；超额/到期关闭监听并断开连接；作废后已下载配置立即失效。
   - 限速只在网关进程内做，**不使用 `tc`/qdisc**，不影响主服务与系统其他流量。
@@ -32,6 +33,8 @@
   - A8: 新分享只有 HTTPS；证书由 certbot 签发且续期钩子可执行；没有明文 HTTP 降级路径。
   - A9: 创建任一步失败后，服务器上不残留本次创建的单元/端口/目录。
   - A10: 不新增本地分享表；`list_shares` 不依赖本地状态。
+  - A11: 服务器 `share_domain` 为空、但 `/srv/vpnshare/tls/fullchain.pem` 存在且有效时，向导自动显示证书中的域名并允许创建；已有有效证书时不再要求 ACME 邮箱。创建出的链接使用该自动检测域名。
+  - A12: 上游出口节点在向导中可勾选；创建时从 `/usr/local/etc/xray-upstream/config.json` 克隆对应 REALITY 入站、SOCKS/HTTP 出站与路由，新分享使用独立 UUID 和回环端口；分享配置中不含同机其它出口的出站凭据。
 
 ## 模块地图（ASCII）
 
@@ -65,17 +68,17 @@ ShareTls ──▶ certbot ──▶ deploy hook ──▶ 重启 vpnshare-* 服
 
 ```
 ShareModel ⇠── ShareManifest / UsageState / GatewayConfig（服务器文件）
-ShareClone ⇠── 主服务 Xray/Sing-box/SS 配置（SSH 读取）
+ShareClone ⇠── 主服务 Xray/Sing-box/SS 配置 + 上游专用 xray-upstream 配置（SSH 读取）
 ShareInstall ⇠── domain::Server（share_domain）与 repos::upstreams/privacies
 SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus）
 ```
 
 ## 执行状态（进度指针）
 
-- 当前：T13（completed）
-- 下一动作：按 superpowers:finishing-a-development-branch 收尾（验证/呈现合并或保留选项）
+- 当前：T14、T15（completed）
+- 下一动作：提交本轮改动（只按路径暂存）
 - 阻塞：无。真机遗留两项已如实记录：整机重启未执行（以 enabled + stop/start 验证）、真机无旧版分享可复验（单测覆盖）
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）、T13（`b32f581`、`1df0511`、`e339bed`、`fe66cd1`、`23b12e9`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）、T13（`b32f581`、`1df0511`、`e339bed`、`fe66cd1`、`23b12e9`）、T14、T15（本轮工作区，提交后补 sha）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -3533,7 +3536,7 @@ git commit -m "docs(share): 记录流量管控、sing-box 与 HTTPS 的行为与
 | A4 | 部分 | 服务器侧单元不依赖桌面应用（全部操作在应用外完成）；单元 `enabled`，stop/start 后防火墙与端口自动恢复、数据路径 204。**未实际重启整台服务器**（避免中断线上节点）。 |
 | A5 | 部分 | 真机无可列出的旧分享（仅残留旧 iptables 规则），未做真机复验；`list_tests`/`manage_tests` 覆盖列举、升级、作废与幂等。 |
 | A6 | 通过 | 真机向导候选对隐私线/上游出口/挂中转节点置灰并给出原因；后端 `create_share_inner` 在连服务器前拒绝（单测）。 |
-| A7 | 通过 | cargo 967 passed / 0 failed（5 ignored 为真机用例、23 filtered）；tsc/test:typecheck 无输出；npm 376 passed；Python 4 passed（连跑 10 次）。 |
+| A7 | 通过 | 第二轮门禁：cargo 980 passed / 0 failed（7 ignored 为真机用例、23 filtered）；tsc/test:typecheck 无输出；npm 376 passed；Python 4 passed（本轮未改网关脚本，上一轮连跑 10 次）。 |
 | A8 | 通过 | certbot 签发成功，到期 2027-01-18；HTTPS YAML/JSON 均 200 且证书校验通过；80 端口签发后撤回；续期钩子存在且可执行。 |
 | A9 | 通过（单测） | 写失败/启动失败均触发统一回滚并核验无残留（`install_tests`）；真机成功路径无残留，未故意制造失败。 |
 | A10 | 通过 | 本地无分享表；用生产库副本（不含分享记录）仍从服务器列出分享与状态。 |
@@ -3555,3 +3558,32 @@ git commit -m "docs(share): 记录流量管控、sing-box 与 HTTPS 的行为与
 - **Goal Contract：** 三要素齐；A1-A10 均可用命令或真机步骤验证。
 - **模块地图：** 层级/调用/依赖三块分开，节点带中文功能名。
 - **Task 卡：** ID 稳定、Depends on 闭合、每卡有验收与状态。
+
+---
+
+## 第二轮范围变更（2026-10-20）：域名自动检测与上游出口分享
+
+用户原话：「让程序自动，检测，还有这个上游节点访问应该做成可以分享的！」
+
+### T14: 分享域名自动检测（from server certificate）
+
+- **Depends on:** T6、T7
+- **Files:** `src-tauri/src/share/tls.rs`、`src-tauri/src/share/install.rs`
+- **Interfaces:** `tls::cert_domain_cmd() -> String`、`tls::cert_domains(sess,cancel) -> Vec<String>`、`tls::detect_cert_domain(sess,cancel) -> String`
+- **验收:** 服务器 `share_domain` 为空且证书有效时，`share_tls_status_cmd` 返回证书 SAN 中的域名且 `ready=true`；未配置 ACME 邮箱不再阻止使用已有证书；创建出的 URL/清单使用检测域名；`prepare_tls` 在证书过期但 SAN 存在时用该域名续签。
+- **状态:** completed ｜ **证据:** 单测 `share::tls_tests` 23 passed（含自动检测、多 SAN、配置不一致、无邮箱有效证书、续签用检测域名）；`share::install_tests::create_share_uses_domain_detected_from_server_cert` 通过；真机 `real_host_tls_autodetect` 返回 `203-0-113-11.sslip.io`、`ready=true`；全量 cargo 980 passed / 0 failed / 7 ignored / 23 filtered。
+
+### T15: 上游出口节点可分享（clone dedicated xray-upstream config）
+
+- **Depends on:** T4、T7、T14
+- **Files:** `src-tauri/src/share/plan.rs`、`src-tauri/src/share/clone.rs`、`src-tauri/src/share/install.rs`
+- **Interfaces:** `ShareSource::{Main,Upstream}`、`ShareNodeSpec.source`、`clone_configs(main_xray, upstream_xray, …)`、`build_specs(nodes,pairs,upstream_node_ids)`、`read_main(...,"upstream", UPSTREAM_CONFIG_PATH)`
+- **验收:** 上游节点在 `list_share_candidates_cmd` 中 `shareable=true`；创建时从 `/usr/local/etc/xray-upstream/config.json` 取对应入站，改 `127.0.0.1` 与新回环端口、换新 UUID；只复制选中出口的出站/路由；同机其它出口的凭据不出现在分享配置中；分享连通后出口 IP 为该上游地址。
+- **状态:** completed ｜ **证据:** 单测 `share::clone_tests` 5 passed（含混选主配置+上游、其它出口密码不泄露）、`share::install_tests` 13 passed（含上游创建闭环）、IPC `list_share_candidates_cmd_marks_upstream_node_shareable` 通过；真机 ashura 创建上游分享 `3da0b65fed1e480c`，mihomo 实测 `generate_204` 204、`ipinfo.io` 出口 `203.0.113.14`（Springfield US），`usage.json` 增长到 27,494 字节，分享 xray 配置仅含 `out-up-4`，验证后已作废并确认目录/单元/端口无残留。
+
+### 第二轮验收补充
+
+| AC | 结论 | 证据 |
+|---|---|---|
+| A11 | 通过 | 单测与 ashura 真机均自动检测出 `203-0-113-11.sslip.io`；生产库原样副本（无 share_domain、无邮箱）`tls_status.ready=true`；创建链接使用该域名。 |
+| A12 | 通过 | 上游候选不再置灰；真机创建上游分享并用 mihomo 实测出口为 `203.0.113.14`；分享配置只含被选出口出站；作废后无残留。 |
