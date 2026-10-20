@@ -78,7 +78,7 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 - 当前：T14、T15（completed）
 - 下一动作：提交本轮改动（只按路径暂存）
 - 阻塞：无。真机遗留两项已如实记录：整机重启未执行（以 enabled + stop/start 验证）、真机无旧版分享可复验（单测覆盖）
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）、T13（`b32f581`、`1df0511`、`e339bed`、`fe66cd1`、`23b12e9`）、T14、T15（本轮工作区，提交后补 sha）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）、T10（`9697201`）、T11（`1897223`）、T12（`dc98e14`）、T13（`b32f581`、`1df0511`、`e339bed`、`fe66cd1`、`23b12e9`）、T14、T15（`387b676`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -3571,7 +3571,7 @@ git commit -m "docs(share): 记录流量管控、sing-box 与 HTTPS 的行为与
 - **Files:** `src-tauri/src/share/tls.rs`、`src-tauri/src/share/install.rs`
 - **Interfaces:** `tls::cert_domain_cmd() -> String`、`tls::cert_domains(sess,cancel) -> Vec<String>`、`tls::detect_cert_domain(sess,cancel) -> String`
 - **验收:** 服务器 `share_domain` 为空且证书有效时，`share_tls_status_cmd` 返回证书 SAN 中的域名且 `ready=true`；未配置 ACME 邮箱不再阻止使用已有证书；创建出的 URL/清单使用检测域名；`prepare_tls` 在证书过期但 SAN 存在时用该域名续签。
-- **状态:** completed ｜ **证据:** 单测 `share::tls_tests` 23 passed（含自动检测、多 SAN、配置不一致、无邮箱有效证书、续签用检测域名）；`share::install_tests::create_share_uses_domain_detected_from_server_cert` 通过；真机 `real_host_tls_autodetect` 返回 `50-114-236-17.sslip.io`、`ready=true`；全量 cargo 980 passed / 0 failed / 7 ignored / 23 filtered。
+- **状态:** completed ｜ **证据:** 单测 `share::tls_tests` 23 passed（含自动检测、多 SAN、配置不一致、无邮箱有效证书、续签用检测域名）；`share::install_tests::create_share_uses_domain_detected_from_server_cert` 通过；真机 `real_host_tls_autodetect` 返回 `50-114-236-17.sslip.io`、`ready=true`；全量 cargo 980 passed / 0 failed / 7 ignored / 23 filtered；提交 `387b676`。
 
 ### T15: 上游出口节点可分享（clone dedicated xray-upstream config）
 
@@ -3579,7 +3579,7 @@ git commit -m "docs(share): 记录流量管控、sing-box 与 HTTPS 的行为与
 - **Files:** `src-tauri/src/share/plan.rs`、`src-tauri/src/share/clone.rs`、`src-tauri/src/share/install.rs`
 - **Interfaces:** `ShareSource::{Main,Upstream}`、`ShareNodeSpec.source`、`clone_configs(main_xray, upstream_xray, …)`、`build_specs(nodes,pairs,upstream_node_ids)`、`read_main(...,"upstream", UPSTREAM_CONFIG_PATH)`
 - **验收:** 上游节点在 `list_share_candidates_cmd` 中 `shareable=true`；创建时从 `/usr/local/etc/xray-upstream/config.json` 取对应入站，改 `127.0.0.1` 与新回环端口、换新 UUID；只复制选中出口的出站/路由；同机其它出口的凭据不出现在分享配置中；分享连通后出口 IP 为该上游地址。
-- **状态:** completed ｜ **证据:** 单测 `share::clone_tests` 5 passed（含混选主配置+上游、其它出口密码不泄露）、`share::install_tests` 13 passed（含上游创建闭环）、IPC `list_share_candidates_cmd_marks_upstream_node_shareable` 通过；真机 ashura 创建上游分享 `3da0b65fed1e480c`，mihomo 实测 `generate_204` 204、`ipinfo.io` 出口 `161.77.152.232`（Springfield US），`usage.json` 增长到 27,494 字节，分享 xray 配置仅含 `out-up-4`，验证后已作废并确认目录/单元/端口无残留。
+- **状态:** completed ｜ **证据:** 单测 `share::clone_tests` 5 passed（含混选主配置+上游、其它出口密码不泄露）、`share::install_tests` 13 passed（含上游创建闭环）、IPC `list_share_candidates_cmd_marks_upstream_node_shareable` 通过；真机 ashura 创建上游分享 `3da0b65fed1e480c`，mihomo 实测 `generate_204` 204、`ipinfo.io` 出口 `161.77.152.232`（Springfield US），`usage.json` 增长到 27,494 字节，分享 xray 配置仅含 `out-up-4`，验证后已作废并确认目录/单元/端口无残留；提交 `387b676`。
 
 ### 第二轮验收补充
 
