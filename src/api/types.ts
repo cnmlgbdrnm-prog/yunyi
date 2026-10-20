@@ -257,6 +257,8 @@ export interface Server {
   /** 服务器出口地址族：VPS → 目标域名时优先/限定哪一族。
    *  与 `addr_family` 完全独立；改动后需重部署才在 VPS 上生效。 */
   egress_family: 'v4' | 'v6'
+  /** 分享域名（解析到该机）；空串 = 未配置。新分享强制 HTTPS。 */
+  share_domain: string
   port: number
   user: string
   auth_kind: 'password' | 'key'

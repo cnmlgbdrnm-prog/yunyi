@@ -308,6 +308,11 @@ CREATE UNIQUE INDEX idx_server_alerts_active
   ON server_alerts(server_id, kind) WHERE resolved_at IS NULL;
 CREATE INDEX idx_server_alerts_opened_at ON server_alerts(opened_at);
 "#,
+    r#"
+-- v18：分享域名。每台服务器一个，解析到该机；新分享用它签证书并生成 https 链接。
+-- 空串 = 未配置，新建分享会被拒绝（绝不退回 HTTP）。
+ALTER TABLE servers ADD COLUMN share_domain TEXT NOT NULL DEFAULT '';
+"#,
 ];
 
 /// 当前 schema 版本（= 已应用迁移条数）。测试断言用，避免把版本号写死在断言里——
