@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """vpn-ctl 分享入口网关：TCP/UDP 转发、字节计量、令牌桶限速、配额与到期。"""
-import argparse, asyncio, json, os, signal, time
+import argparse, asyncio, json, os, signal, socket, time
 
 
 class Bucket:
@@ -281,6 +281,32 @@ async def flusher(gw):
         gw.flush()
 
 
+def bind_socket(kind, host, port):
+    """创建分享入口套接字。
+
+    `host = "::"` 时必须显式关闭 IPV6_V6ONLY：Python 的 asyncio 在 IPv6 通配
+    地址上默认建 IPv6-only 套接字，IPv4 客户端会看到「端口关了」。分享页生成的
+    节点可能用 IPv4 或 IPv6，两种客户端都要能连进来。
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, kind)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError):
+                # 平台不支持双栈时保持 IPv6-only，至少 IPv6 客户端还能用。
+                pass
+        addr = (host, port, 0, 0) if family == socket.AF_INET6 else (host, port)
+        sock.bind(addr)
+        sock.setblocking(False)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -323,13 +349,15 @@ async def main():
         proto = entry.get("proto", "tcp")
         if "tcp" in proto:
             srv = await asyncio.start_server(
-                lambda r, w, t=target: gw.handle_tcp(r, w, t), args.bind, public
+                lambda r, w, t=target: gw.handle_tcp(r, w, t),
+                sock=bind_socket(socket.SOCK_STREAM, args.bind, public),
             )
             gw.servers.append(srv)
         if "udp" in proto:
             proto_obj = UdpPublic(target, gw)
             tr, _ = await loop.create_datagram_endpoint(
-                lambda p=proto_obj: p, local_addr=(args.bind, public)
+                lambda p=proto_obj: p,
+                sock=bind_socket(socket.SOCK_DGRAM, args.bind, public),
             )
             gw.transports.append(tr)
             asyncio.create_task(proto_obj.sweep())

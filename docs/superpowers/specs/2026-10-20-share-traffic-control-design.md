@@ -8,7 +8,7 @@
 >
 > **2026-10-20 范围变更（用户确认）：** 用户要求「让程序自动检测，上游节点访问应该可以分享」。据此：①分享域名在 `share_domain` 为空时自动从服务器分享证书的 DNS SAN 读取，已有有效证书不再要求 ACME 邮箱；②上游出口节点解除排除，创建时从专用 `xray-upstream` 配置克隆对应入站/出站/路由。下文涉及「排除上游」的旧描述以本节为准。
 >
-> **2026-10-21 增量（用户确认）：** 分享编辑支持增删节点。编辑时按节点 `(name, protocol)` 认领旧快照：保留节点的公网/回环端口与凭据不变（链接与 token 不变），新节点重新分配端口并生成凭据，未选中节点连同实例配置、unit、防火墙放行一并移除；改动前备份整份分享目录与 unit，任一步失败按备份恢复。仅改配额/速率/到期时仍走原来的「停网关 → 写配置 → 起网关」。下文「编辑（配额/速率/到期）」为该路径的旧描述。
+> **2026-10-21 增量（用户确认）：** 分享编辑支持增删节点。编辑时按节点 `(name, protocol)` 认领旧快照：保留节点的公网/回环端口与凭据不变（链接与 token 不变），新节点重新分配端口并生成凭据，未选中节点连同实例配置、unit、防火墙放行一并移除；改动前备份整份分享目录与 unit，任一步失败按备份恢复。仅改配额/速率/到期时仍走原来的「停网关 → 写配置 → 起网关」。下文「编辑（配额/速率/到期）」为该路径的旧描述。同日修复 IPv6 分享端口不可达：网关改为双栈监听，防火墙助手同时维护 `iptables`/`ip6tables`；编辑旧分享时自动升级共享脚本。
 
 **前置设计：** `2026-09-13-share-link-design.md`（本文在其基础上演进，保留「真实状态在服务器上」与「快照」两条原则）。
 
@@ -65,7 +65,7 @@
 | `share-http` | 只读静态订阅服务：YAML / sing-box JSON；TLS；禁列举；访问日志；失败请求限速 |
 | `share-gateway` | 每条分享一个：监听公网数据端口，TCP/UDP 转发到回环上的分享实例；字节计数、令牌桶限速、配额与到期判断、状态落盘 |
 | 分享实例 | 按协议族按需：Xray（vless/trojan/vmess）、sing-box（hysteria2/tuic）、shadowsocks-rust；入站只绑 `127.0.0.1`，凭据每条分享独立 |
-| 防火墙助手 | 安装一次：按注释幂等增删 iptables 规则；服务单元的 `ExecStartPost`/`ExecStopPost` 调用它，重启后自动恢复 |
+| 防火墙助手 | 安装一次：按注释幂等增删 `iptables` 与 `ip6tables` 规则（IPv4/IPv6 双栈）；服务单元的 `ExecStartPost`/`ExecStopPost` 调用它，重启后自动恢复 |
 | `vpnshare` 系统用户 | 所有订阅服务/网关/分享实例以它运行；无权读取主服务配置 |
 
 ### 服务器上的文件与单元
@@ -279,7 +279,8 @@
 - 新分享目录 0700 `vpnshare:vpnshare`；清单、实例配置、证书副本 0600。
 - 新分享的订阅服务、网关、分享实例均以 `vpnshare` 运行；创建阶段 SSH 仍为 root。旧分享维持原有的 root 运行与权限，不强行改造。
 - systemd 硬化：`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、`ReadWritePaths=/srv/vpnshare/<id>`、`RestrictAddressFamilies=AF_INET AF_INET6`。
-- 防火墙助手通过单元里的 `ExecStartPost=+...` / `ExecStopPost=+...` 以 root 执行，规则带 `vpnshare-<id>-<port>` 注释，幂等。
+- 防火墙助手通过单元里的 `ExecStartPost=+...` / `ExecStopPost=+...` 以 root 执行，规则带 `vpnshare-<id>-<port>` 注释，幂等；`iptables` 与 `ip6tables` 同时维护。
+- 网关在 `--bind ::` 时显式关闭 `IPV6_V6ONLY`，保证 IPv4/IPv6 客户端都能连入；订阅服务本来就绑定双栈。
 
 ### 订阅服务
 
