@@ -863,7 +863,9 @@ pub struct SummaryEntry {
 pub struct LastAccess {
     pub at: String,
     pub ip: String,
+    /// 最近一次取订阅的格式（yaml/singbox）；列表目前不展示，保留以完整映射摘要。
     #[serde(default)]
+    #[allow(dead_code)]
     pub format: Option<String>,
 }
 

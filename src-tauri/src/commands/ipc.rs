@@ -155,29 +155,19 @@ pub async fn export_singbox_selected_cmd(
 
 // ---------- 分享 ----------
 
-pub async fn list_shares(state: Arc<AppState>) -> R<crate::share::ShareList> {
-    crate::share::list_shares(&state).await.map_err(err)
-}
-
-pub async fn create_share(
-    state: Arc<AppState>,
+#[tauri::command]
+pub async fn list_share_candidates_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
-    node_ids: Vec<String>,
-) -> R<crate::share::ShareInfo> {
-    crate::share::create_share(&state, server_id, &node_ids)
-        .await
-        .map_err(err)
-}
-
-pub async fn delete_share(state: Arc<AppState>, server_id: i64, token: String) -> R<()> {
-    crate::share::delete_share(&state, server_id, &token)
-        .await
-        .map_err(err)
+) -> R<Vec<crate::share::ShareCandidate>> {
+    crate::share::share_candidates(state.inner(), server_id).map_err(err)
 }
 
 #[tauri::command]
-pub async fn list_shares_cmd(state: tauri::State<'_, Arc<AppState>>) -> R<crate::share::ShareList> {
-    list_shares(state.inner().clone()).await
+pub async fn list_shares_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> R<crate::share::ShareList> {
+    crate::share::list_shares(state.inner()).await.map_err(err)
 }
 
 #[tauri::command]
@@ -185,17 +175,93 @@ pub async fn create_share_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
     node_ids: Vec<String>,
+    quota_gb: u64,
+    rate_up_mbps: u32,
+    rate_down_mbps: u32,
+    expires_in_days: u32,
 ) -> R<crate::share::ShareInfo> {
-    create_share(state.inner().clone(), server_id, node_ids).await
+    crate::share::create_share(
+        state.inner(),
+        crate::share::CreateShareInput {
+            server_id,
+            node_ids,
+            options: crate::share::ShareOptions {
+                quota_bytes: crate::share::quota_gb_to_bytes(quota_gb),
+                rate_up_mbps,
+                rate_down_mbps,
+                expires_in_days,
+            },
+        },
+    )
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn update_share_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+    id: String,
+    quota_gb: u64,
+    rate_up_mbps: u32,
+    rate_down_mbps: u32,
+    expires_in_days: u32,
+) -> R<crate::share::ShareInfo> {
+    crate::share::update_share(
+        state.inner(),
+        server_id,
+        &id,
+        crate::share::ShareOptions {
+            quota_bytes: crate::share::quota_gb_to_bytes(quota_gb),
+            rate_up_mbps,
+            rate_down_mbps,
+            expires_in_days,
+        },
+    )
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn reset_share_usage_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+    id: String,
+) -> R<crate::share::ShareInfo> {
+    crate::share::reset_usage(state.inner(), server_id, &id)
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]
 pub async fn delete_share_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
-    token: String,
+    id: String,
 ) -> R<()> {
-    delete_share(state.inner().clone(), server_id, token).await
+    crate::share::delete_share(state.inner(), server_id, &id)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn prepare_share_tls_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+) -> R<crate::share::ShareTlsStatus> {
+    crate::share::prepare_tls(state.inner(), server_id)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn share_tls_status_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+) -> R<crate::share::ShareTlsStatus> {
+    crate::share::tls_status(state.inner(), server_id)
+        .await
+        .map_err(err)
 }
 
 #[tauri::command]

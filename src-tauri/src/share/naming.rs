@@ -48,9 +48,6 @@ pub fn gateway_config_path(id: &str) -> String {
 pub fn usage_path(id: &str) -> String {
     format!("{SHARE_ROOT}/{id}/usage.json")
 }
-pub fn sub_dir(id: &str) -> String {
-    format!("{SHARE_ROOT}/{id}/sub")
-}
 pub fn yaml_path(id: &str, token: &str) -> String {
     format!("{SHARE_ROOT}/{id}/sub/{token}")
 }
