@@ -1276,11 +1276,26 @@ pub(crate) fn legacy_info(
 /// 编辑配额、速率与到期。**保留已用字节**，只清除「已停用」标记——用户提高配额
 /// 或续期后网关重新开始转发；若新配额仍低于已用量，状态仍会显示超额（下次计费
 /// 时网关会立刻再次停用）。
+#[allow(dead_code)] // 兼容旧调用方/真机测试；命令层已改用 update_share_with_nodes
 pub async fn update_share(
     state: &Arc<AppState>,
     server_id: i64,
     id: &str,
     options: ShareOptions,
+) -> Result<ShareInfo, String> {
+    update_share_with_nodes(state, server_id, id, options, None).await
+}
+
+/// 编辑分享。`node_ids = Some(...)` 时同时增删节点；`None` 保持旧行为，只改配额/速率/到期。
+///
+/// 增删节点是**增量替换**：保留仍被选中的节点的公网/回环端口与凭据，链接和 token
+/// 不变；新节点分配端口并生成新凭据；未选中的节点及其端口/单元/防火墙规则一并移除。
+pub async fn update_share_with_nodes(
+    state: &Arc<AppState>,
+    server_id: i64,
+    id: &str,
+    options: ShareOptions,
+    node_ids: Option<Vec<String>>,
 ) -> Result<ShareInfo, String> {
     if !is_valid_id(id) {
         return Err("分享 id 非法".into());
@@ -1321,6 +1336,13 @@ pub async fn update_share(
     usage.blocked_at = None;
     usage.blocked_direction = None;
     usage.updated_at = chrono::Utc::now().to_rfc3339();
+
+    if let Some(node_ids) = node_ids {
+        return update_share_node_set(
+            state, &mut sess, &cancel, &server, id, manifest, usage, node_ids,
+        )
+        .await;
+    }
 
     let gw_unit = gateway_unit_name(id);
     run_cmd_ok(
@@ -1391,6 +1413,789 @@ pub async fn update_share(
     ensure_gateway_active(&mut sess, &cancel, &gw_unit).await?;
 
     Ok(info_from_manifest(&manifest, &usage, &server, true))
+}
+
+/// 节点集合编辑：保留仍被选中节点的端口/凭据，新增节点分配端口并生成凭据，
+/// 未选中的节点连同配置、单元与防火墙放行一起移除。
+///
+/// 任何一步失败都会用编辑前的备份恢复整份分享（目录 + 单元文件 + 防火墙），
+/// 避免「配额已改、节点只换了一半」的半成品状态。
+async fn update_share_node_set(
+    state: &Arc<AppState>,
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    server: &Server,
+    id: &str,
+    mut manifest: ShareManifest,
+    usage: UsageState,
+    node_ids: Vec<String>,
+) -> Result<ShareInfo, String> {
+    if node_ids.is_empty() {
+        return Err("至少选择一个节点".into());
+    }
+
+    let old_nodes = manifest.nodes.clone();
+    let candidates = plan::share_candidates(state, manifest.server_id)?;
+    let mut old_by_key: HashMap<(String, String), ShareNode> = old_nodes
+        .iter()
+        .cloned()
+        .map(|n| ((n.name.clone(), n.protocol.clone()), n))
+        .collect();
+
+    // 仍被选中的节点按 (name, protocol) 认领旧端口/凭据；旧节点即使现在不可分享
+    // （例如后来被停用/挂上中转），也允许用户保留，只有**新增**节点要求通过准入。
+    let mut seen = HashSet::new();
+    let mut chosen: Vec<(Node, Option<ShareNode>)> = Vec::new();
+    for node_id in node_ids {
+        if !seen.insert(node_id.clone()) {
+            return Err(format!("节点重复选择: {node_id}"));
+        }
+        let candidate = candidates
+            .iter()
+            .find(|c| c.node.id == node_id)
+            .ok_or_else(|| format!("节点不存在: {node_id}"))?;
+        let key = (candidate.node.name.clone(), candidate.node.protocol.clone());
+        let retained = old_by_key.remove(&key);
+        if retained.is_none() {
+            if let Some(reason) = &candidate.reason {
+                return Err(format!("节点 {} 不可分享: {reason}", candidate.node.name));
+            }
+        }
+        chosen.push((candidate.node.clone(), retained));
+    }
+    if chosen.iter().filter(|(n, _)| n.protocol == "ss").count() > 1 {
+        return Err("Shadowsocks 分享一次只允许一个节点".into());
+    }
+
+    let upstream_node_ids: HashSet<String> = {
+        let conn = state.db.lock();
+        crate::db::repos::upstreams::list_by_server(&conn, manifest.server_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|u| u.node_id)
+            .collect()
+    };
+
+    // 只给新增节点分配端口；被保留的节点沿用原公网/回环端口，已发出去的订阅
+    // 里这些端口仍然有效。
+    let new_transports: Vec<&str> = chosen
+        .iter()
+        .filter(|(_, old)| old.is_none())
+        .map(|(n, _)| transport_for(&n.protocol))
+        .collect();
+    let allocated = if new_transports.is_empty() {
+        None
+    } else {
+        Some(allocate_share_ports(sess, cancel, &new_transports).await?)
+    };
+    let mut next_new_pair = 0usize;
+    let mut pairs = Vec::with_capacity(chosen.len());
+    for (_, old) in &chosen {
+        match old {
+            Some(n) => pairs.push((n.public_port, n.internal_port)),
+            None => {
+                let pair = allocated
+                    .as_ref()
+                    .and_then(|a| a.pairs.get(next_new_pair))
+                    .copied()
+                    .ok_or("分配新节点端口失败")?;
+                next_new_pair += 1;
+                pairs.push(pair);
+            }
+        }
+    }
+
+    let chosen_nodes: Vec<Node> = chosen.iter().map(|(n, _)| n.clone()).collect();
+    let mut specs = build_specs(&chosen_nodes, &pairs, &upstream_node_ids)?;
+    for (spec, (_, old)) in specs.iter_mut().zip(chosen.iter()) {
+        if let Some(old) = old {
+            let (credential, password) = existing_share_credential(old)?;
+            spec.new_credential = credential;
+            spec.new_password = password;
+        }
+    }
+
+    let main_xray = read_main(sess, cancel, &specs, "vless", XRAY_CONFIG_PATH).await?;
+    let main_sb = read_main(sess, cancel, &specs, "hysteria2", SINGBOX_CONFIG_PATH).await?;
+    let main_ss = read_main(sess, cancel, &specs, "ss", SS_CONFIG_PATH).await?;
+    let upstream_xray = read_main(sess, cancel, &specs, "upstream", UPSTREAM_CONFIG_PATH).await?;
+    let cloned = clone_configs(
+        main_xray.as_deref(),
+        upstream_xray.as_deref(),
+        main_sb.as_deref(),
+        main_ss.as_deref(),
+        &specs,
+        effective_host(server),
+        id,
+        &[],
+    )?;
+    manifest.nodes = specs
+        .iter()
+        .zip(cloned.share_nodes.iter())
+        .map(|(s, n)| ShareNode {
+            name: s.name.clone(),
+            protocol: s.protocol.clone(),
+            public_port: s.public_port,
+            internal_port: s.internal_port,
+            transport: s.transport.into(),
+            params_json: n.params_json.clone(),
+        })
+        .collect();
+    let gateway = gateway_from_manifest(&manifest);
+    let dir = share_dir(id);
+    let bind = if server.addr_family == "v6" {
+        "::"
+    } else {
+        "0.0.0.0"
+    };
+    let new_pairs = spec_public_pairs(&specs);
+    let old_pairs = share_node_public_pairs(&old_nodes);
+    let old_families = share_node_families(&old_nodes);
+    let new_families = share_node_families(&manifest.nodes);
+    let old_instance_units = instance_units_for(id, &old_families);
+    let new_instance_units = instance_units_for(id, &new_families);
+
+    let backup = format!("/srv/vpnshare/.update-{id}");
+    run_cmd_ok(
+        sess,
+        cancel,
+        "备份",
+        &format!("rm -rf {backup} && mkdir -p {backup}/units && cp -a {dir} {backup}/data"),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("备份现有分享失败，未做任何修改：{e}"))?;
+    let _ = run_cmd_ok(
+        sess,
+        cancel,
+        "备份",
+        &format!(
+            "cp -a /etc/systemd/system/vpnshare-{id}*.service {backup}/units/ 2>/dev/null || true"
+        ),
+        CONFIG_TIMEOUT,
+    )
+    .await;
+    run_cmd_ok(
+        sess,
+        cancel,
+        "备份",
+        &format!(
+            "test -f {backup}/units/vpnshare-{id}.service && \
+             test -f {backup}/units/vpnshare-{id}-gateway.service"
+        ),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("备份现有单元失败，未做任何修改：{e}"))?;
+
+    let mut old_start_units = vec![unit_name(id), gateway_unit_name(id)];
+    old_start_units.extend(old_instance_units.iter().cloned());
+
+    let mut stop_units: Vec<String> = Vec::new();
+    let mut stop_seen = HashSet::new();
+    for unit in std::iter::once(gateway_unit_name(id))
+        .chain(std::iter::once(unit_name(id)))
+        .chain(old_instance_units.iter().cloned())
+        .chain(new_instance_units.iter().cloned())
+    {
+        if stop_seen.insert(unit.clone()) {
+            stop_units.push(unit);
+        }
+    }
+    for unit in &stop_units {
+        run_cmd_ok(
+            sess,
+            cancel,
+            "停止旧分享",
+            &format!("systemctl stop {unit} 2>/dev/null || true"),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+    }
+    // `|| true` 会把真实失败也吞掉；写配置前必须确认每个单元真的停了，
+    // 否则旧实例可能继续占用回环端口，或把已删除的节点留在内存里运行。
+    let mut still_active = Vec::new();
+    for unit in &stop_units {
+        let state = run_cmd(
+            sess,
+            cancel,
+            "停止旧分享",
+            &format!("systemctl is-active {unit}"),
+            PROBE_TIMEOUT,
+        )
+        .await?
+        .stdout
+        .trim()
+        .to_string();
+        if matches!(state.as_str(), "active" | "activating" | "deactivating") {
+            still_active.push(format!("{unit}（{state}）"));
+        }
+    }
+    if !still_active.is_empty() {
+        let leftovers = restore_share_after_failed_node_update(
+            sess,
+            cancel,
+            id,
+            &backup,
+            &old_nodes,
+            &manifest.nodes,
+            &old_start_units,
+        )
+        .await;
+        return Err(format!(
+            "单元未能停止：{}，未修改节点{}",
+            still_active.join("、"),
+            rollback_suffix(&leftovers)
+        ));
+    }
+
+    let setup: Result<(), String> = async {
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &share_gateway_script_path(),
+            &scripts::share_gateway_script(),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &manifest_path(id),
+            &serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &gateway_config_path(id),
+            &serde_json::to_string_pretty(&gateway).map_err(|e| e.to_string())?,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &usage_path(id),
+            &serde_json::to_string(&usage).map_err(|e| e.to_string())?,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &yaml_path(id, &manifest.token),
+            &cloned.yaml,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &singbox_path(id, &manifest.token),
+            &cloned.singbox_json,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+
+        // 已不再需要的协议族：停用、删单元与实例配置；sing-box 的证书副本一并清理。
+        for family in old_families.difference(&new_families) {
+            let unit = instance_unit_name(id, family);
+            run_cmd_ok(
+                sess,
+                cancel,
+                "移除旧节点",
+                &format!("systemctl disable {unit} 2>/dev/null || true"),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+            run_cmd_ok(
+                sess,
+                cancel,
+                "移除旧节点",
+                &format!(
+                    "rm -f {} {}",
+                    unit_path(&unit),
+                    instance_config_path(id, family)
+                ),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+            if *family == "singbox" {
+                run_cmd_ok(
+                    sess,
+                    cancel,
+                    "移除旧节点",
+                    &format!("rm -f {dir}/singbox.crt {dir}/singbox.key"),
+                    CONFIG_TIMEOUT,
+                )
+                .await?;
+            }
+        }
+
+        if let Some(cfg) = &cloned.xray_config {
+            write_remote_file(
+                sess,
+                cancel,
+                "写入",
+                &instance_config_path(id, "xray"),
+                cfg,
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+            let unit = instance_unit_name(id, "xray");
+            write_remote_file(
+                sess,
+                cancel,
+                "写入",
+                &unit_path(&unit),
+                &instance_unit(id, &unit, "xray", &dir, &instance_config_path(id, "xray")),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+        }
+        if let Some(cfg) = &cloned.singbox_config {
+            run_cmd_ok(
+                sess,
+                cancel,
+                "准备",
+                &format!(
+                    "install -m 600 /etc/sing-box/self.crt {dir}/singbox.crt && \
+                     install -m 600 /etc/sing-box/self.key {dir}/singbox.key"
+                ),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+            write_remote_file(
+                sess,
+                cancel,
+                "写入",
+                &instance_config_path(id, "singbox"),
+                cfg,
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+            let unit = instance_unit_name(id, "singbox");
+            write_remote_file(
+                sess,
+                cancel,
+                "写入",
+                &unit_path(&unit),
+                &instance_unit(
+                    id,
+                    &unit,
+                    "singbox",
+                    &dir,
+                    &instance_config_path(id, "singbox"),
+                ),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+        }
+        if let Some(cfg) = &cloned.ss_config {
+            write_remote_file(
+                sess,
+                cancel,
+                "写入",
+                &instance_config_path(id, "ss"),
+                cfg,
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+            let unit = instance_unit_name(id, "ss");
+            write_remote_file(
+                sess,
+                cancel,
+                "写入",
+                &unit_path(&unit),
+                &instance_unit(id, &unit, "ss", &dir, &instance_config_path(id, "ss")),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+        }
+
+        let share_units = unit_contents(id, manifest.http_port, bind, &dir, &new_pairs);
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &unit_path(&unit_name(id)),
+            &share_units.http,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        write_remote_file(
+            sess,
+            cancel,
+            "写入",
+            &unit_path(&gateway_unit_name(id)),
+            &share_units.gateway,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        run_cmd_ok(
+            sess,
+            cancel,
+            "准备",
+            &format!("chown -R vpnshare:vpnshare {dir} && chmod 600 {dir}/*.json {dir}/sub/*"),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        run_cmd_ok(
+            sess,
+            cancel,
+            "准备",
+            "systemctl daemon-reload",
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+
+        // 旧网关停止时已按旧单元关掉全部旧端口；这里再显式关闭新集合之外的
+        // 端口，防止旧单元缺失 ExecStopPost 时留下永久放行规则。
+        let removed_pairs: Vec<(u16, &str)> = old_pairs
+            .iter()
+            .filter(|p| !new_pairs.contains(p))
+            .cloned()
+            .collect();
+        close_public_pairs(sess, cancel, id, &removed_pairs).await?;
+
+        // 先起实例再起网关：网关开始转发时回环目标已经就绪。
+        let mut start_units = new_instance_units.clone();
+        start_units.push(gateway_unit_name(id));
+        start_units.push(unit_name(id));
+        for unit in &start_units {
+            run_cmd_ok(
+                sess,
+                cancel,
+                "启动",
+                &format!("systemctl enable --now {unit}"),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+        }
+        for unit in &start_units {
+            let out = run_cmd(
+                sess,
+                cancel,
+                "确认",
+                &format!("systemctl is-active {unit}"),
+                PROBE_TIMEOUT,
+            )
+            .await?;
+            if out.stdout.trim() != "active" {
+                return Err(format!(
+                    "单元 {unit} 未进入 active 状态（systemctl：{}）",
+                    out.stdout.trim()
+                ));
+            }
+        }
+
+        let code = run_cmd(
+            sess,
+            cancel,
+            "自测",
+            &format!(
+                "curl -s -o /dev/null -w '%{{http_code}}' --resolve {domain}:{port}:127.0.0.1 \
+                 https://{domain}:{port}/sub/{token} --max-time 10",
+                domain = manifest.domain,
+                port = manifest.http_port,
+                token = manifest.token
+            ),
+            PROBE_TIMEOUT,
+        )
+        .await?
+        .stdout;
+        if code.trim() != "200" {
+            return Err(format!("分享链接自测返回 {}（期望 200）", code.trim()));
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = setup {
+        let leftovers = restore_share_after_failed_node_update(
+            sess,
+            cancel,
+            id,
+            &backup,
+            &old_nodes,
+            &manifest.nodes,
+            &old_start_units,
+        )
+        .await;
+        return Err(format!(
+            "{e}；{}",
+            if leftovers.is_empty() {
+                "已恢复编辑前的节点配置".to_string()
+            } else {
+                format!("回滚后仍有残留：{leftovers:?}")
+            }
+        ));
+    }
+
+    let _ = run_cmd_ok(
+        sess,
+        cancel,
+        "清理备份",
+        &format!("rm -rf {backup}"),
+        CONFIG_TIMEOUT,
+    )
+    .await;
+    Ok(info_from_manifest(&manifest, &usage, server, true))
+}
+
+fn rollback_suffix(leftovers: &[String]) -> String {
+    if leftovers.is_empty() {
+        String::new()
+    } else {
+        format!("；回滚后仍有残留：{leftovers:?}")
+    }
+}
+
+/// 失败回滚：停掉新旧全部单元，恢复分享目录与单元文件，再按旧节点重开端口/启动。
+/// 所有步骤尽力而为，返回无法确认恢复的项目。
+async fn restore_share_after_failed_node_update(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    id: &str,
+    backup: &str,
+    old_nodes: &[ShareNode],
+    new_nodes: &[ShareNode],
+    old_units: &[String],
+) -> Vec<String> {
+    let mut leftovers = Vec::new();
+    for unit in [
+        unit_name(id),
+        gateway_unit_name(id),
+        instance_unit_name(id, "xray"),
+        instance_unit_name(id, "singbox"),
+        instance_unit_name(id, "ss"),
+    ] {
+        if run_cmd_ok(
+            sess,
+            cancel,
+            "回滚",
+            &format!("systemctl disable --now {unit} 2>/dev/null || true"),
+            CONFIG_TIMEOUT,
+        )
+        .await
+        .is_err()
+        {
+            leftovers.push(format!("unit {unit}"));
+        }
+    }
+    let dir = share_dir(id);
+    if run_cmd_ok(
+        sess,
+        cancel,
+        "回滚",
+        &format!("rm -f /etc/systemd/system/vpnshare-{id}*.service"),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        leftovers.push("旧单元文件清理".into());
+    }
+    let _ = run_cmd_ok(
+        sess,
+        cancel,
+        "回滚",
+        &format!(
+            "cp -a {backup}/units/vpnshare-{id}*.service /etc/systemd/system/ 2>/dev/null || true"
+        ),
+        CONFIG_TIMEOUT,
+    )
+    .await;
+    if run_cmd_ok(
+        sess,
+        cancel,
+        "回滚",
+        &format!("rm -rf {dir} && cp -a {backup}/data {dir}"),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        leftovers.push(format!("目录 {dir}"));
+    }
+    if run_cmd_ok(
+        sess,
+        cancel,
+        "回滚",
+        "systemctl daemon-reload",
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        leftovers.push("daemon-reload".into());
+    }
+
+    let old_pairs = share_node_public_pairs(old_nodes);
+    let new_pairs = share_node_public_pairs(new_nodes);
+    let added: Vec<(u16, &str)> = new_pairs
+        .iter()
+        .filter(|p| !old_pairs.contains(p))
+        .cloned()
+        .collect();
+    if let Err(e) = close_public_pairs(sess, cancel, id, &added).await {
+        leftovers.push(format!("撤新端口：{e}"));
+    }
+    if let Err(e) = open_public_pairs(sess, cancel, id, &old_pairs).await {
+        leftovers.push(format!("恢复旧端口：{e}"));
+    }
+
+    for unit in old_units {
+        if run_cmd_ok(
+            sess,
+            cancel,
+            "回滚",
+            &format!("systemctl enable --now {unit}"),
+            CONFIG_TIMEOUT,
+        )
+        .await
+        .is_err()
+        {
+            leftovers.push(format!("启动 {unit}"));
+        }
+    }
+    let _ = run_cmd_ok(
+        sess,
+        cancel,
+        "回滚",
+        &format!("rm -rf {backup}"),
+        CONFIG_TIMEOUT,
+    )
+    .await;
+    leftovers
+}
+
+fn transport_for(protocol: &str) -> &'static str {
+    match protocol {
+        "hysteria2" | "tuic" => "udp",
+        "ss" => "tcp_and_udp",
+        _ => "tcp",
+    }
+}
+
+fn share_node_families(nodes: &[ShareNode]) -> HashSet<&'static str> {
+    nodes
+        .iter()
+        .filter_map(|n| match n.protocol.as_str() {
+            "vless" | "trojan" | "vmess" => Some("xray"),
+            "hysteria2" | "tuic" => Some("singbox"),
+            "ss" => Some("ss"),
+            _ => None,
+        })
+        .collect()
+}
+
+fn instance_units_for(id: &str, families: &HashSet<&'static str>) -> Vec<String> {
+    let mut units = Vec::new();
+    for family in ["xray", "singbox", "ss"] {
+        if families.contains(family) {
+            units.push(instance_unit_name(id, family));
+        }
+    }
+    units
+}
+
+fn share_node_public_pairs(nodes: &[ShareNode]) -> Vec<(u16, &'static str)> {
+    nodes
+        .iter()
+        .flat_map(|n| match n.transport.as_str() {
+            "tcp_and_udp" => vec![(n.public_port, "tcp"), (n.public_port, "udp")],
+            "tcp" => vec![(n.public_port, "tcp")],
+            "udp" => vec![(n.public_port, "udp")],
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn spec_public_pairs(specs: &[ShareNodeSpec]) -> Vec<(u16, &'static str)> {
+    specs
+        .iter()
+        .flat_map(|s| match s.transport {
+            "tcp_and_udp" => vec![(s.public_port, "tcp"), (s.public_port, "udp")],
+            other => vec![(s.public_port, other)],
+        })
+        .collect()
+}
+
+async fn close_public_pairs(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    id: &str,
+    pairs: &[(u16, &str)],
+) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    run_cmd_ok(
+        sess,
+        cancel,
+        "撤防火墙",
+        &format!(
+            "{} close vpnshare-{id} {}",
+            firewall_script_path(),
+            firewall_specs(pairs)
+        ),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn open_public_pairs(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    id: &str,
+    pairs: &[(u16, &str)],
+) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    run_cmd_ok(
+        sess,
+        cancel,
+        "恢复防火墙",
+        &format!(
+            "{} open vpnshare-{id} {}",
+            firewall_script_path(),
+            firewall_specs(pairs)
+        ),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// 从现有分享的节点参数里取回凭据；编辑节点集合时保留这些凭据，
+/// 已导入的客户端不需要换订阅也能继续用。
+fn existing_share_credential(node: &ShareNode) -> Result<(String, Option<String>), String> {
+    let params: serde_json::Value = serde_json::from_str(&node.params_json)
+        .map_err(|e| format!("节点 {} 的分享参数损坏: {e}", node.name))?;
+    let field = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("节点 {} 的分享参数缺少 {key}", node.name))
+    };
+    match node.protocol.as_str() {
+        "vless" | "vmess" => Ok((field("uuid")?, None)),
+        "tuic" => Ok((field("uuid")?, Some(field("password")?))),
+        _ => Ok((field("password")?, None)),
+    }
 }
 
 /// 重置用量：把 `usage.json` 归零并重启网关。到期时间与配额不变；已到期的分享

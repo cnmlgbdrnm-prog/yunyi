@@ -209,8 +209,9 @@ pub async fn update_share_cmd(
     rate_up_mbps: u32,
     rate_down_mbps: u32,
     expires_in_days: u32,
+    node_ids: Option<Vec<String>>,
 ) -> R<crate::share::ShareInfo> {
-    crate::share::update_share(
+    crate::share::update_share_with_nodes(
         state.inner(),
         server_id,
         &id,
@@ -221,6 +222,7 @@ pub async fn update_share_cmd(
             rate_down_mbps,
             expires_in_days,
         },
+        node_ids,
     )
     .await
     .map_err(err)

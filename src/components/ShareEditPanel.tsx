@@ -1,9 +1,10 @@
-// 编辑分享：配额/上下行速率/剩余有效期；重置用量独立二次确认。
+// 编辑分享：节点增删、配额/上下行速率/剩余有效期；重置用量独立二次确认。
 // 编辑会停-写-起网关并保留已用字节；到期时间按「从现在起 N 天」重新计算。
-import { useState } from 'react'
-import { resetShareUsage, updateShare } from '../api'
+// 节点只在选择集合发生变化时才提交：仍被选中的节点沿用原端口与凭据，链接不变。
+import { useEffect, useState } from 'react'
+import { listShareCandidates, resetShareUsage, updateShare } from '../api'
 import ConfirmButton from './ConfirmButton'
-import type { ShareInfo } from '../api/types'
+import type { ShareCandidate, ShareInfo } from '../api/types'
 
 interface Props {
   share: ShareInfo
@@ -42,6 +43,70 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
   const [days, setDays] = useState(remainingDays(share.expires_at))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [candidates, setCandidates] = useState<ShareCandidate[]>([])
+  const [initialNodeIds, setInitialNodeIds] = useState<Set<string> | null>(null)
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [nodesReady, setNodesReady] = useState(false)
+  const [nodesLoading, setNodesLoading] = useState(true)
+  const [nodesError, setNodesError] = useState<string | null>(null)
+
+  // 节点候选来自后端；当前分享的节点按名字映射回候选 id。读不到候选时
+  // 仍然允许只改配额——此时不传 nodeIds，后端不会动节点。
+  useEffect(() => {
+    let alive = true
+    setNodesLoading(true)
+    setNodesError(null)
+    setNodesReady(false)
+    listShareCandidates(share.server_id)
+      .then((list) => {
+        if (!alive) return
+        const currentNames = new Set(share.node_names)
+        const current = new Set(
+          list
+            .filter((c) => currentNames.has(c.node.name))
+            .map((c) => c.node.id),
+        )
+        setCandidates(list)
+        setInitialNodeIds(current)
+        setPicked(new Set(current))
+        setNodesReady(true)
+      })
+      .catch((e) => {
+        if (!alive) return
+        setNodesError(`节点列表读取失败：${String(e)}；保存只改配额，不会改动节点`)
+      })
+      .finally(() => {
+        if (alive) setNodesLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [share.id, share.server_id, share.node_names])
+
+  const toggleNode = (id: string) => {
+    setPicked((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const ssPicked = candidates.filter(
+    (c) => picked.has(c.node.id) && c.node.protocol === 'ss',
+  ).length
+  const unmatchedCurrent = share.node_names.filter(
+    (name) => !candidates.some((c) => c.node.name === name),
+  )
+  const nodeSetChanged =
+    nodesReady &&
+    initialNodeIds !== null &&
+    (picked.size !== initialNodeIds.size ||
+      [...picked].some((id) => !initialNodeIds.has(id)))
+  // 只有用户真的改了节点集合才校验「至少一个」「SS 最多一个」；否则允许只改配额，
+  // 也避免当前节点不在候选列表时把人锁死。
+  const nodeSetValid =
+    !nodesReady || !nodeSetChanged || (picked.size > 0 && ssPicked <= 1)
 
   const optionsValid =
     validNumber(quotaUpGb, 0, Number.MAX_SAFE_INTEGER) &&
@@ -50,9 +115,10 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
     validNumber(rateUp, 0, 100_000) &&
     validNumber(rateDown, 0, 100_000) &&
     validNumber(days, 1, 3650)
+  const canSave = optionsValid && nodeSetValid && !nodesLoading && !busy
 
   const handleSave = async () => {
-    if (!optionsValid) return
+    if (!canSave) return
     setError(null)
     setBusy(true)
     try {
@@ -65,6 +131,7 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
           Number(rateUp),
           Number(rateDown),
           Number(days),
+          nodeSetChanged ? [...picked] : undefined,
         ),
       )
     } catch (e) {
@@ -115,6 +182,62 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
           {error}
         </p>
       )}
+
+      <div className="space-y-1">
+        <div className="text-xs text-neutral-400">
+          节点（取消勾选即删除，勾选新节点即添加；保留的节点链接与凭据不变）
+        </div>
+        {nodesLoading ? (
+          <p className="text-xs text-neutral-400">读取候选节点…</p>
+        ) : nodesReady ? (
+          <>
+            <ul className="max-h-48 space-y-1 overflow-y-auto rounded bg-neutral-950 p-2">
+              {candidates.map((c) => {
+                const checked = picked.has(c.node.id)
+                return (
+                  <li key={c.node.id}>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        aria-label={`选择节点 ${c.node.name}`}
+                        checked={checked}
+                        disabled={busy || (!c.shareable && !checked)}
+                        onChange={() => toggleNode(c.node.id)}
+                      />
+                      <span>{c.node.name}</span>
+                      <span className="text-xs text-neutral-500">{c.node.protocol}</span>
+                      {c.reason && (
+                        <span className="text-xs text-amber-500">
+                          {c.reason}
+                          {checked ? '（保留现有节点）' : ''}
+                        </span>
+                      )}
+                    </label>
+                  </li>
+                )
+              })}
+            </ul>
+            {nodeSetChanged && picked.size === 0 && (
+              <p className="text-xs text-red-300">至少保留一个节点</p>
+            )}
+            {nodeSetChanged && ssPicked > 1 && (
+              <p className="text-xs text-red-300">
+                Shadowsocks 一次只能保留一个节点
+              </p>
+            )}
+            {unmatchedCurrent.length > 0 && (
+              <p className="rounded bg-amber-950 px-2 py-1 text-xs text-amber-300">
+                当前分享中的节点「{unmatchedCurrent.join('、')}」不在候选列表（可能已停用或删除）；
+                改动节点选择并保存后会被移除。
+              </p>
+            )}
+          </>
+        ) : (
+          <p role="status" className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-400">
+            {nodesError}
+          </p>
+        )}
+      </div>
 
       <div className="grid grid-cols-2 gap-2">
         <label className="flex flex-col gap-1 text-xs text-neutral-400">
@@ -181,7 +304,7 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
         <button
           type="button"
           onClick={() => void handleSave()}
-          disabled={busy || !optionsValid}
+          disabled={!canSave}
           className="rounded bg-blue-600 px-3 py-1.5 text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {busy ? '保存中…' : '保存'}

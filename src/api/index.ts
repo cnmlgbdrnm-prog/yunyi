@@ -163,7 +163,8 @@ export function createShare(
   })
 }
 
-/** 编辑配额/速率/到期：停-写-起网关，保留已用字节。 */
+/** 编辑配额/速率/到期：停-写-起网关，保留已用字节。
+ *  `nodeIds` 省略 = 不改节点；传入时增删节点并保留仍在列表中的节点端口/凭据。 */
 export function updateShare(
   serverId: number,
   id: string,
@@ -172,6 +173,7 @@ export function updateShare(
   rateUpMbps: number,
   rateDownMbps: number,
   expiresInDays: number,
+  nodeIds?: string[],
 ): Promise<ShareInfo> {
   return invoke('update_share_cmd', {
     serverId,
@@ -181,6 +183,7 @@ export function updateShare(
     rateUpMbps,
     rateDownMbps,
     expiresInDays,
+    nodeIds,
   })
 }
 

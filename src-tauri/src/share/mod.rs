@@ -19,8 +19,10 @@ pub mod plan;
 pub mod scripts;
 pub mod tls;
 
+#[allow(unused_imports)] // `update_share` 仍供真机测试与外部调用使用
 pub use install::{
-    create_share, delete_share, list_shares, reset_usage, update_share, CreateShareInput,
+    create_share, delete_share, list_shares, reset_usage, update_share, update_share_with_nodes,
+    CreateShareInput,
 };
 pub use model::*;
 // 根导出是 T10/T11 的契约；binary crate 里部分路径只在测试中使用，统一放行告警。
