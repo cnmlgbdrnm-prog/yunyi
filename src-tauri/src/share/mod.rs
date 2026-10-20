@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+pub mod clone;
 pub mod model;
 pub mod naming;
 pub mod plan;
