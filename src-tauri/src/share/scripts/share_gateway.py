@@ -235,12 +235,32 @@ async def main():
         cfg = json.load(f)
     gw = Gateway(cfg, args.usage)
     gw.flush()
+    loop = asyncio.get_running_loop()
+    stopping = asyncio.Event()
+
+    async def stop():
+        gw.flush()
+        for s in gw.servers:
+            s.close()
+        for t in gw.transports:
+            t.close()
+        stopping.set()
+
+    # 先注册信号再进任何等待：已到期的分享启动后不监听，也必须能被 systemctl
+    # stop 优雅收尾。loop.stop() 会让 asyncio.run 以「Event loop stopped before
+    # Future completed」退出 1，被 systemd 记为失败，所以这里只置事件、让 main 返回。
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(stop()))
+    except NotImplementedError:
+        pass  # Windows 本地测试；生产在 Linux 上走 add_signal_handler
+
     if gw.expired():
         gw.block("expired")
     if gw.blocked:
-        while True:
-            await asyncio.sleep(3600)
-    loop = asyncio.get_running_loop()
+        await stopping.wait()
+        return
+
     for entry in cfg.get("ports", []):
         public = int(entry["public"])
         target = int(entry["target"])
@@ -258,25 +278,14 @@ async def main():
             gw.transports.append(tr)
             asyncio.create_task(proto_obj.sweep())
 
-    async def stop():
-        gw.flush()
-        for s in gw.servers:
-            s.close()
-        for t in gw.transports:
-            t.close()
-        loop.stop()
-
-    try:
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(stop()))
-    except NotImplementedError:
-        pass  # Windows 本地测试；生产在 Linux 上走 add_signal_handler
-
     asyncio.create_task(flusher(gw))
-    while True:
+    while not stopping.is_set():
         if gw.expired():
             gw.block("expired")
-        await asyncio.sleep(1)
+        try:
+            await asyncio.wait_for(stopping.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 if __name__ == "__main__":
