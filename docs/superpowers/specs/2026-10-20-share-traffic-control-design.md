@@ -118,7 +118,8 @@
 
 - `used_bytes >= quota_bytes` 或服务器时间 ≥ `expire_at`：网关关闭公网监听、断开现有连接，写 `blocked` 原因；进程保持运行。
 - 订阅 HTTP 服务不停：对方仍可取到配置，但数据端口连不上。
-- 「编辑」（配额/速率/到期）与「重置用量」：停网关 → 原子写 `gateway.json` / 清零 `usage.json` → 起网关。编辑期间连接会断一下。
+- 「编辑」（配额/速率/到期）：停网关 → 原子写 `share.json` 与 `gateway.json`，并清空 `usage.json` 的 `blocked`（**保留已用字节**）→ 起网关。编辑期间连接会断一下。
+- 「重置用量」：停网关 → 原子写 `usage.json`（`used_bytes=0`、`blocked=null`）→ 起网关。
 
 ### 作废
 
