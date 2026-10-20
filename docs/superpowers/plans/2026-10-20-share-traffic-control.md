@@ -72,10 +72,10 @@ SharesView ⇠── src/api/types.ts（ShareInfo/ShareCandidate/ShareTlsStatus�
 
 ## 执行状态（进度指针）
 
-- 当前：T9（pending）
-- 下一动作：实现 `share/install.rs` 的编辑/重置用量/作废（停-写-起、状态推导、旧分享兼容）并写 `manage_tests.rs`
+- 当前：T10（pending）
+- 下一动作：收敛 `share/mod.rs` 根导出并注册 7 个 IPC 命令（`commands/ipc.rs`、`main.rs`），补 `ipc_tests.rs`
 - 阻塞：无
-- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）
+- 已完成：T1（`c820609`）、T2（`234a13c`）、T3（`91ca458`）、T4（`d2d5233`）、T5（`103556d`）、T6（`81a0373`）、T7（`ccd8fb1`）、T8（`dfbf95f`）、T9（`df8c0b3`）
 - 最后更新：2026-10-20
 
 ## 全局前置事实（实现前必读）
@@ -2741,7 +2741,7 @@ git commit -m "feat(share): 批量列举新旧分享与状态推导"
 
 - **验收:** `cargo test --manifest-path src-tauri/Cargo.toml --features local-tests share::install::manage` 绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `df8c0b3`；`cargo test --features local-tests share::manage_tests` 4 passed（编辑停-写-起且保留已用字节、重置归零并恢复 active、作废清理新旧防火墙注释且旧分享二次调用幂等、非法 id 不连服务器）；作废时逐个核验单元确实停止后才删文件。
 
 - [ ] **Step 1: 写更新/重置/作废测试**
 
