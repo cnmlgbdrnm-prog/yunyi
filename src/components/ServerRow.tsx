@@ -236,7 +236,7 @@ export default function ServerRow({
                 <ConfirmButton label="删除" confirmLabel="确认删除" busyLabel="删除中…" busy={false} onConfirm={onDelete} />
               </div>
             )}
-            {open.channels && <ChannelPanel serverId={s.id} />}
+            {open.channels && <ChannelPanel serverId={s.id} sshPort={s.port} />}
             {open.upstreams && <UpstreamPanel serverId={s.id} serverHost={effectiveServerHost(s)} />}
           </div>
         }

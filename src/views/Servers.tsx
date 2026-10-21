@@ -49,6 +49,14 @@ const toggleSet = (set: Dispatch<SetStateAction<Set<number>>>, id: number) => {
   })
 }
 
+/** 从 Set 中移除一个 id；本来就不存在时返回原集合，避免无意义重渲染。 */
+const withoutId = (set: Set<number>, id: number) => {
+  if (!set.has(id)) return set
+  const next = new Set(set)
+  next.delete(id)
+  return next
+}
+
 export default function Servers() {
   const [servers, setServers] = useState<Server[]>([])
   const [rules, setRules] = useState<RelayRule[]>([])
@@ -175,6 +183,19 @@ export default function Servers() {
     setExpand(null)
   }, [])
   const handleSave = useServerSave(servers, editingId, form, refresh, setError, closeForm)
+
+  // 顶部「更多/收起」在用户眼里就是这张卡的折叠键：收起副操作行时，展开区
+  // （部署向导 / 编辑表单）与通道、上游出口三个子面板必须一起收，否则会停在
+  // 「上面收起了、下面还挂着一块」的半收起状态（2026-10-19 实测）。
+  // 只处理收起方向；展开「更多」不影响其它面板。
+  const handleToggleMore = (id: number) => {
+    const closing = moreOpen.has(id)
+    toggleSet(setMoreOpen, id)
+    if (!closing) return
+    setExpand((cur) => (cur?.id === id ? null : cur))
+    setChannelsOpen((prev) => withoutId(prev, id))
+    setUpstreamsOpen((prev) => withoutId(prev, id))
+  }
 
   const handleTest = async (id: number) => {
     setTesting((prev) => new Set(prev).add(id))
@@ -462,7 +483,7 @@ export default function Servers() {
         expand={expand}
         form={form}
         setForm={setForm}
-        onToggleMore={(id) => toggleSet(setMoreOpen, id)}
+        onToggleMore={handleToggleMore}
         onToggleChannels={(id) => toggleSet(setChannelsOpen, id)}
         onToggleUpstreams={(id) => toggleSet(setUpstreamsOpen, id)}
         onSpeedTest={handleSpeedTestOne}
