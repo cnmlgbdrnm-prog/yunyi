@@ -47,6 +47,7 @@ pub enum ShareStatus {
     Legacy,
 }
 
+#[allow(dead_code)] // 生产路径改用 ShareSnapshot；测试仍按列表形态断言
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShareList {
     pub shares: Vec<ShareInfo>,
@@ -66,6 +67,24 @@ pub struct ShareTlsStatus {
     pub ready: bool,
     pub cert_expires_at: Option<String>,
     pub detail: String,
+}
+
+/// 后端定时采集的分享全量快照：服务器上的分享列表 + 各服务器证书状态。
+///
+/// 分享状态只存在服务器上，列举要逐台 SSH（实测一次 ~14 秒）。前端切到分享页
+/// 只读这份缓存，不再在挂载/切页时触发远端查询；后端轮询完成后经
+/// `share://status` 推送整份快照。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ShareSnapshot {
+    pub shares: Vec<ShareInfo>,
+    pub unreachable: Vec<String>,
+    /// 每台可达服务器的证书状态，key = server id。证书读取与分享摘要共用
+    /// 同一次 SSH 会话，不额外开连接。
+    #[serde(default)]
+    pub tls: std::collections::HashMap<i64, ShareTlsStatus>,
+    /// 本轮采集完成时间（RFC3339）；None = 后端尚未完成第一轮。
+    #[serde(default)]
+    pub checked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

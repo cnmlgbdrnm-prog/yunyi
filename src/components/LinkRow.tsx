@@ -21,11 +21,13 @@ interface Props {
   deleting: boolean
   readopting: boolean
   expanded: boolean
+  /** 同一对中转/落地机上还有几条扩展端口行（锚点链路暂不允许整条拆） */
+  extendedSiblings: number
   rowSuccess: string | undefined
   rowError: string | undefined
   onRefresh: () => void
   onReadopt: () => void
-  onTeardown: (action: 'unregister' | 'full') => void
+  onTeardown: (action: 'unregister' | 'full' | 'port') => void
   onCancelTeardown: () => void
   onDelete: () => void
   onToggleDevices: () => void
@@ -42,6 +44,7 @@ export default function LinkRow({
   deleting,
   readopting,
   expanded,
+  extendedSiblings,
   rowSuccess,
   rowError,
   onRefresh,
@@ -51,7 +54,13 @@ export default function LinkRow({
   onDelete,
   onToggleDevices,
 }: Props) {
-  const showStatus = rule.status === 'built' || rule.status === 'imported'
+  // 扩展端口行只是一条 DNAT，不是独立链路：既没有自己的接口可拆，也不能解除登记
+  //（那会连带删掉锚点链路，后端会拒绝）。它唯一的生命周期操作是「移除端口」。
+  const isExtended = rule.forward_mode === 'extended'
+  // 扩展端口与原始接管链路共用同一条隧道：状态/握手只在锚点行展示。
+  // 否则 N 个端口会同时各发一轮 SSH 查询，显示的还是同一组数字。
+  const showStatus =
+    !isExtended && (rule.status === 'built' || rule.status === 'imported')
   const peersUsable = rule.client_mode === 'peer' && (rule.status === 'built' || rule.status === 'imported')
   return (
     <li className="rounded border border-neutral-800 p-3">
@@ -83,11 +92,27 @@ export default function LinkRow({
           ) : showStatus && !refreshing ? (
             <p className="text-xs text-neutral-500">状态未知</p>
           ) : null}
+          {isExtended && (
+            <p className="text-xs text-neutral-500">
+              状态与传输量见承载该端口的原始接管链路
+            </p>
+          )}
+          {!isExtended && extendedSiblings > 0 && (
+            <p className="text-xs text-amber-400">
+              该链路下还有 {extendedSiblings} 个扩展端口：先逐一「移除端口」，才能解除登记或拆链
+            </p>
+          )}
           {rowSuccess && <p className="text-xs text-emerald-400">{rowSuccess}</p>}
           {rowError && <p className="text-xs text-red-400">{rowError}</p>}
         </div>
         <div className="flex shrink-0 flex-col items-end gap-2">
-          <StatusBadge status={rule.status} />
+          {isExtended ? (
+            <span className="inline-block rounded bg-amber-950 px-2 py-0.5 text-xs text-amber-300">
+              扩展端口
+            </span>
+          ) : (
+            <StatusBadge status={rule.status} />
+          )}
           <div className="flex flex-wrap justify-end gap-2">
             {/* 「刷新状态」与上面的状态行同进同退：查出来的结果既然只对 built/imported
                 显示，那对别的行就不该摆一个按了没反应的按钮。同页「设备」按钮已按
@@ -117,7 +142,15 @@ export default function LinkRow({
                 {readopting ? '接管中…' : '重新接管'}
               </button>
             )}
-            {rule.status !== 'not-built' && rule.status !== 'failed' ? (
+            {isExtended ? (
+              <ConfirmButton
+                label="移除端口"
+                confirmLabel={`确认移除扩展端口「${rule.name}」（只删 DNAT，不动 WireGuard 隧道）`}
+                busyLabel="移除中…"
+                busy={teardownActive}
+                onConfirm={() => onTeardown('port')}
+              />
+            ) : rule.status !== 'not-built' && rule.status !== 'failed' ? (
               rule.status === 'imported' ? (
                 <>
                   <ConfirmButton
@@ -125,6 +158,7 @@ export default function LinkRow({
                     confirmLabel={`确认解除登记 ${rule.name}（不动服务器配置）`}
                     busyLabel="解除中…"
                     busy={teardownActive}
+                    disabled={extendedSiblings > 0}
                     onConfirm={() => onTeardown('unregister')}
                   />
                   <ConfirmButton
@@ -132,6 +166,7 @@ export default function LinkRow({
                     confirmLabel={`确认拆除接口 ${rule.name}（删除两台服务器上的 WireGuard 配置）`}
                     busyLabel="拆除中…"
                     busy={teardownActive}
+                    disabled={extendedSiblings > 0}
                     onConfirm={() => onTeardown('full')}
                   />
                 </>

@@ -1035,6 +1035,10 @@ pub fn parse_summary(json: &str) -> Result<Vec<SummaryEntry>, String> {
 
 /// 逐服务器并发列举。某台连不上不整体失败：好那台照常列出，坏那台进
 /// `unreachable` 并带原因——否则用户会以为分享凭空消失了。
+///
+/// 生产命令已改用 [`refresh_share_snapshot`]（同轮顺带读证书）；这里保留给
+/// 真机/本地测试与只关心分享列表的调用方。
+#[allow(dead_code)]
 pub async fn list_shares(state: &Arc<AppState>) -> Result<ShareList, String> {
     let servers =
         crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
@@ -1076,13 +1080,71 @@ pub async fn list_shares(state: &Arc<AppState>) -> Result<ShareList, String> {
     })
 }
 
-async fn read_server_summaries(
-    state: &Arc<AppState>,
-    server: &Server,
-    cancel: &AtomicBool,
-) -> Result<Vec<ShareInfo>, String> {
+/// 一轮完整采集：分享列表 + 每台可达服务器的证书状态。
+///
+/// 与 [`list_shares`] 的区别：
+/// - 证书状态与分享摘要**共用同一个 SSH 会话**，不给每台服务器多开一条连接；
+/// - 任何一台失败都不拖垮整轮：分享读失败进 `unreachable`，证书读失败只丢该台
+///   的 `tls` 条目（向导会回落到按需实时查询）；
+/// - 返回快照由调用方写缓存并推送，前端切页不再触发这里。
+pub async fn refresh_share_snapshot(state: &Arc<AppState>) -> Result<ShareSnapshot, String> {
+    let servers =
+        crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
+    let email = tls::acme_email(state);
+
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, server) in servers.into_iter().enumerate() {
+        let state = state.clone();
+        let email = email.clone();
+        set.spawn(async move {
+            let cancel = AtomicBool::new(false);
+            let name = server.name.clone();
+            let id = server.id;
+            let mut sess = match connect_server(&state, &server).await {
+                Ok(s) => s,
+                Err(e) => return (idx, id, name, Err(e), None),
+            };
+            let summaries = read_server_summaries_on(&mut sess, &server, &cancel).await;
+            let tls = match &email {
+                Ok(email) => Some(tls::read_tls_status(&server, email, &mut sess).await),
+                Err(_) => None,
+            };
+            (idx, id, name, summaries, tls)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(t) => results.push(t),
+            Err(e) => return Err(format!("读取分享的任务异常结束: {e}")),
+        }
+    }
+    results.sort_by_key(|(idx, ..)| *idx);
+
+    let mut shares = Vec::new();
+    let mut unreachable = Vec::new();
+    let mut tls_map = HashMap::new();
+    for (_, id, name, summaries, tls) in results {
+        match summaries {
+            Ok(mut list) => shares.append(&mut list),
+            Err(reason) => unreachable.push(format!("{name}：{reason}")),
+        }
+        if let Some(Ok(status)) = tls {
+            tls_map.insert(id, status);
+        }
+    }
+    Ok(ShareSnapshot {
+        shares,
+        unreachable,
+        tls: tls_map,
+        checked_at: Some(chrono::Utc::now().to_rfc3339()),
+    })
+}
+
+async fn connect_server(state: &Arc<AppState>, server: &Server) -> Result<SshSession, String> {
     let (auth, _) = crate::servers::load_auth(state, server.id).map_err(|e| e.to_string())?;
-    let mut sess = SshSession::connect(
+    SshSession::connect(
         effective_host(server),
         server.port as u16,
         &server.user,
@@ -1090,12 +1152,28 @@ async fn read_server_summaries(
         CONNECT_TIMEOUT,
     )
     .await
-    .map_err(|e| format!("连接服务器失败: {e}"))?;
+    .map_err(|e| format!("连接服务器失败: {e}"))
+}
 
+#[allow(dead_code)] // 仅 list_shares（测试路径）使用
+async fn read_server_summaries(
+    state: &Arc<AppState>,
+    server: &Server,
+    cancel: &AtomicBool,
+) -> Result<Vec<ShareInfo>, String> {
+    let mut sess = connect_server(state, server).await?;
+    read_server_summaries_on(&mut sess, server, cancel).await
+}
+
+async fn read_server_summaries_on(
+    sess: &mut SshSession,
+    server: &Server,
+    cancel: &AtomicBool,
+) -> Result<Vec<ShareInfo>, String> {
     // 摘要脚本只读；每次列举幂等重写，服务器重装/首次列举都能自愈。
     let summary_script = share_summary_script_path();
     write_remote_file(
-        &mut sess,
+        sess,
         cancel,
         "写入",
         &summary_script,
@@ -1104,7 +1182,7 @@ async fn read_server_summaries(
     )
     .await?;
     run_cmd_ok(
-        &mut sess,
+        sess,
         cancel,
         "准备",
         &format!("chmod 755 {summary_script}"),
@@ -1112,7 +1190,7 @@ async fn read_server_summaries(
     )
     .await?;
     let out = run_cmd_ok(
-        &mut sess,
+        sess,
         cancel,
         "列举",
         &format!("python3 {summary_script} {SHARE_ROOT}"),
@@ -1140,10 +1218,10 @@ async fn read_server_summaries(
                 if !unit.is_empty() && crate::share::unit_needs_upgrade(&unit) {
                     let port = crate::share::parse_port_from_unit(&unit).unwrap_or(0);
                     if port != 0 {
-                        crate::share::upgrade_share_unit(&mut sess, cancel, &entry.id, port)
+                        crate::share::upgrade_share_unit(sess, cancel, &entry.id, port)
                             .await?;
                         active = run_cmd(
-                            &mut sess,
+                            sess,
                             cancel,
                             "确认",
                             &format!("systemctl is-active {}", unit_name(&entry.id)),
@@ -1155,7 +1233,7 @@ async fn read_server_summaries(
                         // 升级替换了正在服务的进程：必须验链接真取得到，不能只看
                         // restart 退出码（2026-09-21 的死链就是只看了进程状态）。
                         let code = run_cmd(
-                            &mut sess,
+                            sess,
                             cancel,
                             "升级",
                             &format!(

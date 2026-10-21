@@ -23,6 +23,7 @@ export default function NodeRow({
   showRelayCol,
   needsCompletion,
   completionTitle,
+  completionBusy,
   onCompleteRelay,
   relayOn,
   onToggleRelay,
@@ -48,6 +49,8 @@ export default function NodeRow({
   showRelayCol: boolean
   needsCompletion: boolean
   completionTitle: string
+  /** 正在复用已有接管链路补端口：按钮锁定，防止连点重复下发 */
+  completionBusy: boolean
   onCompleteRelay: () => void
   relayOn: boolean
   onToggleRelay: () => void
@@ -130,10 +133,11 @@ export default function NodeRow({
             <button
               type="button"
               onClick={onCompleteRelay}
+              disabled={completionBusy}
               title={completionTitle}
-              className="rounded bg-amber-900 px-2 py-1 text-xs text-amber-200 hover:bg-amber-800"
+              className="rounded bg-amber-900 px-2 py-1 text-xs text-amber-200 hover:bg-amber-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              补全中转
+              {completionBusy ? '补全中…' : '补全中转'}
             </button>
           ) : (
             <button

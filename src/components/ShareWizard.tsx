@@ -8,6 +8,7 @@ import {
   shareTlsStatus,
 } from '../api'
 import type { Server, ShareCandidate, ShareInfo, ShareTlsStatus } from '../api/types'
+import { applyShareTls } from '../views/shareStatusStore'
 
 interface Props {
   servers: Server[]
@@ -56,6 +57,8 @@ export default function ShareWizard({ servers, onClose, onCreated }: Props) {
         // 默认勾选全部可分享节点；不可分享的保持未选。
         setPicked(new Set(list.filter((c) => c.shareable).map((c) => c.node.id)))
         setTls(status)
+        // 后端缓存优先返回；把结果同步进 store，分享页下次切回无需再查。
+        applyShareTls(serverId, status)
       })
       .catch((e) => alive && setError(String(e)))
       .finally(() => alive && setLoading(false))
@@ -78,7 +81,9 @@ export default function ShareWizard({ servers, onClose, onCreated }: Props) {
     setError(null)
     setTlsBusy(true)
     try {
-      setTls(await prepareShareTls(serverId))
+      const status = await prepareShareTls(serverId)
+      setTls(status)
+      applyShareTls(serverId, status)
     } catch (e) {
       setError(String(e))
     } finally {

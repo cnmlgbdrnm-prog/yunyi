@@ -166,8 +166,16 @@ pub async fn list_share_candidates_cmd(
 #[tauri::command]
 pub async fn list_shares_cmd(
     state: tauri::State<'_, Arc<AppState>>,
-) -> R<crate::share::ShareList> {
-    crate::share::list_shares(state.inner()).await.map_err(err)
+) -> R<crate::share::model::ShareSnapshot> {
+    refresh_shares(state.inner().clone()).await
+}
+
+/// 分享状态最近快照（纯读缓存，不发 SSH）。前端启动/挂载时读它。
+#[tauri::command]
+pub fn share_status_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> R<crate::share::model::ShareSnapshot> {
+    share_snapshot(state.inner())
 }
 
 #[tauri::command]
@@ -255,9 +263,7 @@ pub async fn prepare_share_tls_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
 ) -> R<crate::share::ShareTlsStatus> {
-    crate::share::prepare_tls(state.inner(), server_id)
-        .await
-        .map_err(err)
+    prepare_share_tls(state.inner().clone(), server_id).await
 }
 
 #[tauri::command]
@@ -265,9 +271,7 @@ pub async fn share_tls_status_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
 ) -> R<crate::share::ShareTlsStatus> {
-    crate::share::tls_status(state.inner(), server_id)
-        .await
-        .map_err(err)
+    share_tls_status(state.inner().clone(), server_id).await
 }
 
 #[tauri::command]
@@ -902,6 +906,15 @@ pub async fn adopt_link_cmd(
     .await
 }
 
+/// 接管链路补端口：复用现有隧道，只补 DNAT（不建新链、不重启 WG）。
+#[tauri::command]
+pub async fn extend_taken_link_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    anchor_rule_id: i64,
+) -> R<Vec<RelayRule>> {
+    extend_taken_link(state.inner().clone(), anchor_rule_id).await
+}
+
 #[tauri::command]
 pub async fn teardown_link_cmd(
     state: tauri::State<'_, Arc<AppState>>,
@@ -987,6 +1000,14 @@ pub async fn refresh_link_status_cmd(
     rule_id: i64,
 ) -> R<LinkStatus> {
     refresh_link_status(state.inner().clone(), rule_id).await
+}
+
+/// 最近一轮后端轮询的链路状态快照（纯读内存，不发 SSH）。
+#[tauri::command]
+pub fn relay_statuses_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> R<HashMap<i64, LinkStatus>> {
+    relay_statuses(state.inner())
 }
 
 #[tauri::command]
