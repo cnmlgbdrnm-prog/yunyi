@@ -43,6 +43,19 @@ pub const DEFAULT_REALITY_DEST: &str = "www.microsoft.com";
 /// 默认入站端口。
 pub const DEFAULT_LISTEN_PORT: u16 = 443;
 
+/// 部署后「本机 → 中转机入站」可达性核验写下的错误前缀。
+///
+/// 这次核验成功时必须清掉上一次同来源的红字：服务器入口地址族从 v6 切回 v4
+/// 后重新部署，端口已经通了，但旧错误若不清会一直挂着（用户看到的就是
+/// 「明明能连，界面还是红字」）。出口 IP 探测写的是另一条链路（中转机 →
+/// 住宅代理）的失败原因，不能用这次入站核验的成功去覆盖它。
+const INBOUND_PROBE_ERROR_PREFIX: &str = "从本机连不上 ";
+
+/// 本次入站可达性核验成功时，是否该清掉旧的 `last_check_error`。
+fn should_clear_stale_inbound_error(old: Option<&str>) -> bool {
+    old.is_some_and(|e| e.starts_with(INBOUND_PROBE_ERROR_PREFIX))
+}
+
 /// REALITY 身份材料：首建生成后固定，重建复用——否则客户端节点每次都要重新导入。
 /// 公钥一并存下来（而不是每次从私钥推导），重建时就不必依赖 `xray x25519 -i`
 /// 这个随版本变化的参数。
@@ -606,23 +619,35 @@ pub async fn run_upstream_job(
                     unreachable.push((
                         u.id,
                         format!(
-                            "从本机连不上 {}:{}（{e}）：服务器上实例与配置正常，卡在**入站放行**\
-                             ——本工具已尝试在服务器上放行该端口，若仍不通就查云服务商的安全组",
+                            "{INBOUND_PROBE_ERROR_PREFIX}{}:{}（{e}）：服务器上实例与配置正常，\
+                             卡在**入站放行**——本工具已尝试在服务器上放行该端口，若仍不通就查\
+                             云服务商的安全组",
                             crate::domain::effective_host(&server),
                             u.listen_port
                         ),
                     ));
                 }
             }
-            if !unreachable.is_empty() {
+            {
                 let conn = state.db.lock();
-                for (id, msg) in &unreachable {
-                    // egress_ip 原样带回：这次核验与它无关，别把已有读数抹掉
-                    let egress = rows
+                for u in &rows {
+                    let msg = unreachable
                         .iter()
-                        .find(|u| u.id == *id)
-                        .and_then(|u| u.egress_ip.as_deref());
-                    let _ = repos::upstreams::set_probe(&conn, *id, egress, Some(msg));
+                        .find(|(id, _)| *id == u.id)
+                        .map(|(_, m)| m.as_str());
+                    // egress_ip 原样带回：这次核验与它无关，别把已有读数抹掉
+                    let egress = u.egress_ip.as_deref();
+                    match msg {
+                        Some(msg) => {
+                            let _ = repos::upstreams::set_probe(&conn, u.id, egress, Some(msg));
+                        }
+                        // 本次可达：只清「同一来源」的旧错误。出口 IP 探测的失败原因
+                        // 来自另一条链路，不能被入站核验的成功抹掉。
+                        None if should_clear_stale_inbound_error(u.last_check_error.as_deref()) => {
+                            let _ = repos::upstreams::set_probe(&conn, u.id, egress, None);
+                        }
+                        None => {}
+                    }
                 }
             }
         }
