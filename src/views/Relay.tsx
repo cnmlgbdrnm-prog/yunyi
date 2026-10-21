@@ -1,26 +1,32 @@
-// 中转链路视图：链路列表（读库持久）+ 状态刷新 + 拆链/删除 + 建链向导入口。
-// 状态从 refreshLinkStatus 结果派生，缺失时显示「状态未知」兜底；拆链为 link
-// 类后台任务，状态与进度取自模块级注册表（jobs/registry，切页不丢、可取消），
-// 终态后刷新列表并给出行内提示。行渲染在 components/LinkRow，向导在 LinkWizard。
-import { useCallback, useEffect, useRef, useState } from 'react'
+// 中转链路视图：链路列表（读库持久）+ 手动状态刷新 + 拆链/删除 + 建链向导入口。
+// 状态由后端定时轮询并推送（stores 见 relayStatusStore），本页挂载不查询；
+// 拆链为 link 类后台任务，状态与进度取自模块级注册表（jobs/registry，切页不丢、
+// 可取消），终态后刷新列表并给出行内提示。行渲染在 components/LinkRow，向导在
+// LinkWizard。
+import { useCallback, useEffect, useState } from 'react'
 import { cancelJob, deleteLinkRule, listRelayRules, listServers, readoptLink, refreshLinkStatus, teardownLink } from '../api'
 import type { LinkStatus, RelayRule, Server } from '../api/types'
 import { bindJob, isTargetBusy, jobForTarget, progressView, release, reserveJob, useJobTerminal, useTrackedJobs } from '../jobs/registry'
 import LinkRow from '../components/LinkRow'
 import LinkWizard from '../components/LinkWizard'
-import { deleteCache, readCache, seedStatuses, STATUS_POLL_MS, writeCache } from './relayStatusCache'
+import {
+  applyOneRelayStatus,
+  forgetRelayStatus,
+  useRelayStatuses,
+} from './relayStatusStore'
 
 // 拆链终态文案在**提交那一刻**定格：取决于当时的动作（解除登记 / 拆除接口 / 拆链）
 // 与链路当时的状态（imported 才有「接口」可拆），事后无从还原。
 // 放模块级是因为终态事件可能在切页之后才到，那时视图状态已经重建过一次；
-// 量级极小（每条链至多一条），终态取用后即删。与 relayStatusCache 同一手法。
+// 量级极小（每条链至多一条），终态取用后即删。
 const teardownOutcome = new Map<number, string>()
 
 export default function Relay() {
   const [rules, setRules] = useState<RelayRule[]>([])
   const [servers, setServers] = useState<Server[]>([])
-  // 初始状态播种自模块级缓存：30s 内切回本页零查询直接展示
-  const [statuses, setStatuses] = useState<Record<number, LinkStatus>>(() => seedStatuses())
+  // 状态来自后端定时轮询（App 启动时读一次缓存并订阅推送）：
+  // 本页挂载/切页都不再发 SSH。
+  const statuses = useRelayStatuses()
   const [refreshing, setRefreshing] = useState<Set<number>>(new Set())
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -35,14 +41,13 @@ export default function Relay() {
 
   const serverById = useCallback((id: number): Server | undefined => servers.find((s) => s.id === id), [servers])
 
-  // 对 built/imported 链路查询一轮状态；失败也写入错误状态（展示「状态未知」）。
-  // 结果回写模块级缓存：切页回来 30s 内零查询。
+  // 手动「刷新状态」：唯一会从本页发起 SSH 的路径（用户明确点击）。
+  // 结果同时写进 store 与后端缓存，切页回来仍是最新值。
   const doRefreshStatus = useCallback(async (ruleId: number) => {
     setRefreshing((prev) => new Set(prev).add(ruleId))
     try {
       const st = await refreshLinkStatus(ruleId)
-      writeCache(ruleId, st)
-      setStatuses((prev) => ({ ...prev, [ruleId]: st }))
+      applyOneRelayStatus(ruleId, st)
     } catch (e) {
       const errorStatus: LinkStatus = {
         ok: false,
@@ -55,8 +60,7 @@ export default function Relay() {
         checked_at: '',
         error: String(e),
       }
-      writeCache(ruleId, errorStatus)
-      setStatuses((prev) => ({ ...prev, [ruleId]: errorStatus }))
+      applyOneRelayStatus(ruleId, errorStatus)
     } finally {
       setRefreshing((prev) => {
         const next = new Set(prev)
@@ -66,58 +70,22 @@ export default function Relay() {
     }
   }, [])
 
-  /**
-   * 一轮状态补查：只查缓存过期/缺失的 built|imported 链路，新鲜的一律跳过（零查询）。
-   *
-   * 链路清单**显式传入**而不是读 rulesRef：调用方都刚拿到一份确切的清单，
-   * 传参省掉一次「ref 是否已经跟上」的时序推理。
-   */
-  const sweepStale = useCallback(
-    (list: RelayRule[]) => {
-      const staleIds = list
-        .filter((r) => r.status === 'built' || r.status === 'imported')
-        .filter((r) => readCache(r.id, STATUS_POLL_MS) == null)
-        .map((r) => r.id)
-      if (staleIds.length === 0) return
-      void Promise.allSettled(staleIds.map((id) => doRefreshStatus(id)))
-    },
-    [doRefreshStatus],
-  )
-
   const refresh = useCallback(async (): Promise<RelayRule[]> => {
     try {
       const [rs, ss] = await Promise.all([listRelayRules(), listServers()])
       setRules(rs)
       setServers(ss)
-      // 链路集合变了就地补一轮：新建/接管的链路没有缓存，不补要等下一个 30s 轮询
-      // 才出现状态，那段「状态未知」是假的。放在这里、而不是靠「effect 依赖 rules」
-      // 触发——后者每次刷新都会把定时器拆掉重建（见下面轮询 effect 的注释）。
-      sweepStale(rs)
       return rs
     } catch (e) {
       setError(String(e))
       return []
     }
-  }, [sweepStale])
+  }, [])
 
-  // 挂载后装载规则/服务器列表（本地读库，不走 SSH）
+  // 挂载后只装规则/服务器列表（本地读库）；状态由后端轮询推送，不在这里查。
   useEffect(() => {
     void refresh()
   }, [refresh])
-
-  // 状态轮询：每 STATUS_POLL_MS 补查一轮缓存过期的链路，视图切走即卸载、定时器随之清除。
-  // 手动「刷新状态」按钮即时可用，与轮询互不阻塞。
-  //
-  // **依赖里不放 rules**：body 读的是 rulesRef.current，且 rules 每次 refresh() 都是新
-  // 数组——放进去等于每次列表刷新（拆链完成、删除、重新接管…）都把定时器拆掉重建，
-  // 下一轮轮询随之顺延，最坏白等一个周期。「新链路要立刻补查」由 refresh() 里的
-  // sweepStale 负责，与定时器解耦。
-  const rulesRef = useRef<RelayRule[]>(rules)
-  rulesRef.current = rules
-  useEffect(() => {
-    const timer = setInterval(() => sweepStale(rulesRef.current), STATUS_POLL_MS)
-    return () => clearInterval(timer)
-  }, [sweepStale])
 
   // 拆链终态：失败标红给出原因，成功按提交时定格的文案提示并清掉该行残留状态，
   // 两种情况都刷新列表。事件丢失由注册表那个唯一的 5s 对账兜底。
@@ -130,17 +98,18 @@ export default function Relay() {
       setRowError((prev) => ({ ...prev, [rid]: job.error ?? '拆链失败' }))
       return
     }
-    setRowSuccess((prev) => ({ ...prev, [rid]: successText ?? '拆链完成' }))
-    // 拆链后行变 not-built 不再查询状态：清掉残留握手/传输缓存，避免旧数据常驻误导。
-    // **模块级缓存也要清**：只清视图状态的话，条目会一直留到 30s 过期，切页重挂时
-    // seedStatuses 又把它播种回来——「刚拆掉的链路显示着拆之前的握手」。
-    // 拆链失败不进这里（上面 error 分支已 return），那时链路还是好的，缓存该留着。
-    deleteCache(rid)
-    setStatuses((prev) => {
-      const next = { ...prev }
-      delete next[rid]
-      return next
-    })
+    // 扩展端口行移除后整行会消失（refresh 之后），行内提示没机会被看到，
+    // 改成顶部消息；其余动作的行还在，仍用行内提示。
+    // 判据用提交时定格的文案而不是当前 rules：切页回来时该行已从库里读不到了。
+    if (successText === '已移除扩展端口') {
+      setSuccess(successText)
+    } else {
+      setRowSuccess((prev) => ({ ...prev, [rid]: successText ?? '拆链完成' }))
+    }
+    // 拆链后行变 not-built 不再查询状态：清掉 store 里的残留握手/传输，
+    // 避免旧数据常驻误导。拆链失败不进这里（上面 error 分支已 return），
+    // 那时链路还是好的，状态该留着。
+    forgetRelayStatus(rid)
     void refresh()
   })
 
@@ -164,15 +133,26 @@ export default function Relay() {
     [doRefreshStatus],
   )
 
-  const handleTeardown = async (ruleId: number, action: 'unregister' | 'full') => {
+  const handleTeardown = async (
+    ruleId: number,
+    action: 'unregister' | 'full' | 'port',
+  ) => {
     setError(null)
+    setSuccess(null)
     clearRowError(ruleId)
     // 终态文案在此定格（动作 + 当时的链路状态）：unregister → 已解除登记；
-    // full + imported → 已拆除接口；full + built → 已拆链
-    const wasImported = rules.find((r) => r.id === ruleId)?.status === 'imported'
+    // port → 已移除扩展端口；full + imported → 已拆除接口；full + built → 已拆链
+    const rule = rules.find((r) => r.id === ruleId)
+    const wasImported = rule?.status === 'imported'
     teardownOutcome.set(
       ruleId,
-      action === 'unregister' ? '已解除登记' : wasImported ? '已拆除接口' : '已拆链',
+      action === 'unregister'
+        ? '已解除登记'
+        : action === 'port'
+          ? '已移除扩展端口'
+          : wasImported
+            ? '已拆除接口'
+            : '已拆链',
     )
     // 占位先行：IPC 回来之前这一行就进入「拆链中…」，连点堆不出一串任务
     const ticket = reserveJob('link', [String(ruleId)])
@@ -208,7 +188,7 @@ export default function Relay() {
     try {
       await readoptLink(ruleId)
       setRowSuccess((prev) => ({ ...prev, [ruleId]: '已重新接管' }))
-      // 状态补查由 refresh() 就地扫一轮（见 sweepStale 的注释）
+      // 等后端下一轮轮询（≤60s）推送新状态，本页不发查询
       void refresh()
     } catch (e) {
       setRowError((prev) => ({ ...prev, [ruleId]: String(e) }))
@@ -227,13 +207,8 @@ export default function Relay() {
     try {
       await deleteLinkRule(ruleId)
       setSuccess(`链路「${name}」已删除`)
-      // 行已删除：状态缓存一并清除（同拆链清理语义，防止残留数据泄漏）
-      deleteCache(ruleId)
-      setStatuses((prev) => {
-        const next = { ...prev }
-        delete next[ruleId]
-        return next
-      })
+      // 行已删除：状态一并清掉（同拆链清理语义，防止残留数据泄漏）
+      forgetRelayStatus(ruleId)
       void refresh()
     } catch (e) {
       setError(String(e))
@@ -246,7 +221,7 @@ export default function Relay() {
     }
   }
 
-  // 建链/接管完成：关闭向导并重载列表；新链路的状态由 refresh() 就地补查一轮
+  // 建链/接管完成：关闭向导并重载列表；新链路状态等后端下一轮推送
   const handleWizardDone = () => {
     setWizardOpen(false)
     void refresh()
@@ -268,29 +243,40 @@ export default function Relay() {
       {success && <p className="text-sm text-emerald-400">{success}</p>}
 
       <ul className="space-y-2">
-        {rules.map((r) => (
-          <LinkRow
-            key={r.id}
-            rule={r}
-            relay={serverById(r.relay_server_id)}
-            landing={serverById(r.landing_server_id)}
-            status={statuses[r.id]}
-            refreshing={refreshing.has(r.id)}
-            teardownActive={isTargetBusy(teardownJobs, String(r.id))}
-            teardown={progressView(jobForTarget(teardownJobs, String(r.id)))}
-            deleting={deleting.has(r.id)}
-            readopting={readopting.has(r.id)}
-            expanded={expandedRuleId === r.id}
-            rowSuccess={rowSuccess[r.id]}
-            rowError={rowError[r.id]}
-            onRefresh={() => handleRefreshStatus(r.id)}
-            onReadopt={() => void handleReadopt(r.id)}
-            onTeardown={(action) => void handleTeardown(r.id, action)}
-            onCancelTeardown={() => void handleCancelTeardown(r.id)}
-            onDelete={() => void handleDelete(r.id, r.name)}
-            onToggleDevices={() => setExpandedRuleId(expandedRuleId === r.id ? null : r.id)}
-          />
-        ))}
+        {rules.map((r) => {
+          // 同一对中转/落地机上的扩展端口挂在同一条隧道上；锚点链路要先清完它们
+          // 才能整条拆（后端同样拒绝，这里把按钮先禁掉并说明原因）。
+          const extendedSiblings = rules.filter(
+            (x) =>
+              x.forward_mode === 'extended' &&
+              x.relay_server_id === r.relay_server_id &&
+              x.landing_server_id === r.landing_server_id,
+          ).length
+          return (
+            <LinkRow
+              key={r.id}
+              rule={r}
+              relay={serverById(r.relay_server_id)}
+              landing={serverById(r.landing_server_id)}
+              status={statuses[r.id]}
+              refreshing={refreshing.has(r.id)}
+              teardownActive={isTargetBusy(teardownJobs, String(r.id))}
+              teardown={progressView(jobForTarget(teardownJobs, String(r.id)))}
+              deleting={deleting.has(r.id)}
+              readopting={readopting.has(r.id)}
+              expanded={expandedRuleId === r.id}
+              extendedSiblings={extendedSiblings}
+              rowSuccess={rowSuccess[r.id]}
+              rowError={rowError[r.id]}
+              onRefresh={() => handleRefreshStatus(r.id)}
+              onReadopt={() => void handleReadopt(r.id)}
+              onTeardown={(action) => void handleTeardown(r.id, action)}
+              onCancelTeardown={() => void handleCancelTeardown(r.id)}
+              onDelete={() => void handleDelete(r.id, r.name)}
+              onToggleDevices={() => setExpandedRuleId(expandedRuleId === r.id ? null : r.id)}
+            />
+          )
+        })}
         {rules.length === 0 && <p className="text-sm text-neutral-500">还没有链路，点击「新建链路」开始。</p>}
       </ul>
 

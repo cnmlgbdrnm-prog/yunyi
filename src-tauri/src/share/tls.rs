@@ -475,17 +475,7 @@ pub async fn tls_status(
 ) -> Result<ShareTlsStatus, String> {
     let (auth, server) =
         crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
-    let configured = crate::servers::normalize_share_domain(&server.share_domain)?;
-    let email = state
-        .settings
-        .get(SHARE_ACME_EMAIL_KEY)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    // 没有配置、证书里也读不到时，向导要能提前告诉用户「点一下就会用哪个域名」。
-    let auto = auto_share_domain(&server);
-
+    let email = acme_email(state)?;
     let mut sess = SshSession::connect(
         effective_host(&server),
         server.port as u16,
@@ -495,11 +485,35 @@ pub async fn tls_status(
     )
     .await
     .map_err(|e| format!("连接服务器失败: {e}"))?;
+    read_tls_status(&server, &email, &mut sess).await
+}
+
+/// 读分享 ACME 邮箱（未配置 = 空串）。签发与状态读取两处共用。
+pub(crate) fn acme_email(state: &Arc<AppState>) -> Result<String, String> {
+    Ok(state
+        .settings
+        .get(SHARE_ACME_EMAIL_KEY)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default()
+        .trim()
+        .to_string())
+}
+
+/// 在**已建立的会话**上读证书状态：分享轮询与手动查询共用一次连接，
+/// 避免每台服务器多开一条 SSH。
+pub(crate) async fn read_tls_status(
+    server: &crate::domain::Server,
+    email: &str,
+    sess: &mut SshSession,
+) -> Result<ShareTlsStatus, String> {
+    let configured = crate::servers::normalize_share_domain(&server.share_domain)?;
+    // 没有配置、证书里也读不到时，向导要能提前告诉用户「点一下就会用哪个域名」。
+    let auto = auto_share_domain(server);
     let cancel = AtomicBool::new(false);
     let cert = format!("{}/fullchain.pem", tls_dir());
 
     let check = run_cmd(
-        &mut sess,
+        sess,
         &cancel,
         "证书校验",
         &format!("openssl x509 -checkend 0 -noout -in {cert}"),
@@ -540,7 +554,7 @@ pub async fn tls_status(
         });
     }
 
-    let domains = cert_domains(&mut sess, &cancel).await?;
+    let domains = cert_domains(sess, &cancel).await?;
     let detected = domains.first().cloned().unwrap_or_default();
     let domain = if configured.is_empty() {
         detected.clone()
@@ -568,7 +582,7 @@ pub async fn tls_status(
     }
 
     let out = run_cmd(
-        &mut sess,
+        sess,
         &cancel,
         "证书校验",
         &format!("openssl x509 -enddate -noout -in {cert}"),

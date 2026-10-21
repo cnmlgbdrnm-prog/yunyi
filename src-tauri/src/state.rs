@@ -64,6 +64,17 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
     /// 服务器健康监控调度器；应用退出时 stop。None = 尚未启动。
     pub monitor: std::sync::Mutex<Option<crate::server_monitor::scheduler::MonitorHandle>>,
+    /// 后端轮询得到的中转链路状态快照（key = relay rule id）。
+    ///
+    /// 中转页只读这份缓存，不再在挂载/切页时发 SSH；后台轮询器定时刷新并推
+    /// `relay://status` 事件，切页/重开界面都直接拿后端已知的最近状态。
+    pub relay_statuses:
+        std::sync::Mutex<std::collections::HashMap<i64, crate::domain::LinkStatus>>,
+    /// 后端轮询得到的分享快照（服务器上的分享 + 各服务器证书状态）。
+    ///
+    /// 分享列举要逐台 SSH（实测一轮 ~14 秒），前端切页只读这份缓存；后台轮询器
+    /// 定时刷新并推 `share://status`，手动「刷新」会即时采集并写回。
+    pub share_snapshot: std::sync::Mutex<Option<crate::share::model::ShareSnapshot>>,
 }
 
 impl AppState {
@@ -150,6 +161,8 @@ impl AppState {
                 .unwrap_or(std::path::Path::new("."))
                 .to_path_buf(),
             monitor: std::sync::Mutex::new(None),
+            relay_statuses: std::sync::Mutex::new(std::collections::HashMap::new()),
+            share_snapshot: std::sync::Mutex::new(None),
         });
         // 构造期无并发读取（worker 未启动），set 必成功
         let _ = state_slot.set(state.clone());

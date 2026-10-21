@@ -260,13 +260,17 @@ export interface ShareInfo {
 }
 
 /**
- * 分享列表 + 读取失败的服务器名。
- * 分开返回是刻意的：某台连不上时无法知道它上面有哪些分享，列表里就少几条——
- * 不点名的话，用户会以为发出去的链接凭空消失了。
+ * 分享状态快照（后端定时采集后推送）。
+ * 分开返回 unreachable 是刻意的：某台连不上时无法知道它上面有哪些分享，列表里
+ * 就少几条——不点名的话，用户会以为发出去的链接凭空消失了。
  */
 export interface ShareList {
   shares: ShareInfo[]
   unreachable: string[]
+  /** 每台可达服务器的证书状态（key = server id）；与分享摘要同一次 SSH 采集 */
+  tls?: Record<number, ShareTlsStatus>
+  /** 本轮采集完成时间；null/缺省 = 后端尚未完成第一轮（空列表不代表没有分享） */
+  checked_at?: string | null
 }
 
 /** 新建向导的节点候选：`shareable=false` 时 `reason` 说明置灰原因。 */
@@ -410,9 +414,11 @@ export interface RelayRule {
   /**
    * 转发粒度。'single'（默认）= 一条链路转发一个端口，可把入口端口重映射到别的落地端口；
    * 'same_port' = 整机转发，按**原端口号**覆盖这台落地机的全部自建节点端口
-   * （后端在建链时读一次 nodes 派生端口表，不落库）。
+   * （后端在建链时读一次 nodes 派生端口表，不落库）；
+   * 'extended' = 接管链路的扩展端口行，复用现有 WireGuard 隧道、只补 DNAT，
+   * 精确覆盖 landing_port 这一个端口（不做整机覆盖）。
    */
-  forward_mode: 'single' | 'same_port'
+  forward_mode: 'single' | 'same_port' | 'extended'
 }
 
 export interface DevicePeer {

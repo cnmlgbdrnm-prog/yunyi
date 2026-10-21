@@ -18,6 +18,7 @@ import {
   setNodeEnabled,
   speedTest,
   toggleNodeRelay,
+  extendTakenLink,
 } from '../api'
 import type { Node, Privacy, RelayRule, Server } from '../api/types'
 import {
@@ -52,6 +53,9 @@ export default function Nodes() {
   const [completing, setCompleting] = useState<{ landingId: number; relayId: number | null } | null>(
     null,
   )
+  // 正在复用接管链路补端口的落地机（同步 IPC，按落地机锁按钮）
+  const [extendingLanding, setExtendingLanding] = useState<number | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   // 多选子集测速：勾选任意节点 → 「测速选中 (N)」按并发窗口并行（后台 chunks(concurrency)）
   const [selected, setSelected] = useState<Set<string>>(new Set())
   // 就地改名：同一时间只允许一行处于编辑态
@@ -288,9 +292,59 @@ export default function Nodes() {
     void refresh()
   })
 
-  const completeRelay = (n: Node) => {
+  // 这台落地机上已有的「接管」端口转发链路。补端口要走它已有的 WireGuard
+  // 隧道、只补 DNAT；另起一条会新开 wg0，与手工建的 wg1 网段/接口都对不上。
+  const extendAnchorFor = (landingId: number): RelayRule | undefined =>
+    relayRules.find(
+      (r) =>
+        r.landing_server_id === landingId &&
+        r.status === 'imported' &&
+        r.client_mode === 'forward' &&
+        r.forward_mode !== 'extended',
+    )
+
+  const completeRelay = async (n: Node) => {
     const landing = landingOf(n)
     if (!landing) return
+    setError(null)
+    setNotice(null)
+    const anchor = extendAnchorFor(landing.id)
+    if (anchor) {
+      // 已有接管链路：复用隧道补端口，不再走建链向导
+      if (!anchor.converged) {
+        // 没有收敛时补 DNAT 不产生中转效果；此时绝不能退回建链向导——那会另起
+        // 一条与新隧道并存的 wg0。让用户先把这条链路重建收敛。
+        setError(
+          `「${anchor.name}」尚未收敛（落地机仍在公网监听），补端口不会产生中转效果；请先在「中转链路」里重建收敛`,
+        )
+        return
+      }
+      setExtendingLanding(landing.id)
+      try {
+        const added = await extendTakenLink(anchor.id)
+        // 原端口被既有链路/中转机服务占用时会自动换入口端口，这里如实说一声
+        const remapped = added.filter(
+          (r) => r.forward_port != null && r.forward_port !== r.landing_port,
+        ).length
+        setNotice(
+          added.length > 0
+            ? `已复用「${anchor.name}」补齐 ${added.length} 个端口${
+                remapped > 0 ? `（${remapped} 个改用备用入口端口）` : ''
+              }`
+            : '该落地机的节点端口都已覆盖，无需补端口',
+        )
+        await refresh()
+        await listRelayRules()
+          .then(setRelayRules)
+          .catch(() => setRelayRules([]))
+      } catch (e) {
+        setError(String(e))
+      } finally {
+        setExtendingLanding(null)
+      }
+      return
+    }
+    // 没有可复用的接管链路：仍走建链向导（新建一条链路）
     // 中转机预填：这台落地机已有链路用的那台；没有就用第一台
     const known = relayRules.find((r) => r.landing_server_id === landing.id)
     setCompleting({
@@ -307,6 +361,9 @@ export default function Nodes() {
         <p role="alert" className="rounded bg-red-950 px-3 py-2 text-sm text-red-300">
           {error}
         </p>
+      )}
+      {notice && (
+        <p className="rounded bg-emerald-950 px-3 py-2 text-sm text-emerald-300">{notice}</p>
       )}
       {completing && (
         <LinkWizard
@@ -401,6 +458,7 @@ export default function Nodes() {
           <tbody>
             {filtered.map((n) => {
               const landing = landingOf(n)
+              const extendAnchor = landing ? extendAnchorFor(landing.id) : undefined
               return (
                 <NodeRow
                   key={n.id}
@@ -418,8 +476,17 @@ export default function Nodes() {
                   onTogglePrivacy={() => void handleTogglePrivacy(n)}
                   showRelayCol={showRelayCol}
                   needsCompletion={needsCompletion(n)}
-                  completionTitle={`${landing?.name ?? '该落地机'} 上还没有可用的转发链路，点这里建一条覆盖整机端口的`}
-                  onCompleteRelay={() => completeRelay(n)}
+                  completionTitle={
+                    extendAnchor?.converged
+                      ? `${landing?.name ?? '该落地机'} 已有接管链路，点这里复用它补端口（不新建隧道）`
+                      : extendAnchor
+                        ? `${landing?.name ?? '该落地机'} 的接管链路尚未收敛，需先重建收敛才能补端口`
+                        : `${landing?.name ?? '该落地机'} 上还没有可用的转发链路，点这里建一条覆盖整机端口的`
+                  }
+                  completionBusy={
+                    extendingLanding != null && extendingLanding === landing?.id
+                  }
+                  onCompleteRelay={() => void completeRelay(n)}
                   relayOn={n.relay_rule_id != null}
                   onToggleRelay={() => void handleToggleRelay(n.id)}
                   speedBusy={isSpeedBusy(n.id)}

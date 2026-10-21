@@ -17,6 +17,7 @@ pub mod model;
 pub mod naming;
 pub mod plan;
 pub mod scripts;
+pub mod status_poll;
 pub mod tls;
 
 #[allow(unused_imports)] // `update_share` 仍供真机测试与外部调用使用

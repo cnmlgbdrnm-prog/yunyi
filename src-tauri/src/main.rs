@@ -273,7 +273,13 @@ fn main() {
                 eprintln!("[vpn-ctl] 注册登录兜底失败: {e}");
             }
             let monitor_state = state.clone();
+            let relay_poll_state = state.clone();
+            let share_poll_state = state.clone();
             app.manage(state);
+            // 中转链路状态：后端定时查询并推 `relay://status`，前端切页只读缓存。
+            crate::relay::status_poll::spawn(app.handle().clone(), relay_poll_state);
+            // 分享状态：分享列举要逐台 SSH，后端定时采集并推 `share://status`。
+            crate::share::status_poll::spawn(app.handle().clone(), share_poll_state);
             let monitor_handle = app.handle().clone();
             let monitor_emit: crate::server_monitor::MonitorEmit =
                 Arc::new(move |event, payload| {
@@ -313,6 +319,7 @@ fn main() {
             commands::export_singbox_selected_cmd,
             commands::list_share_candidates_cmd,
             commands::list_shares_cmd,
+            commands::share_status_cmd,
             commands::create_share_cmd,
             commands::update_share_cmd,
             commands::reset_share_usage_cmd,
@@ -361,10 +368,12 @@ fn main() {
             commands::probe_link_cmd,
             commands::build_link_cmd,
             commands::adopt_link_cmd,
+            commands::extend_taken_link_cmd,
             commands::teardown_link_cmd,
             commands::readopt_link_cmd,
             commands::delete_link_rule_cmd,
             commands::refresh_link_status_cmd,
+            commands::relay_statuses_cmd,
             commands::list_device_peers_cmd,
             commands::add_device_peer_cmd,
             commands::remove_device_peer_cmd,

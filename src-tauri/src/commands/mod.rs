@@ -1297,17 +1297,50 @@ pub async fn adopt_link(state: Arc<AppState>, input: AdoptLinkInput) -> R<RelayR
     relay::adopt_link(&state, input).await.map_err(err)
 }
 
+/// 给已接管的链路补端口：复用现有 WireGuard 隧道，只在中转机上增加 DNAT
+/// （并写入工具自己的 systemd unit 持久化），不新建隧道、不重启 WG。
+pub async fn extend_taken_link(state: Arc<AppState>, anchor_rule_id: i64) -> R<Vec<RelayRule>> {
+    relay::extend::extend_taken_link(&state, anchor_rule_id)
+        .await
+        .map_err(err)
+}
+
 /// 提交拆链任务：规则存在（NotFound 直接报错）→ 建 jobs 行（kind='link'）→ 入队。
-/// action ∈ 'unregister'（解除登记）| 'full'（真实拆除）。
+/// action ∈ 'unregister'（解除登记）| 'full'（真实拆除）| 'port'（只移除扩展端口）。
 pub fn teardown_link(state: Arc<AppState>, rule_id: i64, action: String) -> R<i64> {
-    if !matches!(action.as_str(), "unregister" | "full") {
+    if !matches!(action.as_str(), "unregister" | "full" | "port") {
         return Err(AppError::Message("未知拆链动作".into()));
     }
     {
         let conn = state.db.lock();
-        repos::relay::get(&conn, rule_id)
+        let rule = repos::relay::get(&conn, rule_id)
             .map_err(err)?
             .ok_or_else(|| AppError::NotFound("链路不存在".into()))?;
+        if action == "port" {
+            if rule.forward_mode != relay::extend::EXTENDED_MODE {
+                return Err(AppError::Message(
+                    "只有扩展端口行可以单独移除端口；整条链路请用解除登记/拆链".into(),
+                ));
+            }
+        } else {
+            if rule.forward_mode == relay::extend::EXTENDED_MODE {
+                return Err(AppError::Message(
+                    "扩展端口行请用「移除端口」；直接解登记会留下未清理的 DNAT 规则".into(),
+                ));
+            }
+            // 扩展端口挂在同一条隧道上：先移除它们，再处理整条链路，避免
+            // 隧道被拆掉后留下指向空接口的 DNAT 和一堆悬空规则行。
+            let has_extended = repos::relay::list(&conn).map_err(err)?.iter().any(|r| {
+                r.forward_mode == relay::extend::EXTENDED_MODE
+                    && r.relay_server_id == rule.relay_server_id
+                    && r.landing_server_id == rule.landing_server_id
+            });
+            if has_extended {
+                return Err(AppError::Message(
+                    "该链路下还有扩展端口，请先在链路页逐一「移除端口」".into(),
+                ));
+            }
+        }
     }
     let job_id = repos::jobs::insert(&state.db.lock(), "link", "queued").map_err(err)?;
     state
@@ -1505,9 +1538,88 @@ pub async fn enable_bbr(state: Arc<AppState>, server_id: i64) -> R<String> {
 }
 
 pub async fn refresh_link_status(state: Arc<AppState>, rule_id: i64) -> R<LinkStatus> {
-    relay::refresh_link_status(&state, rule_id)
+    let status = relay::refresh_link_status(&state, rule_id)
         .await
-        .map_err(err)
+        .map_err(err)?;
+    // 手动刷新也写回后端缓存：切页回来/重开界面时读到的是刚查过的结果，
+    // 不必等下一轮定时轮询。
+    state
+        .relay_statuses
+        .lock()
+        .unwrap()
+        .insert(rule_id, status.clone());
+    Ok(status)
+}
+
+/// 中转链路状态的最近快照（纯读缓存，不发 SSH）。前端挂载中转页时读它播种。
+pub fn relay_statuses(state: &AppState) -> R<std::collections::HashMap<i64, LinkStatus>> {
+    Ok(state.relay_statuses.lock().unwrap().clone())
+}
+
+// ---------- 分享状态缓存 ----------
+
+/// 手动刷新：全量采集分享列表与各服务器证书状态，写回缓存后返回。
+///
+/// 这是分享页唯一会主动发 SSH 的入口（用户点「刷新」或完成增删改后）。
+pub async fn refresh_shares(
+    state: Arc<AppState>,
+) -> R<crate::share::model::ShareSnapshot> {
+    let snapshot = crate::share::install::refresh_share_snapshot(&state)
+        .await
+        .map_err(err)?;
+    *state.share_snapshot.lock().unwrap() = Some(snapshot.clone());
+    Ok(snapshot)
+}
+
+/// 分享状态最近快照（纯读缓存，不发 SSH）。前端启动时读它播种。
+pub fn share_snapshot(state: &AppState) -> R<crate::share::model::ShareSnapshot> {
+    Ok(crate::share::status_poll::cached(state))
+}
+
+/// 证书状态缓存优先；未命中（首轮未完成/该台证书读取失败）才实时查询并写回。
+pub async fn share_tls_status(
+    state: Arc<AppState>,
+    server_id: i64,
+) -> R<crate::share::model::ShareTlsStatus> {
+    let cached = state
+        .share_snapshot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|s| s.tls.get(&server_id))
+        .cloned();
+    if let Some(status) = cached {
+        return Ok(status);
+    }
+    let status = crate::share::tls_status(&state, server_id)
+        .await
+        .map_err(err)?;
+    cache_share_tls(&state, server_id, status.clone());
+    Ok(status)
+}
+
+/// 配置/续期 HTTPS 后返回的状态立即入缓存，向导与分享页不必等下一轮轮询。
+pub async fn prepare_share_tls(
+    state: Arc<AppState>,
+    server_id: i64,
+) -> R<crate::share::model::ShareTlsStatus> {
+    let status = crate::share::prepare_tls(&state, server_id)
+        .await
+        .map_err(err)?;
+    cache_share_tls(&state, server_id, status.clone());
+    Ok(status)
+}
+
+fn cache_share_tls(
+    state: &AppState,
+    server_id: i64,
+    status: crate::share::model::ShareTlsStatus,
+) {
+    let mut guard = state.share_snapshot.lock().unwrap();
+    guard
+        .get_or_insert_with(Default::default)
+        .tls
+        .insert(server_id, status);
 }
 
 pub fn list_device_peers(state: Arc<AppState>, rule_id: i64) -> R<Vec<DevicePeer>> {

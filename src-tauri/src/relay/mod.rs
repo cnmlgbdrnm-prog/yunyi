@@ -6,7 +6,9 @@
 
 pub mod build;
 pub mod config;
+pub mod extend;
 pub mod peers;
+pub mod status_poll;
 // 设备 peer 命令层以 relay:: 平级路径消费（与 build/peers 模块内函数同一命名面）
 pub use peers::{add_device_peer, get_peer_config, list_device_peers, remove_device_peer};
 

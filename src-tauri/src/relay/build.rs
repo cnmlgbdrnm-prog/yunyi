@@ -124,6 +124,28 @@ fn load_or_create_rule(state: &AppState, req: &LinkBuildReq) -> Result<RelayRule
             .map_err(|e| RelayError::Db(e.to_string()))?;
     let rule = match existing {
         Some(r) => {
+            // 扩展端口是「接管链路 + 额外 DNAT」的记账行，WireGuard 配置不属于本工具；
+            // 重建会落到 wg0 全序列，既可能冲掉手工隧道，也会把扩展行的语义改坏。
+            if r.forward_mode == "extended" {
+                return Err(RelayError::Validation(
+                    "扩展端口链路不能重建；请在链路页「移除端口」，或新建一条工具管理的链路".into(),
+                ));
+            }
+            // 扩展端口挂在当前隧道上。整条重建会落到 wg0 全序列，可能冲掉手工隧道，
+            // 那些 DNAT 也会指向一个不存在的接口——必须先逐条移除。
+            let has_extended = repos::relay::list(&conn)
+                .map_err(|e| RelayError::Db(e.to_string()))?
+                .iter()
+                .any(|x| {
+                    x.forward_mode == "extended"
+                        && x.relay_server_id == r.relay_server_id
+                        && x.landing_server_id == r.landing_server_id
+                });
+            if has_extended {
+                return Err(RelayError::Validation(
+                    "该链路下还有扩展端口：请先在链路页逐一「移除端口」，再重建链路".into(),
+                ));
+            }
             if req.action == "build" && r.status == "built" {
                 return Err(RelayError::LinkBuilt);
             }
@@ -467,7 +489,7 @@ pub async fn run_teardown(
     cancel: &Arc<AtomicBool>,
     emit: &EmitFn,
 ) -> Result<(), String> {
-    if !matches!(req.action.as_str(), "unregister" | "full") {
+    if !matches!(req.action.as_str(), "unregister" | "full" | "port") {
         return Err(RelayError::Validation(format!("未知拆链动作: {}", req.action)).to_string());
     }
     let rule = {
@@ -476,6 +498,11 @@ pub async fn run_teardown(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| RelayError::NotFound.to_string())?
     };
+    // 扩展端口只删 DNAT 与登记行，绝不碰 WireGuard；它必须走专用分支，
+    // 否则会落进 imported 的「拆除接口」，把用户的 wg1 整条拆掉。
+    if rule.forward_mode == crate::relay::extend::EXTENDED_MODE || req.action == "port" {
+        return crate::relay::extend::remove_extended_port(state, &req, &rule, cancel, emit).await;
+    }
     if rule.status == "not-built" {
         return Err(RelayError::LinkNotBuilt.to_string());
     }
@@ -766,7 +793,7 @@ pub(crate) fn valid_iface_name(name: &str) -> bool {
 }
 
 /// 枚举 WG 接口并按 peer 公钥定位所在接口（接口名不假设 wg0）。
-async fn find_iface_by_peer(
+pub(crate) async fn find_iface_by_peer(
     sess: &mut SshSession,
     cancel: &AtomicBool,
     peer_pubkey: &str,

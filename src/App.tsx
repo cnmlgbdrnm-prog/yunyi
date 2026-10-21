@@ -2,6 +2,8 @@
 import { useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { installJobListener } from './jobs/registry'
+import { installRelayStatusListener } from './views/relayStatusStore'
+import { installShareStatusListener } from './views/shareStatusStore'
 import {
   installMonitorListener,
   refreshMonitor,
@@ -66,6 +68,14 @@ export default function App() {
   useEffect(() => {
     void installMonitorListener(listen)
     void refreshMonitor()
+  }, [])
+  // 中转链路状态：后端定时查询后推送；这里只订阅事件并读一次后端缓存，不发 SSH。
+  useEffect(() => {
+    void installRelayStatusListener(listen)
+  }, [])
+  // 分享状态同理：后端逐台采集（含证书）后推送，切页不再触发全量 SSH。
+  useEffect(() => {
+    void installShareStatusListener(listen)
   }, [])
   return (
     <div className="flex h-screen bg-neutral-950 text-neutral-100">

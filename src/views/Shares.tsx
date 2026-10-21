@@ -1,16 +1,15 @@
 // 分享视图：列出服务器上的分享链接、新建（选服务器 + 勾节点）、作废。
-// 分享的真实状态在服务器上——本地不存记录，每次进页面都向服务器重新拉；
-// 但列表要跨视图切换保留一份**会话级内存快照**：读一次要 SSH 逐台服务器
-// （实测 ~14 秒），每次切回来都空白「读取中…」既慢又像数据丢了。快照只活在
-// 当前进程内存里（不落盘：链接本身就是凭证），进页面先显示旧列表，同时后台
-// 刷新，服务器始终是唯一事实源。某台连不上时只列不出那几条，并把服务器名
-// 摆在明面上（见 unreachable 提示）。
+// 分享的真实状态在服务器上——后端定时逐台采集并经 `share://status` 推送，
+// 前端挂载/切页只读 store，不再触发全量 SSH（列举一次实测 ~14 秒）。
+// 手动「刷新」与增删改之后仍会即时采集（用户动作），结果写回 store 与后端缓存。
+// 某台连不上时只列不出那几条，并把服务器名摆在明面上（见 unreachable 提示）。
 import { Fragment, useCallback, useEffect, useState } from 'react'
 import { deleteShare, listServers, listShares } from '../api'
 import ConfirmButton from '../components/ConfirmButton'
 import ShareEditPanel from '../components/ShareEditPanel'
 import ShareWizard from '../components/ShareWizard'
 import { copyText } from '../utils/clipboard'
+import { applyShareStatus, useShareStatus } from './shareStatusStore'
 import type { Server, ShareInfo } from '../api/types'
 
 const GB = 1024 ** 3
@@ -77,22 +76,19 @@ function statusView(s: ShareInfo): { label: string; className: string } {
   }
 }
 
-/** 会话级快照：模块作用域，视图卸载后仍在；应用退出即丢，不落盘。 */
-type ShareSnapshot = { shares: ShareInfo[]; unreachable: string[] }
-let lastSnapshot: ShareSnapshot | null = null
-
-/** 仅供测试清空快照，避免用例之间互相污染（生产代码不应调用）。 */
-export function clearShareSnapshot() {
-  lastSnapshot = null
+/** 会话级快照已移入后端轮询；这里只格式化「更新于」的时刻。 */
+function formatClock(at: string): string | null {
+  const d = new Date(at)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
 export default function Shares() {
-  // 有快照就先渲染旧列表，避免每次切回来都空白「读取中…」；
-  // 真实数据仍然由下面的后台刷新拿服务器结果覆盖。
-  const [shares, setShares] = useState<ShareInfo[]>(() => lastSnapshot?.shares ?? [])
-  const [unreachable, setUnreachable] = useState<string[]>(
-    () => lastSnapshot?.unreachable ?? [],
-  )
+  // 状态来自后端定时采集（App 启动时读一次缓存并订阅 share://status）：
+  // 本页挂载/切页都不再发 SSH。
+  const status = useShareStatus()
+  const shares = status?.shares ?? []
+  const unreachable = status?.unreachable ?? []
   const [servers, setServers] = useState<Server[]>([])
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
@@ -102,33 +98,30 @@ export default function Shares() {
   const [editing, setEditing] = useState<ShareInfo | null>(null)
   const [created, setCreated] = useState<ShareInfo | null>(null)
 
+  // 手动刷新：唯一会从本页触发全量 SSH 的路径（用户点击/增删改之后）。
   const refresh = useCallback(async () => {
+    setError(null)
     setRefreshing(true)
     try {
-      const list = await listShares()
-      // 只有成功结果才更新快照；失败时保留旧列表（服务器不可达不代表分享没了）
-      lastSnapshot = { shares: list.shares, unreachable: list.unreachable }
-      setShares(list.shares)
-      setUnreachable(list.unreachable)
+      applyShareStatus(await listShares())
+    } catch (e) {
+      setError(String(e))
     } finally {
       setRefreshing(false)
     }
   }, [])
 
-  // 首次取数期间**不能**渲染「还没有分享」：分享在服务器上，这台要 SSH 逐台读，
-  // 实测一次 ~14 秒。那 14 秒里界面说「没有分享」就是在撒谎——用户切一下视图
-  // 回来看到它，会以为分享被删了（2026-09-21 实际发生）。
-  // 有会话快照时不再进入这个空窗：直接显示上次结果，后台刷新。
-  const [loading, setLoading] = useState(() => lastSnapshot === null)
+  // 后端尚未完成第一轮（checked_at=null）时不能渲染「还没有分享」：那不是在说
+  // 事实，而是在说「还没读到」。已完成后空列表才表示真的没有分享。
+  const loading = status == null || status.checked_at === null
+  const updatedAt = status?.checked_at ? formatClock(status.checked_at) : null
 
   useEffect(() => {
-    void refresh()
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false))
+    // 只读本地库（服务器清单）；分享状态由后端推送。
     void listServers()
       .then(setServers)
       .catch((e) => setError(String(e)))
-  }, [refresh])
+  }, [])
 
   // 复制失败必须说出来：剪贴板 API 的拒绝是静默的，不说用户就只会看到「点了没反应」
   const handleCopy = async (url: string) => {
@@ -151,7 +144,17 @@ export default function Shares() {
     <div className="space-y-4">
       <div className="flex items-center gap-3">
         <h2 className="text-xl font-semibold">分享</h2>
-        {refreshing && <span className="text-xs text-neutral-500">更新中…</span>}
+        <button
+          type="button"
+          disabled={refreshing}
+          onClick={() => void refresh()}
+          className="rounded bg-neutral-800 px-3 py-1.5 text-sm text-sky-300 hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {refreshing ? '刷新中…' : '刷新'}
+        </button>
+        {updatedAt && (
+          <span className="text-xs text-neutral-500">更新于 {updatedAt}</span>
+        )}
       </div>
       {error && (
         <p role="alert" className="rounded bg-red-950 px-3 py-2 text-sm text-red-300">
@@ -191,7 +194,7 @@ export default function Shares() {
           onCreated={(info) => {
             setCreated(info)
             setWizardOpen(false)
-            void refresh().catch((e) => setError(String(e)))
+            void refresh()
           }}
         />
       )}
@@ -353,7 +356,7 @@ export default function Shares() {
                             onClose={() => setEditing(null)}
                             onSaved={() => {
                               setEditing(null)
-                              void refresh().catch((e) => setError(String(e)))
+                              void refresh()
                             }}
                           />
                         </td>

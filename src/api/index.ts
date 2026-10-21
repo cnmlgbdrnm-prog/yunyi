@@ -132,9 +132,14 @@ export function exportSingboxSelected(nodeIds: string[]): Promise<ExportOutcome 
   return invoke('export_singbox_selected_cmd', { nodeIds })
 }
 
-/** 列出所有服务器上的分享。状态实读自服务器，本地不存分享记录 */
+/** 手动刷新：后端逐台 SSH 采集分享与证书状态并写回缓存（切页不再触发）。 */
 export function listShares(): Promise<ShareList> {
   return invoke('list_shares_cmd')
+}
+
+/** 分享状态最近快照（纯读后端缓存，不发 SSH）；null 字段表示尚未完成首轮。 */
+export function shareStatus(): Promise<ShareList> {
+  return invoke('share_status_cmd')
 }
 
 /** 向导候选：后端按服务器重算准入（自建/启用/非 ssr/非隐私/非中转；上游出口可分享）。 */
@@ -579,7 +584,15 @@ export function adoptLink(input: {
   return invoke('adopt_link_cmd', { ...input })
 }
 
-export function teardownLink(ruleId: number, action: 'unregister' | 'full'): Promise<number> {
+/** 接管链路补端口：复用现有隧道，只在中转机上补 DNAT（不新建链路）。 */
+export function extendTakenLink(anchorRuleId: number): Promise<RelayRule[]> {
+  return invoke('extend_taken_link_cmd', { anchorRuleId })
+}
+
+export function teardownLink(
+  ruleId: number,
+  action: 'unregister' | 'full' | 'port',
+): Promise<number> {
   return invoke('teardown_link_cmd', { ruleId, action })
 }
 
@@ -593,6 +606,11 @@ export function deleteLinkRule(ruleId: number): Promise<void> {
 
 export function refreshLinkStatus(ruleId: number): Promise<LinkStatus> {
   return invoke('refresh_link_status_cmd', { ruleId })
+}
+
+/** 后端最近一轮轮询的链路状态快照（纯读内存，不发 SSH）。 */
+export function relayStatuses(): Promise<Record<number, LinkStatus>> {
+  return invoke('relay_statuses_cmd')
 }
 
 export function listDevicePeers(ruleId: number): Promise<DevicePeer[]> {
