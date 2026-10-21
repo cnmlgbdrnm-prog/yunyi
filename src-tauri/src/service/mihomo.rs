@@ -710,6 +710,17 @@ fn start(config_yaml: &str, mixed_port: u16, ctrl_port: u16, token: &str) -> Res
     if let Response::Failed { message } = stop() {
         return Response::Failed { message };
     }
+    // 服务正常停止时会故意留下一个直连 mihomo 占着 mixed 端口（见
+    // `preserve_on_service_stop`）。用户现在明确要开网络：按镜像 + `-d` 精确回收
+    // 它，否则新实例绑不上同一个端口。这里也兜住旧版本留下的同参数孤儿。
+    if let Err(e) = crate::net::orphan::cleanup(
+        &[(paths::bin_dir().join("mihomo.exe"), paths::net_dir())],
+        &[],
+    ) {
+        return Response::Failed {
+            message: format!("清理上次会话保留的代理进程失败: {e}"),
+        };
+    }
     let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
 
     let assets = match assets_dir() {
@@ -789,16 +800,43 @@ fn start(config_yaml: &str, mixed_port: u16, ctrl_port: u16, token: &str) -> Res
     }
 }
 
-fn stop() -> Response {
+/// 服务正常停止时保留直连端点：切直连并解除 Job 的「关句柄即杀」，
+/// 让 mihomo 在服务进程退出后继续监听 mixed 端口。
+///
+/// **不能只切直连**：`ManagedChild` 创建时给 Job 设了
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，服务进程一退，内核就会连 mihomo 一起
+/// 收走。已运行程序的环境变量记着 `127.0.0.1:7890`，端口消失会让它们整片
+/// `ECONNREFUSED`——服务重启（`Restart-Service yunyi-service`）正是这条故障路径。
+///
+/// 下次服务启动不会主动清这只 mihomo（见 `host.rs`）；等用户真正「开启网络」时，
+/// [`start`] 会先按镜像与 `-d` 精确回收它，再起新实例。若服务是被强杀的，这里
+/// 不会执行，Job 仍按原语义回收子进程。
+pub(super) fn preserve_on_service_stop() {
+    let _ = handle(&Request::Detach);
+    // Detach 只换配置、不撤防火墙（防火墙清理在 session::detach_network）；服务
+    // 被直接停止时也要把会话阻断规则撤掉，否则新启动的直连程序会被挡住。
+    let _ = handle(&Request::UnblockDirect);
     let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(c) = guard.as_mut() {
-        if let Err(e) = c.kill().and_then(|_| c.wait()) {
-            return Response::Failed {
-                message: format!("停止代理进程失败: {e}"),
-            };
-        }
+    let Some(child) = guard.as_mut() else {
+        return;
+    };
+    if let Err(e) = child.keep_alive_on_close() {
+        eprintln!("[yunyi-service] 保留直连代理失败（服务退出将回收 mihomo）: {e}");
     }
-    guard.take();
+}
+
+fn stop() -> Response {
+    {
+        let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = guard.as_mut() {
+            if let Err(e) = c.kill().and_then(|_| c.wait()) {
+                return Response::Failed {
+                    message: format!("停止代理进程失败: {e}"),
+                };
+            }
+        }
+        guard.take();
+    }
     if TUN_ENABLED.load(Ordering::Relaxed) {
         let problems = wait_tun_gone(
             &crate::net::winprobe::adapter_names,
@@ -816,6 +854,21 @@ fn stop() -> Response {
     // 否则下次起来界面会显示一个并不存在的「TUN 已开启」
     TUN_ENABLED.store(false, Ordering::Relaxed);
     *LAST_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // 服务重启会留下一个不在 CHILD 槽里的直连 mihomo（见
+    // `preserve_on_service_stop`）。StopNet 是**硬停止**，必须连它一起回收：
+    // 否则 mixed 端口仍被占着，调用方接着 `StartNet` 时会在端口检查处报
+    // 「7890 已被占用」，把保留机制变成用户无法重新开网的死锁。
+    //
+    // 必须放在 CHILD 锁释放之后：orphan::cleanup 要枚举全进程并可能等待它退出，
+    // 握着槽位锁会让并发的 Status 查询跟着卡住。
+    if let Err(e) = crate::net::orphan::cleanup(
+        &[(paths::bin_dir().join("mihomo.exe"), paths::net_dir())],
+        &[],
+    ) {
+        return Response::Failed {
+            message: format!("清理保留的直连代理失败: {e}"),
+        };
+    }
     Response::Stopped {
         mixed_port: if port == 0 { None } else { Some(port) },
     }
