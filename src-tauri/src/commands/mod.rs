@@ -865,7 +865,7 @@ pub fn add_upstream(state: Arc<AppState>, input: servers::upstream::UpstreamInpu
     Ok(Upstream { id, ..row })
 }
 
-/// 编辑出口（协议/地址/端口/凭据/监听端口/伪装域名）。**只写库**：远端那份配置与
+/// 编辑出口（名称/协议/地址/端口/凭据/监听端口/伪装域名）。**只写库**：远端那份配置与
 /// 写回的节点都由部署 job 重渲染（`upstream.rs` 尾部），所以改完**必须重部署才生效**
 /// ——界面据此提示，别在这里假装已经切过去了。
 ///
@@ -874,6 +874,11 @@ pub fn add_upstream(state: Arc<AppState>, input: servers::upstream::UpstreamInpu
 /// 出站，入站那套 REALITY 身份与写回的节点都不动。代价却在用户身上现形了
 /// （2026-09-22 真机）：对面把 socks5 端口发在 12324、HTTP 在 12323，用户填错一位，
 /// 只能删掉重建——出口 id 3→4、写回的节点跟着重建、名称与分组全丢。
+///
+/// **名称也在这条编辑路径里**：它是写回节点名 `<服务器名>-<出口名>` 的一部分。
+/// 保存只改自身行；重新部署时 job 按同一个 `node_id` 用新名字覆盖节点，节点身份与
+/// 凭据不变。不要在这里顺手改 nodes 行——运行中的 mihomo 配置还是旧名字，提前改库
+/// 只会让界面显示一个客户端并不认识的节点。
 pub fn update_upstream(
     state: Arc<AppState>,
     id: i64,
@@ -899,8 +904,8 @@ pub fn update_upstream(
     let listen_port = servers::upstream::pick_listen_port(edit.listen_port, &taken);
     let input = servers::upstream::UpstreamInput {
         server_id: row.server_id,
-        // 名称不在编辑面内（改名要连带改远端节点），原样带过去过校验
-        name: row.name.clone(),
+        // 名称可改；重新部署时部署 job 按 node_id 用新名字覆盖写回的节点
+        name: edit.name.clone(),
         proto: edit.proto.clone(),
         host: edit.host.clone(),
         port: edit.port,
@@ -911,6 +916,7 @@ pub fn update_upstream(
     };
     servers::upstream::validate(&input, &others, &reserved).map_err(err)?;
     let next = Upstream {
+        name: servers::clean_text(&input.name),
         proto: input.proto.clone(),
         host: servers::clean_text(&input.host),
         port: input.port,

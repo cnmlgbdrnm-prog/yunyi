@@ -502,7 +502,7 @@ pub fn add_upstream_cmd(
     )
 }
 
-/// 编辑出口（改完要点「重新部署」才在远端生效）。
+/// 编辑出口（含名称；改完要点「重新部署」才在远端生效）。
 ///
 /// `password` 传 `null` 或空串 = **不改**（凭据不回显，表单拿不到原值）。
 #[tauri::command]
@@ -510,6 +510,7 @@ pub fn add_upstream_cmd(
 pub fn update_upstream_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     id: i64,
+    name: String,
     proto: String,
     host: String,
     port: i64,
@@ -522,6 +523,7 @@ pub fn update_upstream_cmd(
         state.inner().clone(),
         id,
         servers::upstream::UpstreamEdit {
+            name,
             proto,
             host,
             port,

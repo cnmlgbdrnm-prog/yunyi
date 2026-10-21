@@ -414,15 +414,17 @@ export function addUpstream(input: {
   return invoke('add_upstream_cmd', { ...input })
 }
 
-/** 编辑出口（协议/地址/端口/凭据/监听端口/伪装域名）。
+/** 编辑出口（名称/协议/地址/端口/凭据/监听端口/伪装域名）。
  *
  *  返回**实际生效**的记录：监听端口撞车时后端会自动改用空闲端口，所以返回值可能与
  *  传进去的不同，调用方要按返回值回显与提示。
- *  只写库——远端要等 `startUpstreamJob`（重新部署）才切过去。
+ *  只写库——远端与写回节点要等 `startUpstreamJob`（重新部署）才切过去；改名后节点名
+ *  由部署 job 按 `<服务器名>-<出口名>` 重写。
  *  `password` 省略/传空 = **不改密码**：凭据不回显，表单拿不到原值。 */
 export function updateUpstream(
   id: number,
   input: {
+    name: string
     proto: string
     host: string
     port: number
