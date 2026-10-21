@@ -78,7 +78,7 @@
 | --- | --- | --- | --- |
 | `list_upstreams_cmd` | `listUpstreams(serverId)` | `{ serverId }` | `Upstream[]`（不含密码） |
 | `add_upstream_cmd` | `addUpstream(input)` | `{ serverId, name, proto, host, port, username, password, listenPort, realityDest? }` | `Upstream` |
-| `update_upstream_cmd` | `updateUpstream(id, input)` | `{ id, proto, host, port, username, password?, listenPort, realityDest }` | `Upstream`（实际生效值；端口冲突会自动改用空闲端口） |
+| `update_upstream_cmd` | `updateUpstream(id, input)` | `{ id, name, proto, host, port, username, password?, listenPort, realityDest }` | `Upstream`（实际生效值；端口冲突会自动改用空闲端口） |
 | `remove_upstream_cmd` | `removeUpstream(id)` | `{ id }` | `void` |
 | `start_upstream_job_cmd` | `startUpstreamJob(serverId)` | `{ serverId }` | `job_id`（kind `upstream`） |
 | `probe_egress_ip_cmd` | `probeEgressIp(id)` | `{ upstreamId }` | `string`（最近探测的出口 IP） |
@@ -86,7 +86,9 @@
 | `enable_privacy_cmd` | `enablePrivacy(serverId, nodeId)` | `{ serverId, nodeId }` | `job_id`（kind `privacy`） |
 | `disable_privacy_cmd` | `disablePrivacy(privacyId)` | `{ privacyId }` | `job_id \| null`（从未部署成功则为 null） |
 
-`update_upstream` 的 `password` 省略/传空 = **不改密码**（凭据不回显）。
+`update_upstream` 的 `password` 省略/传空 = **不改密码**（凭据不回显）。`name` 可改；
+保存只写库，重新部署时部署 job 按同一个 `node_id` 用新名字（`<服务器名>-<出口名>`）
+覆盖写回的节点。
 
 ## 6. 分享与订阅服务
 

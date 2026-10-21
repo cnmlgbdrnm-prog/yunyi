@@ -1318,8 +1318,8 @@ pub mod upstreams {
         })
     }
 
-    /// 改可编辑字段（协议/地址/端口/用户名/监听端口/伪装域名）。**只写库**：远端那份
-    /// 配置与写回的节点都由部署 job 重渲染，所以改完必须重部署才生效。
+    /// 改可编辑字段（名称/协议/地址/端口/用户名/监听端口/伪装域名）。**只写库**：远端
+    /// 那份配置与写回的节点都由部署 job 重渲染，所以改完必须重部署才生效。
     /// 调用前必须过 [`crate::servers::upstream::validate`]。
     ///
     /// `password_sealed = None` 表示**不动密码**——界面留空即此意。凭据经 IPC 不回显，
@@ -1332,10 +1332,11 @@ pub mod upstreams {
         match password_sealed {
             Some(sealed) => {
                 conn.execute(
-                    "UPDATE upstreams SET proto=?2,host=?3,port=?4,username=?5,listen_port=?6,\
-                     reality_dest=?7,password=?8 WHERE id=?1",
+                    "UPDATE upstreams SET name=?2,proto=?3,host=?4,port=?5,username=?6,\
+                     listen_port=?7,reality_dest=?8,password=?9 WHERE id=?1",
                     params![
                         u.id,
+                        u.name,
                         u.proto,
                         u.host,
                         u.port,
@@ -1348,10 +1349,11 @@ pub mod upstreams {
             }
             None => {
                 conn.execute(
-                    "UPDATE upstreams SET proto=?2,host=?3,port=?4,username=?5,listen_port=?6,\
-                     reality_dest=?7 WHERE id=?1",
+                    "UPDATE upstreams SET name=?2,proto=?3,host=?4,port=?5,username=?6,\
+                     listen_port=?7,reality_dest=?8 WHERE id=?1",
                     params![
                         u.id,
+                        u.name,
                         u.proto,
                         u.host,
                         u.port,

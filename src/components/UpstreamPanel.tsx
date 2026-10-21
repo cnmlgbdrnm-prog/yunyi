@@ -218,6 +218,8 @@ export default function UpstreamPanel({
         return
       }
       const saved = await updateUpstream(u.id, {
+        // 行内改端口只改端口：名称按原值完整带过去
+        name: u.name,
         proto: u.proto,
         host: u.host,
         port: u.port,
@@ -270,6 +272,7 @@ export default function UpstreamPanel({
         return
       }
       const saved = await updateUpstream(id, {
+        name: form.name.trim(),
         proto: form.proto,
         host: form.host.trim(),
         port: p,

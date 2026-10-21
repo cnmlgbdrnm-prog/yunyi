@@ -71,12 +71,13 @@ pub struct UpstreamInput {
 /// 编辑既有出口：改的都在这，改完**必须重新部署**才在远端生效。
 ///
 /// 两处刻意的取舍：
-/// - **不含名称**：名称参与写回节点的命名（`<服务器名>-<出口名>`），改名要在远端把
-///   那个节点一起改名，不是一次纯本地编辑。留着以后单做。
+/// - **名称可改**：名称参与写回节点的命名（`<服务器名>-<出口名>`）。保存只写库；
+///   重新部署时部署 job 会按 `node_id` 用新名字覆盖那只节点，不是一次纯本地编辑。
 /// - **密码是 `Option`**：`None` = 不动。凭据经 IPC 不回显（前端表单拿不到原值），
 ///   留空就只能是「不改」——照空串写回去等于把已存的口令擦掉。
 #[derive(Debug, Clone)]
 pub struct UpstreamEdit {
+    pub name: String,
     pub proto: String,
     pub host: String,
     pub port: i64,
@@ -157,8 +158,16 @@ pub fn validate(
     existing: &[Upstream],
     reserved: &[i64],
 ) -> Result<(), ServersError> {
-    if clean_text(&input.name).is_empty() {
+    let name = clean_text(&input.name);
+    if name.is_empty() {
         return Err(ServersError::Validation("出口名称不能为空".into()));
+    }
+    // 节点名是 `<服务器名>-<出口名>`：同机出口重名会让写回的两个节点同名，
+    // mihomo 会以 duplicate name 拒绝整份配置。新增与改名共用这条校验。
+    if existing.iter().any(|u| clean_text(&u.name) == name) {
+        return Err(ServersError::Validation(format!(
+            "出口名称「{name}」已被这台机器上的其他出口使用"
+        )));
     }
     if !PROTOS.contains(&input.proto.as_str()) {
         return Err(ServersError::Validation(format!(

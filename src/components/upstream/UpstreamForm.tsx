@@ -38,12 +38,11 @@ export default function UpstreamForm({
           aria-label="出口名称"
           className={field}
           value={values.name}
-          // 名称参与写回节点的命名（<服务器>-<出口名>），改名要连带改远端节点，
-          // 不在这次编辑面内——只读展示，免得用户以为改了却没生效
-          disabled={editing}
+          // 名称参与写回节点的命名（<服务器>-<出口名>）。保存只写库；重新部署时
+          // 部署 job 会按同一个 node_id 用新名字覆盖那只节点。
           onChange={(e) => onChange('name', e.target.value)}
         />
-        {editing && <span className="text-neutral-500">名称暂不可改（改名要连带改远端节点）</span>}
+        {editing && <span className="text-neutral-500">改名后点「重新部署」同步到节点名</span>}
       </label>
       <label className="text-xs text-neutral-400">
         上游协议
