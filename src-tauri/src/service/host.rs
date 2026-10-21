@@ -63,11 +63,11 @@ fn run_service() -> windows_service::Result<()> {
         ServiceControlAccept::STOP,
     ))?;
 
-    // 升级前的服务没有 Job Object，启动时按固定镜像、完整 -d 和父进程归属清扫。
-    if let Err(e) = super::session::cleanup_legacy_orphans() {
-        eprintln!("[yunyi-service] 旧版孤儿进程恢复失败: {e}");
-        // 后续 RecoverNet 仍会重试并把错误交给界面，不能静默越过旧会话。
-    }
+    // 这里**刻意不清理** mihomo：服务正常停止时会留下一个直连实例占着 mixed
+    // 端口（见 `mihomo::preserve_on_service_stop`），启动期按镜像 + `-d` 清扫会
+    // 把它连同用户已运行程序的环境变量指针一起打断。真正的回收推迟到
+    // `StartNet`（mihomo::start）或需要完整清理的 `RecoverNet`；在那之前这只
+    // 直连 mihomo 继续给旧进程供网。
 
     // 服务启动时清扫阻断规则（四重清扫之三）：服务活着的每一刻，主程序都可能被
     // 强杀，那一瞬间留下的规则没有任何人去撤。服务起来了就意味着「上一段会话已经
@@ -104,10 +104,10 @@ fn run_service() -> windows_service::Result<()> {
         }
     }
 
-    // 退出前先杀 mihomo：静态量不会在进程退出时析构，`Child` 的 Drop 也不杀进程，
-    // 不显式清理就会留下一个 SYSTEM 权限的孤儿 mihomo。
-    // 主程序退出时会先发 StopNet，这里是兜底——直接 `sc stop` 也得清干净。
-    let _ = super::mihomo::handle(&super::protocol::Request::StopNet);
+    // 正常停止**不杀 mihomo**：先切直连，再解除 Job 的「关句柄即杀」，让它继续
+    // 占住 mixed 端口。服务重启时，用户已运行程序的环境变量仍指向该端口；杀了
+    // 它们就整片 `ECONNREFUSED`（本机实测过）。下次 StartNet 会精确回收它。
+    super::mihomo::preserve_on_service_stop();
 
     status_handle.set_service_status(status_for(
         ServiceState::Stopped,

@@ -276,6 +276,42 @@ impl ManagedChild {
     pub fn kill(&mut self) -> io::Result<()> {
         self.process.terminate_and_wait()
     }
+
+    /// 服务正常停止时解除「关 Job 即杀」：Job 句柄随服务进程退出而关闭，但子进程
+    /// 要继续活着占住 mixed 端口。
+    ///
+    /// 已运行程序的环境变量是进程启动那一刻的死快照（浏览器/终端/Claude Code
+    /// 都记着 `HTTP_PROXY=127.0.0.1:7890`）。服务重启若把 mihomo 连端口一起收走，
+    /// 这些程序会整片 `ECONNREFUSED`。调用方应先把 mihomo 切到直连再调用本函数；
+    /// 只对**正常停止**生效——进程被强杀时不会走到这里，Job 仍会回收子进程。
+    pub fn keep_alive_on_close(&self) -> io::Result<()> {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self._job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info.BasicLimitInformation.LimitFlags &= !JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = unsafe {
+            SetInformationJobObject(
+                self._job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         if unsafe { WaitForSingleObject(self.process.handle.as_raw_handle(), 5000) }
             != WAIT_OBJECT_0
