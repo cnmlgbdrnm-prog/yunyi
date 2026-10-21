@@ -3,8 +3,12 @@
 //! 输出：Channel/ChannelStatus。开关状态不入库——SSH iptables INPUT 链规则
 //! 存在性是事实源（-C 查询退出码 0=规则存在=已放行）。
 //! 开关语义（防火墙放行/封锁，不触碰端口背后的服务）：
-//! - 开：规则不存在则 `iptables -I INPUT 1 -p tcp --dport {port} -j ACCEPT`
-//! - 关：规则存在则 `iptables -D INPUT -p tcp --dport {port} -j ACCEPT`
+//! - 开：规则不存在则 `iptables -I INPUT 1 -p tcp --dport {port} -j ACCEPT`；
+//!   服务器有 ip6tables 时同一条命令也给 v6 加规则——服务器入口可以切到 IPv6
+//!   （`addr_family=v6`），只放行 v4 时表现是「实例在听、v6 从本机连必超时」。
+//! - 关：两个地址族都尝试删除规则。
+//! - 状态仍按 IPv4 规则判定（所有服务器都有 v4；v6 规则只做同步维护，避免把
+//!   历史只放行 v4 的通道在界面上突然显示成「已封锁」）。
 //!
 //! 安全：端口范围校验；**SSH 端口拒绝封锁**（防自锁，把自己关在服务器外面）；
 //! 凭据复用 load_auth 解密即用即弃；错误文本经 ssh 层脱敏（不含凭据）。
@@ -212,10 +216,14 @@ pub async fn set_channel_enabled(
         // 放行：不存在才插入（幂等；与上游部署自动放行同一条命令，只此一处拼）
         ensure_open_cmd(channel.port)
     } else {
-        // 封锁：存在才删除（幂等）
+        // 封锁：两个地址族都尝试删除。规则本就不存在时 -D 报错是正常态
+        // （幂等），故忽略删除阶段的错误，最终以回查状态为准。
         format!(
-            "{check} && iptables -D INPUT -p tcp --dport {} -j ACCEPT",
-            channel.port
+            "iptables -D INPUT -p tcp --dport {p} -j ACCEPT 2>/dev/null; \
+             if command -v ip6tables >/dev/null 2>&1; then \
+                 ip6tables -D INPUT -p tcp --dport {p} -j ACCEPT 2>/dev/null; \
+             fi; true",
+            p = channel.port
         )
     };
     let out = sess
@@ -248,10 +256,19 @@ fn accept_rule_check(port: i64) -> String {
 /// 报错（2026-09-21 实测：8864 上 xray 在听、配置进程全对，本机连它超时；手工加上
 /// 这条规则后立刻连通）。能自动做的只有机器这一层；云服务商安全组是另一层，
 /// 本工具够不着，只能由部署后的可达性核验把话说明白。
+///
+/// **IPv6 不能漏**：服务器入口切到 v6 后，可达性核验连的是 `[host_v6]:port`，
+/// 而 ip6tables 的 INPUT 默认也是 DROP（2026-10-22 实测 ashura：v4 端口通、
+/// v6 超时，ip6tables 无对应规则）。有 ip6tables 就同步放行；命令仍以 v4
+/// 成功为前提，v4 失败时不要再用 v6 的 0 退出码把失败吞掉。
 pub fn ensure_open_cmd(port: i64) -> String {
     format!(
-        "{check} || iptables -I INPUT 1 -p tcp --dport {port} -j ACCEPT",
-        check = accept_rule_check(port)
+        "( {v4} || iptables -I INPUT 1 -p tcp --dport {port} -j ACCEPT ) && \
+         if command -v ip6tables >/dev/null 2>&1; then \
+             {v6} || ip6tables -I INPUT 1 -p tcp --dport {port} -j ACCEPT; \
+         fi",
+        v4 = accept_rule_check(port),
+        v6 = format!("ip6tables -C INPUT -p tcp --dport {port} -j ACCEPT"),
     )
 }
 
