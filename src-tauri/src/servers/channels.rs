@@ -151,6 +151,9 @@ fn extract_process_name(line: &str) -> String {
 }
 
 /// 删除通道（纯 DB，不触碰服务器防火墙——删除与开关分离，已放行的端口保持原状）。
+///
+/// 界面在通道**当前已放行**时会先经二次确认，再调 [`switch_channel`] 撤规则后才调用
+/// 本函数；本函数自身保持纯 DB，供服务器不可达时仍能清理登记。
 pub fn remove_channel(state: &AppState, id: i64) -> Result<(), ServersError> {
     let conn = state.db.lock();
     let exists = repos::channels::get(&conn, id)
