@@ -1,5 +1,7 @@
 // 上游出口的新增/编辑共用表单（同一套字段，editing=true 时是编辑面）。
+import { useState } from 'react'
 import { REALITY_DEST_GROUPS, findRealityDest } from '../../utils/realityDest'
+import { defaultUpstreamName, parseProxyInput } from '../../utils/proxyUrl'
 
 export type UpstreamFormValues = {
   name: string
@@ -30,8 +32,74 @@ export default function UpstreamForm({
   onSubmit: () => void
   onCancel: () => void
 }) {
+  // 快速粘贴：服务商给的是「一整条带认证的链接」时，一次拆进下面各字段，
+  // 省掉逐个填主机/端口/用户名/密码。解析失败只就地提示，不动已填内容。
+  const [quick, setQuick] = useState('')
+  const [quickError, setQuickError] = useState<string | null>(null)
+  const [quickOk, setQuickOk] = useState<string | null>(null)
+
+  const fillFromQuick = () => {
+    setQuickError(null)
+    setQuickOk(null)
+    try {
+      const parsed = parseProxyInput(quick, values.proto)
+      onChange('proto', parsed.proto)
+      onChange('host', parsed.host)
+      onChange('port', String(parsed.port))
+      onChange('username', parsed.username)
+      onChange('password', parsed.password)
+      // 只补空名称：编辑既有出口时用户可能已经起好名字，不能覆盖
+      if (!values.name.trim()) onChange('name', defaultUpstreamName(parsed))
+      setQuickOk(`已填入 ${parsed.proto} ${parsed.host}:${parsed.port}`)
+      setQuick('')
+    } catch (e) {
+      setQuickError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   return (
     <div className="mt-2 grid grid-cols-2 gap-2">
+      <div className="col-span-2 rounded border border-neutral-800 bg-neutral-900/40 p-2">
+        <label className="text-xs text-neutral-400">
+          快速粘贴（代理链接、curl 命令，或「主机:端口:用户名:密码」）
+          <div className="mt-1 flex gap-2">
+            <input
+              aria-label="快速粘贴"
+              className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm"
+              value={quick}
+              placeholder="socks5://用户:密码@主机:端口"
+              onChange={(e) => {
+                setQuick(e.target.value)
+                setQuickError(null)
+                setQuickOk(null)
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  fillFromQuick()
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={fillFromQuick}
+              className="rounded bg-neutral-800 px-3 py-1 text-xs text-sky-300 hover:bg-neutral-700"
+            >
+              填入
+            </button>
+          </div>
+        </label>
+        {quickError && (
+          <p role="alert" className="mt-1 text-xs text-red-400">
+            {quickError}
+          </p>
+        )}
+        {quickOk && (
+          <p role="status" className="mt-1 text-xs text-emerald-400">
+            {quickOk}
+          </p>
+        )}
+      </div>
       <label className="text-xs text-neutral-400">
         出口名称
         <input
