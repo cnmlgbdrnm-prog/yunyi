@@ -104,9 +104,7 @@ pub fn quota_gb_to_bytes(gb: u64) -> u64 {
 }
 
 pub fn validate_options(o: &ShareOptions) -> Result<(), String> {
-    if o.quota_up_bytes == 0 && o.quota_down_bytes == 0 {
-        return Err("上行配额与下行配额至少填一个大于 0 的值（0 = 不限）".into());
-    }
+    // 每个方向 0 = 不限；两个方向都填 0（完全不限）也允许，分享仍受到期时间约束。
     if o.rate_up_mbps > 100_000 || o.rate_down_mbps > 100_000 {
         return Err("速率上限过大".into());
     }

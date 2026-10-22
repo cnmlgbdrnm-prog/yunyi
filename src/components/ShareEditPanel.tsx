@@ -111,7 +111,6 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
   const optionsValid =
     validNumber(quotaUpGb, 0, Number.MAX_SAFE_INTEGER) &&
     validNumber(quotaDownGb, 0, Number.MAX_SAFE_INTEGER) &&
-    (Number(quotaUpGb) > 0 || Number(quotaDownGb) > 0) &&
     validNumber(rateUp, 0, 100_000) &&
     validNumber(rateDown, 0, 100_000) &&
     validNumber(days, 1, 3650)
