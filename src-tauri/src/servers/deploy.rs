@@ -91,24 +91,85 @@ pub fn deployed_protocol_details(
 }
 
 /// 端口占用检查：true=端口已被监听（占用），false=空闲可部署。
-async fn probe_port(sess: &mut SshSession, cancel: &AtomicBool, port: u16) -> Result<bool, String> {
-    Ok(
-        run_cmd(sess, cancel, "探测", &port_probe_cmd(port), PROBE_TIMEOUT)
-            .await?
-            .exit_code
-            == 0,
+///
+/// 探测的套接字类型**随协议**：Hysteria2/TUIC 只绑 UDP，用 TCP 表探测会永远
+/// 报「空闲」，既可能选到已被别的 UDP 服务占用的端口，也会让验证永远失败。
+async fn probe_port(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    protocol: &str,
+    port: u16,
+) -> Result<bool, String> {
+    Ok(run_cmd(
+        sess,
+        cancel,
+        "探测",
+        &listen_probe_cmd(protocol, port),
+        PROBE_TIMEOUT,
     )
+    .await?
+    .exit_code
+        == 0)
+}
+
+/// 从既有入站的 REALITY 私钥推导客户端应使用的公钥。
+///
+/// 服务器配置里只有私钥，公钥必须与它成对；旧节点参数里的公钥可能是错的——
+/// 2026-10-23 ashura 实测：入站私钥推导出 `ZE2j…`，节点行却写着 `HjKX…`（来自
+/// 一条已被合并的重复行），vless 直连与中转全部 503，而 trojan 的密钥对是好的。
+/// 能推导就以服务器私钥为准；只有旧版 xray 不支持 `x25519 -i` 时才由调用方退回
+/// 节点参数（此时保持原有行为，不因推导失败而让部署失败）。
+async fn derive_reality_public_key(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    private_key: &str,
+) -> Option<String> {
+    // 私钥是 base64url；先卡字符集，避免把任意内容拼进远端命令
+    if private_key.is_empty()
+        || !private_key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let out = run_cmd_ok(
+        sess,
+        cancel,
+        "配置",
+        &format!("xray x25519 -i {private_key}"),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .ok()?;
+    parse_x25519_keys(&out.stdout).ok().map(|(_, pub_k)| pub_k)
+}
+
+/// 节点名是否属于本次部署要写回的这条线。
+///
+/// 除了同名，还要认 `{base} #N`：应用启动时的重名自愈
+/// （`nodes::ensure_unique_names`）会把历史重复行改名成 ` #2`、` #3`……，
+/// 它们正是上一次「按地址删不到」留下的副本；不认识这个后缀就会把它们
+/// 当成用户自己的另一条节点，永远清不掉。用户改过的名字不带这个后缀，不受影响。
+pub(crate) fn matches_deployed_name(candidate: &str, base: &str) -> bool {
+    if candidate == base {
+        return true;
+    }
+    candidate
+        .strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix(" #"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// 从 base 起探测空闲端口(逐 +1),最多 20 个连续候选;全占报错。
 async fn allocate_port(
     sess: &mut SshSession,
     cancel: &AtomicBool,
+    protocol: &str,
     base: u16,
 ) -> Result<u16, String> {
     for n in 0..21u16 {
         let cand = base.saturating_add(n);
-        if !probe_port(sess, cancel, cand).await? {
+        if !probe_port(sess, cancel, protocol, cand).await? {
             return Ok(cand);
         }
     }
@@ -694,8 +755,9 @@ impl ProdRunner {
         emit_progress("探测", "连接服务器", 5);
         let (auth, _) =
             load_auth_parts(&state.db, &state.creds, req.server_id).map_err(|e| e.to_string())?;
+        let host = crate::domain::effective_host(&server).to_string();
         let mut sess = SshSession::connect(
-            crate::domain::effective_host(&server),
+            &host,
             server.port as u16,
             &server.user,
             &auth,
@@ -779,7 +841,7 @@ impl ProdRunner {
             }
             let assigned = match existing.ports.get(proto.as_str()) {
                 Some(p) => *p,
-                None => allocate_port(&mut sess, cancel, base).await?,
+                None => allocate_port(&mut sess, cancel, proto, base).await?,
             };
             ports.insert(proto.as_str(), assigned);
         }
@@ -940,9 +1002,18 @@ impl ProdRunner {
                 // 不复用，退化成新生成——宁可多写一次新凭据，也不要复用出一个公钥为空的
                 // reality 入站（那同样是全废，且更难查）。
                 if let Some(old) = existing.xray_inbounds.get(&port) {
-                    let old_pk = existing_nodes
-                        .get(p)
-                        .and_then(|n| public_key_of(&n.params_json));
+                    // 私钥才是服务器侧的事实源；见 derive_reality_public_key 的说明。
+                    let old_pk = if p == "vmess" {
+                        None
+                    } else {
+                        derive_reality_public_key(&mut sess, cancel, &old.private_key)
+                            .await
+                            .or_else(|| {
+                                existing_nodes
+                                    .get(p)
+                                    .and_then(|n| public_key_of(&n.params_json))
+                            })
+                    };
                     if p == "vmess" || old_pk.is_some() {
                         let mut e = old.clone();
                         e.reality_dest = reality_dest.clone();
@@ -1008,6 +1079,11 @@ impl ProdRunner {
                 success_protocols.push((e.proto.to_string(), e.port, params));
             }
         }
+        // 客户端用哪一族地址连这台机器，UDP/SS 入站就必须监听哪一族：
+        // sing-box 与 shadowsocks-rust 的 `0.0.0.0` 都是**纯 IPv4**（Xray 的同一
+        // 写法却是双栈）。香港这类登记了 IPv6 的机器会因此让 ss/h2/tuic 完全
+        // 收不到包（2026-10-23 真机：ss 在 0.0.0.0:8388，客户端连 [v6]:8388 503）。
+        let inbound_listen = if host.contains(':') { "::" } else { "0.0.0.0" };
         if need_ss {
             // 同 xray 那段：既有密码原样复用，重复部署不轮换（轮换 = 两侧短暂不一致，
             // 中途失败就把节点变砖）。只有首次部署或读不回配置时才新生成。
@@ -1016,7 +1092,7 @@ impl ProdRunner {
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key)
             });
             let ss_port = ports["ss"];
-            let cfg = ss_config_json(ss_port, &pw, egress);
+            let cfg = ss_config_json(ss_port, &pw, egress, inbound_listen);
             write_remote_file(
                 &mut sess,
                 cancel,
@@ -1117,6 +1193,7 @@ impl ProdRunner {
                 tuic_selected.then(|| (ports["tuic"], tuic_uuid.as_str(), tuic_pw.as_str())),
                 egress,
                 singbox_ver,
+                inbound_listen,
             );
             write_remote_file(
                 &mut sess,
@@ -1230,11 +1307,12 @@ impl ProdRunner {
         }
         // 逐协议端口验证：失败隔离（其余协议继续,仅标记）
         for (proto, port, _params) in &success_protocols {
+            // UDP 协议（Hysteria2/TUIC）只在 UDP 表里可见，用 `ss -tln` 验永远失败。
             let listening = run_cmd(
                 &mut sess,
                 cancel,
                 "启动",
-                &port_probe_cmd(*port),
+                &listen_probe_cmd(proto, *port),
                 VERIFY_TIMEOUT,
             )
             .await?
@@ -1299,31 +1377,72 @@ impl ProdRunner {
         emit_progress("写回", "写入节点与部署记录", 95);
         {
             let conn = state.db.lock();
+            let upstream_ids: HashSet<String> =
+                repos::upstreams::list_by_server(&conn, req.server_id)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter_map(|u| u.node_id)
+                    .collect();
             for (proto, port, params) in &ok_protocols {
-                let node = Node {
-                    id: Uuid::new_v4().simple().to_string(),
-                    name: format!("{}-{}", server.name, proto),
-                    source: "self-built".into(),
-                    protocol: proto.clone(),
-                    addr: crate::domain::effective_host(&server).to_string(),
-                    port: *port as i64,
-                    params_json: params.clone(),
-                    group_name: "自建".into(),
-                    sub_id: None,
-                    relay_rule_id: None,
-                    enabled: true,
-                    latency: None,
-                    bandwidth: None,
-                    last_checked_at: None,
-                    last_check_error: None,
-                    direct_latency: None,
-                    hop_relay_ms: None,
-                    hop_landing_ms: None,
-                    hop_tunnel_ms: None,
+                let name = format!("{}-{}", server.name, proto);
+                // 同名旧行必须**原地更新**，不能按地址删了重建：
+                // - 切过地址族的机器（香港/ashura 登记 v6，旧行 addr 还是 v4）按新地址
+                //   删不到旧行，重建后库里出现两个同名节点，mihomo 热重载直接 400
+                //   `proxy <name> is the duplicate name`（2026-10-23 真机）；
+                // - 旧行上的 relay_rule_id 与用户改名也跟着丢。
+                // 只认「同服务器 + 同协议 + 同名」；用户改过名的节点不算，另起一行。
+                // ` #N` 是重名自愈给历史副本加的后缀，同样属于这条线（见
+                // matches_deployed_name 的说明）。
+                let rows: Vec<Node> = repos::nodes::list(&conn, &state.creds)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter(|n| {
+                        n.source == "self-built"
+                            && n.protocol == *proto
+                            && matches_deployed_name(&n.name, &name)
+                            && crate::domain::server_owns_addr(&server, &n.addr)
+                            && !upstream_ids.contains(&n.id)
+                    })
+                    .collect();
+                // 优先保留挂了中转的那行：链路是按节点行 id/端口建的，换行即丢挂载。
+                let keep = rows
+                    .iter()
+                    .position(|n| n.relay_rule_id.is_some())
+                    .unwrap_or(0);
+                let mut node = if rows.is_empty() {
+                    Node {
+                        id: Uuid::new_v4().simple().to_string(),
+                        name: name.clone(),
+                        source: "self-built".into(),
+                        protocol: proto.clone(),
+                        addr: String::new(),
+                        port: 0,
+                        params_json: String::new(),
+                        group_name: "自建".into(),
+                        sub_id: None,
+                        relay_rule_id: None,
+                        enabled: true,
+                        latency: None,
+                        bandwidth: None,
+                        last_checked_at: None,
+                        last_check_error: None,
+                        direct_latency: None,
+                        hop_relay_ms: None,
+                        hop_landing_ms: None,
+                        hop_tunnel_ms: None,
+                    }
+                } else {
+                    rows[keep].clone()
                 };
-                // 幂等：重复部署先清同一地址同协议的旧自建行，不留参数失效的副本
-                repos::nodes::delete_self_built(&conn, &node.protocol, &node.addr)
-                    .map_err(|e| e.to_string())?;
+                node.addr = crate::domain::effective_host(&server).to_string();
+                node.port = *port as i64;
+                node.params_json = params.clone();
+                node.enabled = true;
+                for (i, extra) in rows.iter().enumerate() {
+                    if i != keep {
+                        repos::nodes::delete(&conn, &extra.id).map_err(|e| e.to_string())?;
+                    }
+                }
                 repos::nodes::upsert(&conn, &node, &state.creds).map_err(|e| e.to_string())?;
             }
             // 自动补挂中转：建链只改指「当时已存在」的节点，之后部署上来的节点
@@ -1368,6 +1487,13 @@ impl ProdRunner {
             .rebuild_config()
             .await
             .map_err(|e| e.to_string())?;
+        // 只重建导出缓存不够：新节点必须同时进入**正在运行**的客户端。否则出口
+        // 下拉框（读库）里能选中新节点，切换时 mihomo 回
+        // `HTTP 400 Selector update error: proxy not exist`（2026-10-23 实测）。
+        // 网络没开时这步是 no-op（ConfigApply::NotRunning）。
+        crate::net::runtime::apply_config_change(state)
+            .await
+            .map_err(|e| format!("部署已完成，但更新运行中的客户端失败：{e}"))?;
         if failed_protocols.is_empty() {
             // BBR 结果并进 100% 文案：用户不点开摘要也能看到
             let done = match &bbr_note {
@@ -1384,9 +1510,11 @@ impl ProdRunner {
                 step: "写回".into(),
                 message: msg.clone(),
                 progress: 100,
-                error: Some(msg),
+                error: Some(msg.clone()),
             });
-            Err("部分协议部署失败".into())
+            // 把失败协议名带回任务错误里：以前只回一句「部分协议部署失败」，
+            // 任务表里查不到到底是哪几个，用户只知道「勾了却没部署上」。
+            Err(msg)
         }
     }
 }

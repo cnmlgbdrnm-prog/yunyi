@@ -433,7 +433,7 @@ async fn build_main(
     //    后拆链跳过恢复，服务永久绑在已不存在的 WG 内网地址
     if req.converged {
         emit_progress("收敛", "收敛落地机监听地址", 95);
-        converge_listen(state, &mut landing, cancel, &landing_srv.host, rule).await?;
+        converge_listen(state, &mut landing, cancel, &landing_srv, rule).await?;
     } else if req.action == "rebuild" && rule.converged {
         emit_progress("收敛", "恢复落地机监听地址", 95);
         converge_restore(state, &mut landing, cancel, rule).await?;
@@ -449,9 +449,8 @@ async fn build_main(
         // 公钥写回：状态查询/拆链按公钥定位 peer，不依赖接口名
         repos::relay::set_pubkeys(&conn, rule.id, Some(&relay_pubkey), Some(&landing_pubkey))
             .map_err(|e| e.to_string())?;
-        let nodes =
-            crate::relay::landing_nodes_for_rule(&conn, &landing_srv.host, rule, &state.creds)
-                .map_err(|e| e.to_string())?;
+        let nodes = crate::relay::landing_nodes_for_rule(&conn, &landing_srv, rule, &state.creds)
+            .map_err(|e| e.to_string())?;
         for n in nodes {
             // 只落标记，**不改地址**（同 reroute_landing_nodes 的说明）。生效地址由
             // crate::config::effective_node 在生成侧一处算出，这里再写一遍就是第二份
@@ -1184,12 +1183,11 @@ async fn converge_listen(
     state: &AppState,
     sess: &mut SshSession,
     cancel: &AtomicBool,
-    landing_host: &str,
+    landing: &crate::domain::Server,
     rule: &RelayRule,
 ) -> Result<(), String> {
-    let nodes =
-        crate::relay::landing_nodes_for_rule(&state.db.lock(), landing_host, rule, &state.creds)
-            .map_err(|e| e.to_string())?;
+    let nodes = crate::relay::landing_nodes_for_rule(&state.db.lock(), landing, rule, &state.creds)
+        .map_err(|e| e.to_string())?;
     let node = nodes.first().ok_or("落地机没有可收敛的自建节点")?;
     let (cfg_path, service) = match node.protocol.as_str() {
         "vless" | "vmess" | "trojan" => (XRAY_CONFIG_PATH, "xray"),

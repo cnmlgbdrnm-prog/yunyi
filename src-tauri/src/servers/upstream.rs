@@ -677,9 +677,8 @@ pub async fn run_upstream_job(
     }
     check_cancel()?;
 
-    // 6 写回节点：按 upstreams.node_id 定位。**不得**用 nodes::delete_self_built——
-    // 它按 protocol+addr 删，而同一中转机上所有出口的节点协议与地址都相同，
-    // 会把兄弟出口的节点一起删掉。
+    // 6 写回节点：按 upstreams.node_id 定位。**不得**按 protocol+addr 删——
+    // 同一中转机上所有出口的节点协议与地址都相同，会把兄弟出口的节点一起删掉。
     let mut wrote_nodes = false;
     if service_action(rows.len()) == ServiceAction::Restart {
         emit("写回", "写入节点", 95);

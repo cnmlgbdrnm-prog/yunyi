@@ -295,16 +295,21 @@ pub mod nodes {
             .collect())
     }
 
-    /// 删除同一地址同协议的自建节点旧行（重复部署幂等：只保留最新一次写回）。
-    pub fn delete_self_built(
+    /// 同 [`find_self_built_by_host`]，但按服务器登记的**两族地址**匹配。
+    /// 切过地址族后 `direct_addr` 可能是另一族，只传 `server.host` 会漏节点。
+    pub fn find_self_built_by_server(
         conn: &Connection,
-        protocol: &str,
-        addr: &str,
-    ) -> rusqlite::Result<usize> {
-        conn.execute(
-            "DELETE FROM nodes WHERE source='self-built' AND protocol=?1 AND addr=?2",
-            params![protocol, addr],
-        )
+        server: &crate::domain::Server,
+        creds: &crate::crypto::CredentialService,
+    ) -> rusqlite::Result<Vec<Node>> {
+        let sql = format!("SELECT {NODE_COLS} FROM nodes WHERE source='self-built'");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| row_to_node(r, creds))?;
+        let all: Vec<Node> = rows.collect::<rusqlite::Result<_>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|n| crate::domain::server_owns_addr(server, &crate::domain::direct_addr(n)))
+            .collect())
     }
 
     /// 删除某订阅下不在保留集合中的节点（订阅刷新时清理已下架节点）。
@@ -533,17 +538,34 @@ pub mod nodes {
     }
 
     /// 落地机自建节点：按 P2 写回时的 addr/port 精确匹配。
-    pub fn find_for_landing(
+    /// 按落地机的**任一登记地址**（IPv4/IPv6 入口）找自建节点。
+    ///
+    /// 切过地址族的服务器上，节点行的 `addr` 已写成另一族地址；只按
+    /// `server.host` 找会漏掉它。2026-10-23 实测后果：部署后的自动挂链
+    /// 摘要写着「ashura-ss 已挂链路 #8」，实际只找到了旧的 IPv4 行，新节点
+    /// 的 `relay_rule_id` 始终为 None。
+    pub fn find_for_landing_server(
+        conn: &Connection,
+        server: &crate::domain::Server,
+        port: i64,
+        creds: &crate::crypto::CredentialService,
+    ) -> rusqlite::Result<Vec<Node>> {
+        find_for_landing_addrs(conn, &server.host, &server.host_v6, port, creds)
+    }
+
+    pub fn find_for_landing_addrs(
         conn: &Connection,
         host: &str,
+        alt_host: &str,
         port: i64,
         creds: &crate::crypto::CredentialService,
     ) -> rusqlite::Result<Vec<Node>> {
         let sql = format!(
-            "SELECT {NODE_COLS} FROM nodes WHERE source='self-built' AND addr=?1 AND port=?2"
+            "SELECT {NODE_COLS} FROM nodes WHERE source='self-built' AND port=?3 \
+             AND (addr=?1 OR (?2<>'' AND addr=?2))"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![host, port], |r| row_to_node(r, creds))?;
+        let rows = stmt.query_map(params![host, alt_host, port], |r| row_to_node(r, creds))?;
         rows.collect()
     }
 

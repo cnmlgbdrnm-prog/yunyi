@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
+/// 自我托管主机首轮直连的快速预算。正常握手 1–2 秒；超过它多半是丢包在拖
+/// 密钥交换（实测 112 直连 11–39 秒），继续等满 15 秒只会让连通测试拖到 90 秒。
+const DIRECT_FIRST_BUDGET: Duration = Duration::from_secs(6);
+
 /// SSH 适配器错误：连接/认证/命令/超时/密钥格式。
 #[derive(Debug, Error)]
 pub enum SshError {
@@ -174,6 +178,13 @@ impl SshSession {
     /// 建立连接并认证；conn_timeout 同时约束连接与认证两个阶段。
     /// 拨号经 [`crate::net::local_proxy`]：开启网络时走 mihomo mixed-port（白拿
     /// 一套规则路由——国内服务器自动直连、国外自动走节点），未开启时即直连。
+    ///
+    /// 自我托管主机（节点宿主）是直连优先；直连丢包时 TCP 往往拨得通、坏在
+    /// SSH 握手/认证，而 `local_proxy` 的自动回退只在**拨号报错**时触发。这里对
+    /// 这类主机再补一层：先用 **6 秒**短预算试直连（正常握手 1–2 秒），超时
+    /// 改走本地代理；代理也不通时再给直连一次完整预算（手动出口恰好装在目标机
+    /// 上时，只有直连可走）。实测 112：直连 11–39 秒且频繁超时，经代理约 4 秒；
+    /// ashura/香港的直连 IPv6 正常，仍会稳在直连（绕到香港反而会中途掉线）。
     pub async fn connect(
         host: &str,
         port: u16,
@@ -181,15 +192,71 @@ impl SshSession {
         auth: &AuthMaterial,
         conn_timeout: Duration,
     ) -> Result<Self, SshError> {
-        Self::connect_via(
+        let proxy = crate::net::local_proxy::get();
+        let Some(proxy) = proxy.filter(|_| crate::net::local_proxy::is_self_hosted(host)) else {
+            return Self::connect_via(host, port, user, auth, conn_timeout, proxy).await;
+        };
+        Self::connect_with_fallback(
             host,
             port,
             user,
             auth,
+            conn_timeout.min(DIRECT_FIRST_BUDGET),
             conn_timeout,
-            crate::net::local_proxy::get(),
+            Some(proxy),
+            Some(proxy),
         )
         .await
+    }
+
+    /// 自我托管主机的连接策略：直连（quick）→ 强制代理（full）→ 直连（full）。
+    ///
+    /// 参数外提与 `connect_via` 同理：进程级登记表在并行测试里无法安全复位。
+    /// `first_proxy`/`fallback_proxy` 分开传，测试才能让首轮真的走直连。
+    pub(crate) async fn connect_with_fallback(
+        host: &str,
+        port: u16,
+        user: &str,
+        auth: &AuthMaterial,
+        quick_timeout: Duration,
+        conn_timeout: Duration,
+        first_proxy: Option<u16>,
+        fallback_proxy: Option<u16>,
+    ) -> Result<Self, SshError> {
+        let first =
+            match Self::connect_via(host, port, user, auth, quick_timeout, first_proxy).await {
+                Ok(sess) => return Ok(sess),
+                Err(e) => e,
+            };
+        let Some(proxy) = fallback_proxy else {
+            return Err(first);
+        };
+        // 非超时错误（认证失败、指纹不符、拒绝连接）换路也一样，不白试。
+        if !matches!(first, SshError::Timeout { .. }) {
+            return Err(first);
+        }
+        match Self::connect_via_proxy_only(host, port, user, auth, conn_timeout, proxy).await {
+            Ok(sess) => Ok(sess),
+            // 代理也走不通（常见于手动出口恰好装在目标机上）：再给直连一次
+            // 完整预算，避免「短预算内没握上手」把本来能连的机器判死。
+            Err(proxy_err) => Self::connect_via(
+                host,
+                port,
+                user,
+                auth,
+                conn_timeout,
+                first_proxy.or(Some(proxy)),
+            )
+            .await
+            .map_err(|direct_err| SshError::Connect {
+                host: host.into(),
+                port,
+                reason: format!(
+                    "直连短预算内未完成握手（{first}），改走本地代理失败（{proxy_err}），\
+                     直连完整预算仍失败（{direct_err}）"
+                ),
+            }),
+        }
     }
 
     /// 显式代理参数版本（None = 直连）。代理外提是为了可测——进程级登记表在并行
@@ -202,6 +269,34 @@ impl SshSession {
         conn_timeout: Duration,
         proxy: Option<u16>,
     ) -> Result<Self, SshError> {
+        Self::connect_inner(host, port, user, auth, conn_timeout, proxy, false).await
+    }
+
+    /// 只经本地代理拨号（跳过自我托管主机的直连优先）。
+    ///
+    /// 部署到 112 这类机器时，直连（China→VPS）丢包会让 SSH 握手在 15 秒预算内
+    /// 完不成；而拨号本身是通的，`local_proxy::dial_with` 的「拨号失败才回退代理」
+    /// 永远等不到。调用方在直连超时后用这个入口强制走代理重试一次。
+    pub(crate) async fn connect_via_proxy_only(
+        host: &str,
+        port: u16,
+        user: &str,
+        auth: &AuthMaterial,
+        conn_timeout: Duration,
+        proxy: u16,
+    ) -> Result<Self, SshError> {
+        Self::connect_inner(host, port, user, auth, conn_timeout, Some(proxy), true).await
+    }
+
+    async fn connect_inner(
+        host: &str,
+        port: u16,
+        user: &str,
+        auth: &AuthMaterial,
+        conn_timeout: Duration,
+        proxy: Option<u16>,
+        proxy_only: bool,
+    ) -> Result<Self, SshError> {
         let config = Arc::new(russh::client::Config::default());
         let reject: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let handler = ClientHandler {
@@ -213,13 +308,15 @@ impl SshSession {
         let mut handle = tokio::time::timeout(conn_timeout, async {
             // 先建流再交给 russh：connect 的第二个参数是 impl AsyncRead + AsyncWrite，
             // 不限于 TcpStream——HTTP CONNECT 打通后拿回的就是那条 TcpStream。
-            let stream = crate::net::local_proxy::dial(host, port, proxy)
-                .await
-                .map_err(|e| SshError::Connect {
-                    host: host.into(),
-                    port,
-                    reason: e.to_string(),
-                })?;
+            let dial = match (proxy_only, proxy) {
+                (true, Some(p)) => crate::net::local_proxy::dial_through_proxy(host, port, p).await,
+                _ => crate::net::local_proxy::dial(host, port, proxy).await,
+            };
+            let stream = dial.map_err(|e| SshError::Connect {
+                host: host.into(),
+                port,
+                reason: e.to_string(),
+            })?;
             // 用 connect_stream 而非 connect：后者只收 ToSocketAddrs（内部自建
             // TcpStream），前者才接受任意的 AsyncRead + AsyncWrite——传什么流由
             // 我们决定（russh 的 connect 实现本身就是 connect_stream 的一层包装）。

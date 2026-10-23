@@ -33,9 +33,12 @@ static PORT: AtomicU16 = AtomicU16::new(0);
 /// 「打开通道 执行失败(exit=0): Channel send error」（2026-09-20 真机）。
 /// 直连还顺带解决了「节点挂了就够不着那台机器」——而那正是最需要 SSH 的时候。
 ///
-/// 不直连优先的对象：**只有经代理才可达**的机器（如走劣化出境路径的 112）。它们是
-/// 节点宿主之外的机器，不在本集合里，行为完全不变。集合里的机器若直连失败，仍回退
-/// 代理——宁可冒自指的险，也不能够不着。
+/// 直连**丢包**（而非拨号失败）时，`ssh::SshSession::connect` 会先用 6 秒短预算
+/// 试直连，超时改走代理再试：112 直连握手 11–39 秒，经代理约 4 秒。不要改成
+/// 「一律代理优先」——香港这类线路到国内本就抖动，把 ashura 的管理连接绕到香港
+/// 会让部署中途掉线（2026-10-23 真机）。
+///
+/// 集合里的机器若直连失败，仍回退代理——宁可冒自指的险，也不能够不着。
 fn self_hosted() -> &'static RwLock<HashSet<String>> {
     static S: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
     S.get_or_init(|| RwLock::new(HashSet::new()))
@@ -49,7 +52,7 @@ pub(crate) fn set_self_hosted(hosts: impl IntoIterator<Item = String>) {
     w.extend(hosts.into_iter().map(|h| h.to_ascii_lowercase()));
 }
 
-fn is_self_hosted(host: &str) -> bool {
+pub(crate) fn is_self_hosted(host: &str) -> bool {
     self_hosted()
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -138,6 +141,23 @@ fn authority(host: &str, port: u16) -> String {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
+    }
+}
+
+/// 只经本地代理拨号：不享受自我托管主机的直连优先。
+///
+/// 给「直连能拨通、但 SSH 握手一直超时」的机器兜底。`dial_with` 的自动回退只在
+/// **拨号报错**时触发，而丢包链路的表现往往是 TCP 连上后握手卡死——调用方在
+/// 自己的连接超时后再发一次强制代理，才有机会换到一条好路。
+pub(crate) async fn dial_through_proxy(
+    host: &str,
+    port: u16,
+    proxy_port: u16,
+) -> io::Result<TcpStream> {
+    match tunnel(proxy_port, host, port).await {
+        Ok(s) => Ok(s),
+        Err(Tunnel::Unreachable(e)) => Err(e),
+        Err(Tunnel::Rejected(msg)) => Err(io::Error::other(msg)),
     }
 }
 

@@ -473,7 +473,7 @@ pub async fn adopt_link(state: &AppState, input: AdoptLinkInput) -> Result<Relay
     let id = repos::relay::insert(&conn, &rule).map_err(|e| RelayError::Db(e.to_string()))?;
     // 节点改指须带真实行 id（rule 构造时 id=0，insert 后才落库）
     let rule = RelayRule { id, ..rule };
-    reroute_landing_nodes(&conn, &rule, &landing.host, &state.creds)?;
+    reroute_landing_nodes(&conn, &rule, &landing, &state.creds)?;
     Ok(rule)
 }
 
@@ -482,7 +482,7 @@ pub async fn adopt_link(state: &AppState, input: AdoptLinkInput) -> Result<Relay
 /// 生效地址由 [`crate::config::effective_node`] 在生成侧一处算出——`config/mod.rs`
 /// 的不变量是「数据始终存直连地址」。这里若连地址一起写，会坏掉两件事：
 /// ① 关掉中转时那个被写坏的原地址会浮上来（本地曾实测：节点标着直连、地址却是中转口）；
-/// ② `find_for_landing` 是按「落地机 host + 端口」找节点的，地址一改下次就找不到它，
+/// ② `find_for_landing_server` 是按「落地机地址 + 端口」找节点的，地址一改下次就找不到它，
 /// 转而新建一个——就是重名节点的来源。
 ///
 /// 落地节点按「落地机 host + 服务端口（landing_port）」匹配，不是 SSH 端口。
@@ -490,10 +490,10 @@ pub async fn adopt_link(state: &AppState, input: AdoptLinkInput) -> Result<Relay
 fn reroute_landing_nodes(
     conn: &Connection,
     rule: &RelayRule,
-    landing_host: &str,
+    landing: &crate::domain::Server,
     creds: &crate::crypto::CredentialService,
 ) -> Result<(), RelayError> {
-    let nodes = repos::nodes::find_for_landing(conn, landing_host, rule.landing_port, creds)
+    let nodes = repos::nodes::find_for_landing_server(conn, landing, rule.landing_port, creds)
         .map_err(|e| RelayError::Db(e.to_string()))?;
     for n in nodes {
         repos::nodes::set_relay(conn, &n.id, Some(rule.id))
@@ -553,7 +553,7 @@ pub async fn readopt_link(state: &AppState, rule_id: i64) -> Result<RelayRule, R
     let landing = repos::servers::get(&conn, rule.landing_server_id)
         .map_err(|e| RelayError::Db(e.to_string()))?
         .ok_or(RelayError::NotFound)?;
-    reroute_landing_nodes(&conn, &rule, &landing.host, &state.creds)?;
+    reroute_landing_nodes(&conn, &rule, &landing, &state.creds)?;
     repos::relay::get(&conn, rule_id)
         .map_err(|e| RelayError::Db(e.to_string()))?
         .ok_or(RelayError::NotFound)
@@ -680,20 +680,20 @@ pub fn resolve_forward_mode(existing: Option<&str>, requested: Option<&str>) -> 
 /// 这条链路该对落地机上的**哪些节点**动手（收敛、改指共用）。
 ///
 /// `same_port` 取该宿主的全部自建节点：改指走的是节点自己的端口号，而
-/// `find_for_landing` 按「落地端口」过滤——整机转发下落地端口只是其中一个节点，
+/// `find_for_landing_server` 按「落地端口」过滤——整机转发下落地端口只是其中一个节点，
 /// 用它会把另外几个协议漏掉（实测：112 的 4443/8443 没被改指，依旧直连打不通）。
 /// 宿主判定走 [`crate::domain::direct_addr`]，节点改指后 `addr` 已变成中转机，
 /// 只有 `params_json.direct.addr` 还留着落地机地址。
 pub fn landing_nodes_for_rule(
     conn: &Connection,
-    host: &str,
+    landing: &crate::domain::Server,
     rule: &RelayRule,
     creds: &crate::crypto::CredentialService,
 ) -> rusqlite::Result<Vec<crate::domain::Node>> {
     if rule.forward_mode == "same_port" {
-        repos::nodes::find_self_built_by_host(conn, host, creds)
+        repos::nodes::find_self_built_by_server(conn, landing, creds)
     } else {
-        repos::nodes::find_for_landing(conn, host, rule.landing_port, creds)
+        repos::nodes::find_for_landing_server(conn, landing, rule.landing_port, creds)
     }
 }
 
@@ -752,6 +752,11 @@ pub struct AttachOutcome {
     pub detail: String,
 }
 
+/// 只绑 UDP 的协议：Hysteria2 / TUIC。转发式中转只下发 TCP DNAT，承载不了它们。
+fn protocol_is_udp(protocol: &str) -> bool {
+    matches!(protocol, "hysteria2" | "tuic")
+}
+
 /// 部署写回后把刚落库的节点挂到该落地机可用的中转链路上（「节点后于建链部署」的补挂）。
 ///
 /// 为什么必须有这一步：建链只在**当时**把节点改指（`build.rs` 第 9 步），之后部署上来的
@@ -785,12 +790,33 @@ pub fn attach_deployed_nodes(
             route_for(r, &relay_host, *port).map(|t| (r, t))
         });
         match hit {
+            // 转发式中转只下发 TCP DNAT（`-p tcp`），UDP 协议挂上去只会一直超时。
+            // 历史误挂要顺手清掉：2053 这类端口号恰好与 TUIC 相同，曾把 tuic 挂到
+            // 一条只能过 TCP 的扩展链路上，摘要却写「已挂上」。
+            Some((r, _)) if protocol_is_udp(protocol) && r.client_mode == "forward" => {
+                let nodes = repos::nodes::find_for_landing_server(conn, landing, *port, creds)
+                    .map_err(|e| RelayError::Db(e.to_string()))?;
+                for n in nodes {
+                    if n.relay_rule_id == Some(r.id) {
+                        repos::nodes::set_relay(conn, &n.id, None)
+                            .map_err(|e| RelayError::Db(e.to_string()))?;
+                    }
+                }
+                out.push(AttachOutcome {
+                    node: node_name,
+                    attached: false,
+                    detail: format!(
+                        "{protocol} 是 UDP 协议，转发式中转只承载 TCP（链路 #{}），保持直连",
+                        r.id
+                    ),
+                });
+            }
             Some((r, (addr, target_port))) => {
-                let nodes = repos::nodes::find_for_landing(conn, &landing.host, *port, creds)
+                let nodes = repos::nodes::find_for_landing_server(conn, landing, *port, creds)
                     .map_err(|e| RelayError::Db(e.to_string()))?;
                 for n in nodes {
                     // 只落标记，不改地址（同 reroute_landing_nodes 的说明）：改写 addr
-                    // 会让 find_for_landing 下次部署找不到这个节点，转而新建一个重名节点。
+                    // 会让 find_for_landing_server 下次部署找不到这个节点，转而新建一个重名节点。
                     repos::nodes::set_relay(conn, &n.id, Some(r.id))
                         .map_err(|e| RelayError::Db(e.to_string()))?;
                 }

@@ -49,12 +49,15 @@ pub fn xray_install_cmd() -> String {
 /// 1. `sha256` 非空时按上游给的哈希校验**归档**（TLS 只保证「从哪来」，不保证
 ///    「内容是什么」）。`None` 时**不假装校验**，改为把实测哈希打出来，让版本漂移
 ///    至少看得见（调用方再把这一行记进部署进度）。
-/// 2. 解到**临时目录**再点名确认 `bin` 真的在里面——归档哈希对得上只说明拿到的是
-///    上游发布的那一份，不说明 `--strip-components=1` 解出来的布局与预期一致。
-///    布局一变，光看归档是看不出来的，表现是「安装成功」而服务起不来，报错落在几步
-///    之后的 systemd 上。本仓为这个布局已经栽过一次（无 strip-components 时 binary
-///    不在 /usr/local/bin）。
-/// 3. 只有前两步都过了才 `cp` 进 `/usr/local/bin`：失败时那里不会留下半装状态。
+/// 2. 整包解到**临时目录**，再按名字 `find` 出 `bin`——**不能假定归档只有一层目录**。
+///    2026-10-23 实测两种布局并存：shadowsocks-rust 的 tar.xz 是平铺的（`ssserver`
+///    等二进制直接在根），sing-box 的 tar.gz 带一层版本目录。对平铺归档用
+///    `--strip-components=1` 时 GNU tar 会把每个成员剥成空名并**静默跳过**（退出码
+///    仍是 0），解出空目录——表现正是「解包后没有 ssserver：归档布局与预期不符」。
+///    按名字找则不依赖布局；真找不到时报错仍然说人话，不会「装好了却起不来」。
+/// 3. 只有前两步都过了才把**二进制所在目录**整份 `cp` 进 `/usr/local/bin`：失败时
+///    那里不会留下半装状态。搬整个目录而不是单个文件，因为 sing-box 归档里还有
+///    运行时要按同目录查找的 `libcronet.so`。
 ///
 /// 顺带把装上的那个文件的实测 sha256 留在 stdout（调用方记进部署进度）——tor 那条链
 /// 的 exe 哈希是常量（版本写死），我们这里的版本是运行时才定的，钉不住预期值，
@@ -72,18 +75,22 @@ fn binary_install_cmd(
         None => format!("sha256sum {tmp}"),
     };
     let guard = format!(
-        "if ! test -x {dir}/{bin}; then echo '解包后没有 {bin}：归档布局与预期不符' >&2; exit 1; fi"
+        "if [ -z \"$binpath\" ] || [ ! -x \"$binpath\" ]; then \
+         echo '解包后没有 {bin}：归档布局与预期不符' >&2; exit 1; fi"
     );
     format!(
         "curl -fL -o {tmp} '{url}' && {verify} \
-         && rm -rf {dir} && mkdir -p {dir} && tar {tar_flag} {tmp} -C {dir} --strip-components=1 \
-         && {guard} && sha256sum {dir}/{bin} \
-         && cp -a {dir}/. /usr/local/bin/ && rm -rf {dir} {tmp}"
+         && rm -rf {dir} && mkdir -p {dir} && tar {tar_flag} {tmp} -C {dir} \
+         && binpath=$(find {dir} -type f -name '{bin}' | head -n 1) && {guard} \
+         && bindir=$(dirname \"$binpath\") && cp -a \"$bindir\"/. /usr/local/bin/ \
+         && sha256sum /usr/local/bin/{bin} \
+         && rm -rf {dir} {tmp}"
     )
 }
 
-/// shadowsocks-rust 安装命令。`tar -xJf` 的 `f` 紧跟归档名；无 `--strip-components`
-/// 时解出的是首层目录（binary 不在 /usr/local/bin，systemd 起不来）。
+/// shadowsocks-rust 安装命令。`tar -xJf` 的 `f` 紧跟归档名；归档是**平铺**的
+/// （`ssserver` 等二进制直接在根，2026-10-23 实测 v1.18.4 与 v1.25.0 都是），
+/// 不能加 `--strip-components`。
 pub fn ss_install_cmd(url: &str, sha256: Option<&str>) -> String {
     binary_install_cmd(
         url,
@@ -117,6 +124,23 @@ pub const SS_GH_API_BASE: &str = "https://api.github.com/repos/shadowsocks/shado
 /// 任何空闲端口全会误报「已被占用」（部署与建链的前置探测均受影响）。
 pub fn port_probe_cmd(port: u16) -> String {
     format!("ss -tln 'sport = :{port}' | grep -q '^LISTEN'")
+}
+
+/// UDP 端口监听探测。Hysteria2 / TUIC 是 UDP 协议，`ss -tln` 永远看不到它们的
+/// 套接字；`ss -uln` 里已绑定 UDP 套接字的状态列是 `UNCONN`。
+pub fn udp_port_probe_cmd(port: u16) -> String {
+    format!("ss -uln 'sport = :{port}' | grep -q '^UNCONN'")
+}
+
+/// 按协议选择监听探测：UDP 协议查 UDP 套接字，其余查 TCP。
+///
+/// 2026-10-23 实测：验证循环对 Hysteria2/TUIC 也发 `ss -tln`，端口永远「没监听」
+/// → 两个协议被判失败、节点不写回，用户看到的是「勾了 Hysteria2 却没部署上」。
+pub fn listen_probe_cmd(protocol: &str, port: u16) -> String {
+    match protocol {
+        "hysteria2" | "tuic" => udp_port_probe_cmd(port),
+        _ => port_probe_cmd(port),
+    }
 }
 
 /// 部署协议白名单。字符串标识同时作 nodes.protocol 与 params 来源。
@@ -391,9 +415,12 @@ pub fn parse_xray_inbounds(json: &str) -> std::collections::HashMap<u16, XrayInb
 /// 漂移的表现就是客户端 SYN 超时。2026-09-20 用「拿生成器输出反过来喂解析器」的用例
 /// 抓到的（见 deploy_tests::parse_ss_port_extracts_server_port）。
 pub fn parse_ss_port(json: &str) -> Option<u16> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()?
-        .pointer("/servers/0/server_port")?
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    // 新版是 servers[0]；旧版 shadowsocks-rust 配置是顶层 server/server_port。
+    // 只认新形状会让老机器重部署时读不到端口 → 拿正在跑的 ssserver 自己当「端口被占」
+    // → 端口漂移（实测 8388→8389），旧节点与中转规则一起失效。
+    v.pointer("/servers/0/server_port")
+        .or_else(|| v.get("server_port"))?
         .as_u64()
         .map(|p| p as u16)
 }
@@ -411,9 +438,11 @@ pub fn public_key_of(params_json: &str) -> Option<String> {
 /// 解析 shadowsocks-rust 服务端配置里的密码（重部署复用凭据用）；缺失/损坏 → None。
 /// 形状见 [`ss_config_json`]：servers[0].password。
 pub fn parse_ss_password(json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()?
-        .pointer("/servers/0/password")?
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    // 同 parse_ss_port：兼容旧版顶层形状；读不到密码会重新生成，客户端旧参数
+    // 立刻变砖（服务端新密码 + 客户端旧密码）。
+    v.pointer("/servers/0/password")
+        .or_else(|| v.get("password"))?
         .as_str()
         .map(|s| s.to_string())
 }
@@ -697,12 +726,22 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily
 
 /// SS 服务端配置（2022-blake3-aes-256-gcm）。
 ///
+/// `inbound_listen` 与 sing-box 同理：shadowsocks-rust 的 `server: "0.0.0.0"`
+/// **也是纯 IPv4**（2026-10-23 香港实测 `ss -tln` 只有 `0.0.0.0:8388`，客户端连
+/// `[v6]:8388` 直接 503）；入口是 IPv6 时必须写 `::`。Xray 的 `0.0.0.0` 是双栈，
+/// 所以这个坑只在 ss / h2 / tuic 上出现。
+///
 /// 出口族只能**尽力而为**：`ipv6_first` 仅把 IPv6 排在 DNS 结果的 IPv4 前面，
 /// DNS 没有 AAAA 时仍会回落 IPv4；shadowsocks-rust 没有「只允许某族」的开关。
-pub fn ss_config_json(port: u16, password_b64: &str, egress: EgressFamily) -> String {
+pub fn ss_config_json(
+    port: u16,
+    password_b64: &str,
+    egress: EgressFamily,
+    inbound_listen: &str,
+) -> String {
     serde_json::json!({
         "servers": [{
-            "server": "0.0.0.0", "server_port": port,
+            "server": inbound_listen, "server_port": port,
             "method": "2022-blake3-aes-256-gcm", "password": password_b64, "mode": "tcp_and_udp"
         }],
         "locals": [],
@@ -754,16 +793,22 @@ pub fn singbox_cert_cmd() -> String {
 /// 注意：sing-box 两个入站**强制要求显式 tls 块**（无 certificate 直接 FATAL
 /// “TLS required”，实测 h2/tuic 部署失败 exit=3）。部署器先幂等生成自签证书
 /// （/etc/sing-box/self.crt/key），客户端 skip-cert-verify 跳过校验。
+///
+/// `inbound_listen` 必须跟着**客户端实际使用的地址族**走：sing-box 的
+/// `0.0.0.0` 是纯 IPv4（实测 `ss -uln` 显示 `0.0.0.0:2097`），而香港这类机器
+/// 登记的是 IPv6 地址，客户端把 UDP 发到 `[v6]:2097` 永远到不了；Xray 的
+/// `0.0.0.0` 实际是双栈（`ss -tln` 显示 `*:443`），所以只有 h2/tuic 会坏。
 pub fn singbox_config_json(
     hy2: Option<(u16, &str)>,
     tuic: Option<(u16, &str, &str)>,
     egress: EgressFamily,
     version: Option<(u32, u32)>,
+    inbound_listen: &str,
 ) -> String {
     let mut inbounds = Vec::new();
     if let Some((port, pw)) = hy2 {
         inbounds.push(serde_json::json!({
-            "type": "hysteria2", "listen": "0.0.0.0", "listen_port": port,
+            "type": "hysteria2", "listen": inbound_listen, "listen_port": port,
             "tls": {
                 "enabled": true,
                 "certificate_path": "/etc/sing-box/self.crt",
@@ -774,11 +819,16 @@ pub fn singbox_config_json(
     }
     if let Some((port, uuid, pw)) = tuic {
         inbounds.push(serde_json::json!({
-            "type": "tuic", "listen": "0.0.0.0", "listen_port": port,
+            "type": "tuic", "listen": inbound_listen, "listen_port": port,
             "tls": {
                 "enabled": true,
                 "certificate_path": "/etc/sing-box/self.crt",
-                "key_path": "/etc/sing-box/self.key"
+                "key_path": "/etc/sing-box/self.key",
+                // 必须显式声明 h3：不写时 sing-box 的 TLS 服务端不选择 ALPN，
+                // mihomo 客户端直接失败 `CRYPTO_ERROR ... server did not select
+                // an ALPN protocol`（2026-10-23 真机：服务端在跑、UDP 也到了，
+                // 客户端仍 503；补上该行后 gstatic 204，约 0.4s）。
+                "alpn": ["h3"]
             },
             "users": [{ "uuid": uuid, "password": pw }]
         }));

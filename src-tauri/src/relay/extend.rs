@@ -338,7 +338,7 @@ pub async fn extend_taken_link(
                 }
             };
         let attached =
-            repos::nodes::find_for_landing(&conn, &landing.host, landing_port, &state.creds)
+            repos::nodes::find_for_landing_server(&conn, &landing, landing_port, &state.creds)
                 .map_err(|e| RelayError::Db(e.to_string()))?;
         for n in attached {
             repos::nodes::set_relay(&conn, &n.id, Some(id))
