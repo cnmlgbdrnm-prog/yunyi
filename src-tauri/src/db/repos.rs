@@ -398,6 +398,12 @@ pub mod nodes {
 
     /// 「仅换伪装域名」的 sni 回写：该服务器名下的 vless/trojan 节点（params_json
     /// 含字符串 sni 字段 = REALITY）统一替换为 dest；返回改写条数。读写同样加密口径。
+    ///
+    /// **上游出口节点（upstreams.node_id 指向的）必须排除**：它们走独立的
+    /// xray-upstream 实例，伪装域名是每条出口自己的 `upstreams.reality_dest`。
+    /// 一并改写会让客户端 SNI 与上游入站的 serverNames 不一致 → REALITY 握手失败，
+    /// 表现是所有广播/住宅出口节点 503，而主入站协议一切正常（2026-10-23 实测：
+    /// 换主入站伪装域名为 nvidia 后，六个上游节点全被写成 nvidia）。
     pub fn update_reality_sni(
         conn: &Connection,
         host: &str,
@@ -405,7 +411,8 @@ pub mod nodes {
         creds: &crate::crypto::CredentialService,
     ) -> rusqlite::Result<usize> {
         let mut stmt = conn.prepare(
-            "SELECT id, params_json FROM nodes WHERE addr=?1 AND protocol IN ('vless','trojan')",
+            "SELECT id, params_json FROM nodes WHERE addr=?1 AND protocol IN ('vless','trojan') \
+             AND id NOT IN (SELECT node_id FROM upstreams WHERE node_id IS NOT NULL)",
         )?;
         let rows: Vec<(String, String)> = stmt
             .query_map(params![host], |r| Ok((r.get(0)?, r.get(1)?)))?

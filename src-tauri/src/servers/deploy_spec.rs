@@ -143,6 +143,71 @@ pub fn listen_probe_cmd(protocol: &str, port: u16) -> String {
     }
 }
 
+/// 持久放行已部署协议的入站端口。
+///
+/// 为什么不能只靠运行时规则：2026-10-23 ashura 重启后，UFW 的持久规则里没有
+/// 8443/2053/2083/2096/8002/8989（这些端口此前只由运行时 iptables 放行），
+/// 默认 DROP 立即把它们挡掉——节点行还在、界面上一切正常，客户端全部 0ms。
+/// 部署成功意味着「客户端应该能连上」，端口放行就不能依赖任何开机后才补的规则。
+///
+/// 优先级：
+/// 1. `ufw allow`（规则写入 /etc/ufw，同时维护 IPv4/IPv6，重启后仍生效）；
+/// 2. 没有 ufw 时退回 `iptables` + `ip6tables`（幂等 `-C || -I`）；若装了
+///    `netfilter-persistent` 再落盘，否则只能是运行时规则。
+///
+/// 套接字类型随协议：`ss` 的配置是 `tcp_and_udp`，Hysteria2/TUIC 只绑 UDP，
+/// vless/vmess/trojan 只用 TCP。
+pub fn firewall_allow_cmd(protocols: &[(&str, u16)]) -> String {
+    let mut rules: Vec<(u16, &'static str)> = Vec::new();
+    for (protocol, port) in protocols {
+        let sockets: &[&'static str] = match *protocol {
+            "hysteria2" | "tuic" => &["udp"],
+            "ss" => &["tcp", "udp"],
+            _ => &["tcp"],
+        };
+        for socket in sockets {
+            if !rules.contains(&(*port, *socket)) {
+                rules.push((*port, *socket));
+            }
+        }
+    }
+    if rules.is_empty() {
+        // 空 if 分支在 shell 里是语法错误（`then` 后直接 `elif`）。
+        return String::new();
+    }
+    rules.sort_unstable();
+
+    let mut ufw = String::new();
+    let mut iptables = String::new();
+    let mut ip6tables = String::new();
+    for (port, socket) in &rules {
+        ufw.push_str(&format!(
+            "ufw allow {port}/{socket} >/dev/null 2>&1 || exit 1\n"
+        ));
+        // 幂等：先 -C 查，缺了再 -I 1 插到最前（与 channels.rs 的放行写法一致）。
+        iptables.push_str(&format!(
+            "( iptables -C INPUT -p {socket} --dport {port} -j ACCEPT 2>/dev/null \
+             || iptables -I INPUT 1 -p {socket} --dport {port} -j ACCEPT ) || exit 1\n"
+        ));
+        ip6tables.push_str(&format!(
+            "( ip6tables -C INPUT -p {socket} --dport {port} -j ACCEPT 2>/dev/null \
+             || ip6tables -I INPUT 1 -p {socket} --dport {port} -j ACCEPT ) || exit 1\n"
+        ));
+    }
+    format!(
+        "if command -v ufw >/dev/null 2>&1; then\n\
+         {ufw}\
+         elif command -v iptables >/dev/null 2>&1; then\n\
+         {iptables}\
+         if command -v ip6tables >/dev/null 2>&1; then\n\
+         {ip6tables}\
+         fi\n\
+         if command -v netfilter-persistent >/dev/null 2>&1; then \
+         netfilter-persistent save >/dev/null 2>&1 || true; fi\n\
+         fi"
+    )
+}
+
 /// 部署协议白名单。字符串标识同时作 nodes.protocol 与 params 来源。
 pub const PROTOCOLS: [&str; 6] = ["vless", "trojan", "vmess", "ss", "hysteria2", "tuic"];
 
@@ -870,4 +935,63 @@ pub fn singbox_config_json(
 /// sing-box 的 systemd unit（工具自写）。
 pub fn singbox_systemd_unit() -> String {
     "[Unit]\nDescription=sing-box server\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n".to_string()
+}
+
+#[cfg(test)]
+mod firewall_tests {
+    use super::*;
+
+    /// 部署成功的判据必须包括「端口已持久放行」：运行时 iptables 规则活不过重启
+    /// （2026-10-23 ashura 重启后广播 IP 节点端口全被 UFW 默认策略挡掉）。
+    #[test]
+    fn firewall_allow_cmd_uses_persistent_ufw_first() {
+        let cmd = firewall_allow_cmd(&[("vless", 443), ("vmess", 8443)]);
+        assert!(cmd.contains("command -v ufw"), "必须优先探测 ufw：{cmd}");
+        assert!(cmd.contains("ufw allow 443/tcp"), "缺少 443/tcp 放行：{cmd}");
+        assert!(cmd.contains("ufw allow 8443/tcp"), "缺少 8443/tcp 放行：{cmd}");
+        let ufw_at = cmd.find("ufw allow 443/tcp").unwrap();
+        let fallback_at = cmd.find("iptables -C INPUT").unwrap();
+        assert!(ufw_at < fallback_at, "ufw 分支必须排在 iptables 回退之前：{cmd}");
+    }
+
+    /// 套接字类型随协议：ss 是 tcp_and_udp，Hysteria2/TUIC 只绑 UDP，其余 TCP。
+    #[test]
+    fn firewall_allow_cmd_maps_protocol_sockets() {
+        let cmd = firewall_allow_cmd(&[
+            ("ss", 8388),
+            ("hysteria2", 2097),
+            ("tuic", 2053),
+            ("trojan", 4443),
+        ]);
+        assert!(cmd.contains("ufw allow 8388/tcp"));
+        assert!(cmd.contains("ufw allow 8388/udp"));
+        assert!(cmd.contains("ufw allow 2097/udp"));
+        assert!(!cmd.contains("ufw allow 2097/tcp"));
+        assert!(cmd.contains("ufw allow 2053/udp"));
+        assert!(!cmd.contains("ufw allow 2053/tcp"));
+        assert!(cmd.contains("ufw allow 4443/tcp"));
+    }
+
+    /// 无 ufw 时退回 iptables，且 IPv6 入口也必须放行（节点地址可能是 v6）。
+    #[test]
+    fn firewall_allow_cmd_falls_back_to_iptables_and_ipv6() {
+        let cmd = firewall_allow_cmd(&[("vless", 443)]);
+        assert!(cmd.contains("iptables -C INPUT -p tcp --dport 443 -j ACCEPT"));
+        assert!(cmd.contains("iptables -I INPUT 1 -p tcp --dport 443 -j ACCEPT"));
+        assert!(cmd.contains("ip6tables -C INPUT -p tcp --dport 443 -j ACCEPT"));
+        assert!(cmd.contains("netfilter-persistent save"));
+    }
+
+    /// 同一端口被多个协议选中时只写一次（vless/vmess 共用端口是允许的）。
+    #[test]
+    fn firewall_allow_cmd_dedups_same_port_socket() {
+        let cmd = firewall_allow_cmd(&[("vless", 443), ("vless", 443), ("vmess", 443)]);
+        assert_eq!(cmd.matches("ufw allow 443/tcp").count(), 1);
+    }
+
+    /// 空协议列表不能生成语法残缺的 shell（if 分支为空会让整条命令失败）。
+    #[test]
+    fn firewall_allow_cmd_is_noop_for_empty_ports() {
+        assert!(firewall_allow_cmd(&[]).trim().is_empty());
+    }
 }

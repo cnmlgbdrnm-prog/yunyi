@@ -553,26 +553,27 @@ pub async fn run_upstream_job(
             // 手工加上这条 iptables 规则后立刻连通）。幂等，已放行则不动。
             check_cancel()?;
             emit("放行", "放行监听端口", 75);
-            let opens: Vec<String> = rows
+            // 与协议部署同一条持久化放行命令（ufw 优先、netfilter-persistent 保存）：
+            // `ensure_open_cmd` 只写运行时 iptables，重启后规则全丢——2026-10-23
+            // ashura 重启后主入站（部署时已改持久化）全通、六个上游出口节点全超时，
+            // 正是这条差异造成的。
+            let ports: Vec<(&str, u16)> = rows
                 .iter()
-                .map(|u| crate::servers::channels::ensure_open_cmd(u.listen_port))
+                .filter_map(|u| u16::try_from(u.listen_port).ok())
+                .map(|port| ("vless", port))
                 .collect();
-            if let Err(e) = run_cmd_ok(
-                &mut sess,
-                cancel,
-                "放行",
-                &opens.join(" && "),
-                CONFIG_TIMEOUT,
-            )
-            .await
-            {
-                // 这里不判失败：可能没装 iptables，也可能本就由别处（云侧镜像/ufw）放行。
-                // 真正的判据是最后那次「从本机连它」——那才是客户端要走的路径。
-                emit(
-                    "放行",
-                    &format!("放行命令未成功（{e}），继续，稍后用可达性核验判定"),
-                    76,
-                );
+            let allow_cmd = crate::servers::deploy_spec::firewall_allow_cmd(&ports);
+            if !allow_cmd.is_empty() {
+                if let Err(e) = run_cmd_ok(&mut sess, cancel, "放行", &allow_cmd, CONFIG_TIMEOUT).await
+                {
+                    // 这里不判失败：可能没装 iptables，也可能本就由别处（云侧镜像/ufw）放行。
+                    // 真正的判据是最后那次「从本机连它」——那才是客户端要走的路径。
+                    emit(
+                        "放行",
+                        &format!("放行命令未成功（{e}），继续，稍后用可达性核验判定"),
+                        76,
+                    );
+                }
             }
             check_cancel()?;
             emit("启动", "启动专用实例", 80);

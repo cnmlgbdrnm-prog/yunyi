@@ -11,7 +11,7 @@ use crate::jobs::{DeployRequest, EmitFn, JobRequest, JobRunner};
 use crate::servers::{load_auth_parts, CONNECT_TIMEOUT, PROBE_TIMEOUT};
 use crate::ssh::SshSession;
 use crate::state::AppState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -88,6 +88,89 @@ pub fn deployed_protocol_details(
     // 同一协议只保留端口最小的那条（重复部署会清旧行，这里只是防御历史脏数据）。
     details.dedup_by(|a, b| a.protocol == b.protocol);
     Ok(details)
+}
+
+/// 持久放行的端口清单 `(协议, 端口)`：部署管理的节点端口 + 上游出口监听端口。
+///
+/// 防火墙放行要覆盖的不只是「本次勾选的协议」：同一台机器上还可能有此前部署的
+/// 多个入站（例如 ashura 的德国/新加坡/日本/洛杉矶/纽约/亚利桑那广播节点），
+/// 它们同样需要持久放行。
+///
+/// 上游出口（`upstreams.listen_port`）由独立的 xray-upstream 实例监听，重启后
+/// iptables 规则同样会丢——所以即使它们不属于「部署管理」（见
+/// [`deployed_protocol_details`] 的排除口径），端口也必须并进同一份放行清单。
+/// 否则表现是主入站全通、所有广播/住宅出口节点超时（2026-10-23 ashura 重启后实测）。
+///
+/// 同一 `(协议, 端口)` 只返回一次。
+pub fn firewall_ports(
+    nodes: &[crate::domain::Node],
+    upstreams: &[crate::domain::Upstream],
+    server: &crate::domain::Server,
+) -> Vec<(String, u16)> {
+    let upstream_ids: HashSet<&str> = upstreams
+        .iter()
+        .filter_map(|u| u.node_id.as_deref())
+        .collect();
+    let mut out: Vec<(String, u16)> = Vec::new();
+    let mut push = |protocol: &str, port: i64| {
+        let Ok(port) = u16::try_from(port) else {
+            return;
+        };
+        if !out.iter().any(|(p, q)| p == protocol && *q == port) {
+            out.push((protocol.to_string(), port));
+        }
+    };
+    // 上游出口节点在 xray-upstream 里一律是 vless/REALITY 入站（出站才是住宅协议）。
+    for u in upstreams {
+        push("vless", u.listen_port);
+    }
+    for n in nodes {
+        if n.source != "self-built"
+            || !is_supported_protocol(&n.protocol)
+            || upstream_ids.contains(n.id.as_str())
+            || !crate::domain::server_owns_addr(server, &crate::domain::direct_addr(n))
+        {
+            continue;
+        }
+        push(&n.protocol, n.port);
+    }
+    out
+}
+
+/// 部署「复用既有入站」时可选的节点（按协议索引，每协议一条）。
+///
+/// **必须排除上游出口节点**：同一个协议名（vless）在两类节点上重名，而上游节点
+/// 的 sni/公钥属于各自的 xray-upstream 入口。混进来会让主入站复用错公钥或拿错
+/// 伪装域名——重复 key 时旧代码的 `collect::<HashMap>` 由哈希顺序决定谁留下，
+/// 表现为时好时坏、极难复现。这里统一用「先到先得」且显式排除，行为确定。
+pub fn deploy_managed_nodes(
+    nodes: Vec<crate::domain::Node>,
+    server: &crate::domain::Server,
+    upstream_node_ids: &HashSet<String>,
+) -> HashMap<String, crate::domain::Node> {
+    let mut out = HashMap::new();
+    for n in nodes {
+        if n.source != "self-built"
+            || upstream_node_ids.contains(&n.id)
+            || !crate::domain::server_owns_addr(server, &crate::domain::direct_addr(&n))
+        {
+            continue;
+        }
+        out.entry(n.protocol.clone()).or_insert(n);
+    }
+    out
+}
+
+/// 从库里收集 [`firewall_ports`] 的输入（读库失败按空表处理：放行是增益，
+/// 不能因为读不到节点就让整次部署失败）。
+fn deployed_node_ports(
+    state: &Arc<AppState>,
+    server: &crate::domain::Server,
+) -> Vec<(String, u16)> {
+    let conn = state.db.lock();
+    let upstreams = repos::upstreams::list_by_server(&conn, server.id).unwrap_or_default();
+    let nodes = repos::nodes::list(&conn, &state.creds).unwrap_or_default();
+    firewall_ports(&nodes, &upstreams, server)
 }
 
 /// 端口占用检查：true=端口已被监听（占用），false=空闲可部署。
@@ -716,7 +799,7 @@ pub(crate) async fn run_cmd_ok(
 
 impl ProdRunner {
     /// 部署主线。步骤：探测(5→20)→安装(30→45)→配置(55)→启动(80)→优化(88→90，仅勾选 BBR)
-    /// →写回(95→100)。进度单调递增；全协议验证失败在「优化」之前中止，不发 95/100。
+    /// →放行(92)→写回(95→100)。进度单调递增；全协议验证失败在「优化」之前中止，不发 95/100。
     /// 多协议：一次会话内按选中协议并行完成安装/配置/启动/验证；
     /// 单协议失败仅标记 failed_protocols，其余协议继续验证与写回（失败隔离）。
     async fn run_deploy(
@@ -937,16 +1020,15 @@ impl ProdRunner {
         // 本机库里已有的节点（按协议索引）：复用入站时要拿它补 reality 公钥——公钥只在
         // 客户端这一侧（服务器配置只存私钥）。读库失败按空表处理：复用是增益，读不回来
         // 就退化成新生成，不能让一次部署因为「读不到旧节点」而失败。
-        let existing_nodes: std::collections::HashMap<String, crate::domain::Node> = {
+        let existing_nodes: HashMap<String, Node> = {
             let conn = state.db.lock();
-            repos::nodes::list(&conn, &state.creds)
+            let nodes = repos::nodes::list(&conn, &state.creds).unwrap_or_default();
+            let upstream_ids: HashSet<String> = repos::upstreams::list_by_server(&conn, server.id)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|n| {
-                    n.source == "self-built" && crate::domain::server_owns_addr(&server, &n.addr)
-                })
-                .map(|n| (n.protocol.clone(), n))
-                .collect()
+                .filter_map(|u| u.node_id)
+                .collect();
+            deploy_managed_nodes(nodes, &server, &upstream_ids)
         };
         // 每协议记录 (protocol, port, params_json) 供写回；失败收集 failed_protocols
         let mut success_protocols: Vec<(String, u16, String)> = vec![];
@@ -1370,6 +1452,36 @@ impl ProdRunner {
 
         // 步骤边界：BBR 段可能刚跑了几十秒，这期间用户点的取消必须在这里被看见（#14）。
         // 写回是「应用认为这次部署成立」的那一刻，取消要在它之前生效。
+        check_cancel(cancel)?;
+
+        // 4.6 放行：把本次验证通过的端口写进**持久**防火墙规则。
+        //
+        // 必须在写回之前：写回之后界面就把它当成可用节点，而端口没放行时用户看到
+        // 的是「节点在、测速 0ms」，只能人工上服务器查防火墙。2026-10-23 ashura
+        // 重启后，8443/2053/2083/2096/8002/8989 只因运行时 iptables 规则放行过，
+        // UFW 的持久规则里没有 → 默认 DROP 全挡，正是这个缺口。
+        // 放行失败直接让部署失败：留下一个连不上的节点比失败更糟。
+        emit_progress("放行", "持久放行节点端口", 92);
+        // 本次验证通过的端口 + 这台机器上已部署的其它节点端口（广播 IP 多入站），
+        // 一次全写进去；firewall_allow_cmd 内部去重。
+        let existing_ports = deployed_node_ports(state, &server);
+        let mut allow_ports: Vec<(&str, u16)> = ok_protocols
+            .iter()
+            .map(|(protocol, port, _)| (protocol.as_str(), *port))
+            .collect();
+        allow_ports.extend(
+            existing_ports
+                .iter()
+                .map(|(protocol, port)| (protocol.as_str(), *port)),
+        );
+        run_cmd_ok(
+            &mut sess,
+            cancel,
+            "放行",
+            &firewall_allow_cmd(&allow_ports),
+            VERIFY_TIMEOUT,
+        )
+        .await?;
         check_cancel(cancel)?;
 
         // 5 写回：仅写成功协议节点(含端口验证通过);failed 在成功节点写回后随 error 上报
