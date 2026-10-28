@@ -131,7 +131,7 @@ pub fn smart_rules() -> Vec<String> {
 /// 客户端专属的「钉死走代理」域名，**排在智能分流之前**（只在客户端配置里用，
 /// 导出给别人用的 YAML 不加——那是别人的策略）。
 ///
-/// Grok 的网页与 WebSocket 都应遵循用户选择的出口，不能被后面的国内直连规则抢走。
+/// Grok 与 Gemini 的网页、登录和 API 都应遵循用户选择的出口，不能被国内直连规则抢走。
 /// 规则匹配以识别到域名为前提：普通模式由 HTTP CONNECT 传递域名，TUN 模式可由
 /// fake-ip 恢复域名。仅传真实 IP 的 SOCKS4 请求未必能命中这里。
 ///
@@ -141,11 +141,25 @@ pub fn smart_rules() -> Vec<String> {
 /// 历史观测中的 400 不能证明中转出口必然被封：2026-09-19 同一路径未登录握手得到 401。
 /// 实际会话是否可用需结合当次请求和响应判断，不能用节点类型代替诊断。
 pub fn pinned_proxy_rules(target: &str) -> Vec<String> {
-    vec![
+    let mut rules = vec![
         format!("DOMAIN-SUFFIX,x.ai,{target}"),
         format!("DOMAIN-SUFFIX,grok.com,{target}"),
-    ]
+    ];
+    rules.extend(
+        GOOGLE_PROXY_DOMAINS
+            .iter()
+            .map(|domain| format!("DOMAIN-SUFFIX,{domain},{target}")),
+    );
+    rules
 }
+
+/// Gemini 页面、登录、clients6 对话接口及资源域名；DNS 和路由必须覆盖同一集合。
+const GOOGLE_PROXY_DOMAINS: &[&str] = &[
+    "google.com",
+    "googleapis.com",
+    "googleusercontent.com",
+    "gstatic.com",
+];
 
 /// 生成合并后的订阅 YAML；节点顺序按名称排序保证输出确定性。
 /// ssr 节点（mihomo 已移除 SSR 支持）在映射前跳过并计数，不静默映射为 ss；
@@ -366,7 +380,7 @@ pub fn tun_block(enabled: bool) -> Vec<(&'static str, Value)> {
 /// 文件缺失会让 mihomo 启动期联网下载（卡住启动 5s+）。
 pub fn dns_block(has_nodes: bool) -> (&'static str, Value) {
     let via = if has_nodes { "#手动选择" } else { "" };
-    let dns: Value = serde_yaml::from_str(&format!(
+    let mut dns: Value = serde_yaml::from_str(&format!(
         "enable: true\n\
          enhanced-mode: fake-ip\n\
          fake-ip-range: 198.18.0.1/16\n\
@@ -375,6 +389,17 @@ pub fn dns_block(has_nodes: bool) -> (&'static str, Value) {
          fallback-filter:\n  geoip: true\n  geoip-code: CN\n"
     ))
     .expect("dns 块字面量恒合法");
+    if has_nodes {
+        // fallback 只决定采用哪个答案，不能撤回已发给国内解析器的查询。
+        // 实测 Gemini 域名会先发送给两个国内 DoH；policy 才能绕过这一步。
+        let mut policy = Mapping::new();
+        for domain in GOOGLE_PROXY_DOMAINS {
+            policy.insert(s(&format!("+.{domain}")), dns["fallback"].clone());
+        }
+        dns["nameserver-policy"] = Value::Mapping(policy);
+        // 仅解析代理服务器本身，避免节点使用域名时，解析节点又依赖该节点。
+        dns["proxy-server-nameserver"] = dns["nameserver"].clone();
+    }
     ("dns", dns)
 }
 
@@ -970,6 +995,15 @@ fn hysteria2_mapping(n: &Node, name: &str, params: &serde_json::Value) -> Mappin
         let v = str_param(params, key);
         if !v.is_empty() {
             m.insert(s(key), s(&v));
+        }
+    }
+    // Salamander 混淆：服务端开了 obfs 而客户端不带这两个字段时，握手直接失败。
+    let obfs = str_param(params, "obfs");
+    if !obfs.is_empty() {
+        m.insert(s("obfs"), s(&obfs));
+        let obfs_pw = str_param(params, "obfs-password");
+        if !obfs_pw.is_empty() {
+            m.insert(s("obfs-password"), s(&obfs_pw));
         }
     }
     if skip_cert_verify_true(params) {

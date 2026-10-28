@@ -19,9 +19,7 @@ use crate::share::clone::{clone_configs, ShareNodeSpec, ShareSource};
 use crate::share::model::*;
 use crate::share::naming::*;
 use crate::share::plan;
-use crate::share::plan::{
-    reserved_share_ports_cmd, tcp_port_probe_cmd, udp_port_probe_cmd,
-};
+use crate::share::plan::{reserved_share_ports_cmd, tcp_port_probe_cmd, udp_port_probe_cmd};
 use crate::share::{scripts, tls};
 use crate::ssh::SshSession;
 use crate::state::AppState;
@@ -47,6 +45,9 @@ pub async fn create_share(
     validate_options(&input.options)?;
     if input.node_ids.is_empty() {
         return Err("至少选择一个节点".into());
+    }
+    if let Some(cdn) = super::cdn::load(state, input.server_id)? {
+        return create_share_inner_with_domain(state, input, Some(&cdn.domain)).await;
     }
     let tls = tls::tls_status(state, input.server_id).await?;
     if !tls.ready {
@@ -101,21 +102,38 @@ async fn create_share_inner_with_domain(
         return Err("Shadowsocks 分享一次只允许一个节点".into());
     }
 
+    let mut cdn = super::cdn::load(state, input.server_id)?;
+    if cdn.is_some() {
+        super::cdn::validate_nodes(&chosen)?;
+    }
+
     // 上游出口的入站不在主 Xray 配置里，而在专用的 `xray-upstream` 实例。
     // 先按 node_id 认出哪些选中节点来自上游，克隆时才选对配置来源。
-    let upstream_node_ids: HashSet<String> = {
+    // 复用主入口的出口（entry_proto 非空）单独标出：它的入站在主配置里，
+    // 但克隆需要改写用户路由，当前明确拒绝分享。
+    let (upstream_node_ids, reused_upstream_node_ids): (HashSet<String>, HashSet<String>) = {
         let conn = state.db.lock();
-        crate::db::repos::upstreams::list_by_server(&conn, input.server_id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|u| u.node_id)
-            .collect()
+        let rows = crate::db::repos::upstreams::list_by_server(&conn, input.server_id)
+            .map_err(|e| e.to_string())?;
+        let ids = rows.iter().filter_map(|u| u.node_id.clone()).collect();
+        let reused = rows
+            .iter()
+            .filter(|u| !u.entry_proto.is_empty())
+            .filter_map(|u| u.node_id.clone())
+            .collect();
+        (ids, reused)
     };
 
     // 2. 读服务器/凭据并建立 SSH 会话。
     let (auth, server) =
         crate::servers::load_auth(state, input.server_id).map_err(|e| e.to_string())?;
-    let domain = match resolved_domain.map(str::trim).filter(|d| !d.is_empty()) {
+    let domain = match cdn
+        .as_ref()
+        .map(|c| c.domain.as_str())
+        .or(resolved_domain)
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
         Some(d) => crate::servers::normalize_share_domain(d)?,
         None => crate::servers::normalize_share_domain(&server.share_domain)?,
     };
@@ -154,27 +172,38 @@ async fn create_share_inner_with_domain(
             _ => "tcp",
         })
         .collect();
-    let allocated = allocate_share_ports(&mut sess, &cancel, &transports).await?;
-    let specs = build_specs(&chosen, &allocated.pairs, &upstream_node_ids)?;
+    let mut allocated = allocate_share_ports(&mut sess, &cancel, &transports).await?;
+    if let Some(c) = cdn.as_mut() {
+        run_cmd_ok(
+            &mut sess,
+            &cancel,
+            "CDN 证书校验",
+            &super::cdn::certificate_check(&c.domain),
+            PROBE_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("CDN 域名需已有有效源站证书：{e}"))?;
+        c.port = allocate_cdn_port(&mut sess, &cancel, c.port).await?;
+        allocated.http = c.port;
+    }
+    let specs = build_specs(
+        &chosen,
+        &allocated.pairs,
+        &upstream_node_ids,
+        &reused_upstream_node_ids,
+    )?;
 
     // 4. 读配置。需要哪个协议/来源才读哪个；文件缺失即报错，不静默跳过。
     let id = new_id();
     let token = new_token();
     let main_xray = read_main(&mut sess, &cancel, &specs, "vless", XRAY_CONFIG_PATH).await?;
-    let main_sb = read_main(
-        &mut sess,
-        &cancel,
-        &specs,
-        "hysteria2",
-        SINGBOX_CONFIG_PATH,
-    )
-    .await?;
+    let main_sb = read_main(&mut sess, &cancel, &specs, "hysteria2", SINGBOX_CONFIG_PATH).await?;
     let main_ss = read_main(&mut sess, &cancel, &specs, "ss", SS_CONFIG_PATH).await?;
     let upstream_xray =
         read_main(&mut sess, &cancel, &specs, "upstream", UPSTREAM_CONFIG_PATH).await?;
 
     // 5. 克隆：只改端口、监听地址与凭据，其余流设置/出站原样保留。
-    let cloned = clone_configs(
+    let mut cloned = clone_configs(
         main_xray.as_deref(),
         upstream_xray.as_deref(),
         main_sb.as_deref(),
@@ -183,6 +212,15 @@ async fn create_share_inner_with_domain(
         effective_host(&server),
         &id,
         &[],
+    )?;
+
+    if let Some(c) = &cdn {
+        super::cdn::apply(&mut cloned, c)?;
+    }
+    super::bandwidth::sync_cloned(
+        &mut cloned,
+        input.options.rate_up_mbps,
+        input.options.rate_down_mbps,
     )?;
 
     // 6. 清单/网关配置。到期时间用**服务器时钟**——客户端时钟不可信。
@@ -207,24 +245,24 @@ async fn create_share_inner_with_domain(
         })
         .collect();
     let manifest = ShareManifest {
+        quota_total_bytes: Some(input.options.quota_total_bytes),
         version: 1,
         id: id.clone(),
         token: token.clone(),
         server_id: server.id,
         created_at: chrono::Utc::now().to_rfc3339(),
-        // 旧字段写成上下行之和，便于降级展示；判停以 quota_up/down 为准。
-        quota_bytes: input
-            .options
-            .quota_up_bytes
-            .saturating_add(input.options.quota_down_bytes),
-        quota_up_bytes: Some(input.options.quota_up_bytes),
-        quota_down_bytes: Some(input.options.quota_down_bytes),
+        // 只按公网双向总额度判停（由 meter 执行）。旧的方向配额字段照写
+        // `Some(0)`：网关继续累计上行/下行用量供展示，但 0 = 不限，不再单独停用。
+        quota_bytes: 0,
+        quota_up_bytes: Some(0),
+        quota_down_bytes: Some(0),
         rate_up_mbps: input.options.rate_up_mbps,
         rate_down_mbps: input.options.rate_down_mbps,
         expires_at_unix,
         http_port: allocated.http,
         domain: domain.clone(),
         nodes: share_nodes,
+        cdn,
     };
     let gateway = GatewayConfig {
         quota_bytes: manifest.quota_bytes,
@@ -325,6 +363,12 @@ async fn create_share_inner_with_domain(
             CONFIG_TIMEOUT,
         )
         .await?;
+
+        if let Some(c) = &manifest.cdn {
+            run_cmd_ok(&mut sess, &cancel, "CDN 证书部署", &super::cdn::certificate_install(&c.domain, &dir), CONFIG_TIMEOUT).await?;
+            write_remote_file(&mut sess, &cancel, "CDN 续期钩子", "/etc/letsencrypt/renewal-hooks/deploy/vpnshare-cdn", super::cdn::RENEW_HOOK, CONFIG_TIMEOUT).await?;
+            run_cmd_ok(&mut sess, &cancel, "CDN 续期钩子", "chmod 755 /etc/letsencrypt/renewal-hooks/deploy/vpnshare-cdn", CONFIG_TIMEOUT).await?;
+        }
 
         write_remote_file(
             &mut sess,
@@ -433,7 +477,7 @@ async fn create_share_inner_with_domain(
             &cancel,
             "写入",
             &unit_path(&unit_name(&id)),
-            &share_units.http,
+            &super::cdn::http_unit(share_units.http.clone(), &manifest),
             CONFIG_TIMEOUT,
         )
         .await?;
@@ -466,6 +510,7 @@ async fn create_share_inner_with_domain(
             CONFIG_TIMEOUT,
         )
         .await?;
+        super::meter::install(&mut sess, &cancel, &manifest).await?;
         for unit in &units {
             run_cmd_ok(
                 &mut sess,
@@ -499,7 +544,7 @@ async fn create_share_inner_with_domain(
             "自测",
             &format!(
                 "curl -s -o /dev/null -w '%{{http_code}}' --resolve {domain}:{port}:127.0.0.1 \
-                 https://{domain}:{port}/sub/{token} --max-time 10",
+                 https://{domain}:{port}/sub/{token} --max-time 5 --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 15",
                 port = allocated.http
             ),
             PROBE_TIMEOUT,
@@ -511,6 +556,14 @@ async fn create_share_inner_with_domain(
                 "分享链接自测返回 {}（期望 200）",
                 code.trim()
             ));
+        }
+        if manifest.cdn.is_some() {
+            let code = run_cmd(&mut sess, &cancel, "CDN 回源自测", &format!(
+                "curl --noproxy '*' -s -o /dev/null -w '%{{http_code}}' https://{domain}:{}/sub/{token} --max-time 20", allocated.http
+            ), CONFIG_TIMEOUT).await?;
+            if code.exit_code != 0 || code.stdout.trim() != "200" {
+                return Err("CDN 回源自测失败，请检查橙云、SSL 模式及回源端口；未生成可用分享".into());
+            }
         }
         Ok(())
     }
@@ -544,8 +597,7 @@ pub(crate) fn status_from(m: &ShareManifest, u: &UsageState, active: bool) -> Sh
     } else {
         m.quota_bytes > 0 && u.used_bytes >= m.quota_bytes
     };
-    let expired =
-        m.expires_at_unix > 0 && chrono::Utc::now().timestamp() >= m.expires_at_unix;
+    let expired = m.expires_at_unix > 0 && chrono::Utc::now().timestamp() >= m.expires_at_unix;
     if u.blocked.as_deref() == Some("quota") || quota_hit {
         ShareStatus::BlockedQuota
     } else if u.blocked.as_deref() == Some("expired") || expired {
@@ -588,6 +640,8 @@ pub(crate) fn info_from_manifest(
     };
     let status_detail = status_detail_from(u);
     ShareInfo {
+        quota_total_bytes: m.quota_total_bytes,
+        total_usage: None,
         id: m.id.clone(),
         server_id: m.server_id,
         server_name: server.name.clone(),
@@ -610,8 +664,7 @@ pub(crate) fn info_from_manifest(
         split_quota: split,
         rate_up_mbps: m.rate_up_mbps,
         rate_down_mbps: m.rate_down_mbps,
-        expires_at: chrono::DateTime::from_timestamp(m.expires_at_unix, 0)
-            .map(|t| t.to_rfc3339()),
+        expires_at: chrono::DateTime::from_timestamp(m.expires_at_unix, 0).map(|t| t.to_rfc3339()),
         last_access_at: None,
         last_access_ip: None,
     }
@@ -724,10 +777,7 @@ async fn reserved_share_ports(
     )
     .await?;
     if out.exit_code != 0 {
-        return Err(format!(
-            "读取已有分享端口失败: {}",
-            out.stderr.trim()
-        ));
+        return Err(format!("读取已有分享端口失败: {}", out.stderr.trim()));
     }
     Ok(out
         .stdout
@@ -735,6 +785,39 @@ async fn reserved_share_ports(
         .filter_map(|s| s.trim().parse::<u16>().ok())
         .filter(|p| *p != 0)
         .collect())
+}
+
+pub(crate) async fn allocate_cdn_port(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    requested: u16,
+) -> Result<u16, String> {
+    let reserved = reserved_share_ports(sess, cancel).await?;
+    let ports = if requested == 0 {
+        super::cdn::HTTPS_PORTS.to_vec()
+    } else {
+        vec![requested]
+    };
+    for port in ports {
+        if reserved.contains(&port) {
+            continue;
+        }
+        let probe = run_cmd(
+            sess,
+            cancel,
+            "CDN 端口探测",
+            &tcp_port_probe_cmd(port),
+            PROBE_TIMEOUT,
+        )
+        .await?;
+        if probe.exit_code == 1 {
+            return Ok(port);
+        }
+        if probe.exit_code != 0 {
+            return Err("CDN 端口探测失败".into());
+        }
+    }
+    Err("CDN HTTPS 端口已占用或被已有分享保留，请选择其它端口".into())
 }
 
 /// 订阅端口、公网数据端口、回环内部端口三段各自独立分配；每段都从段首开始，
@@ -790,6 +873,7 @@ pub fn build_specs(
     nodes: &[Node],
     pairs: &[(u16, u16)],
     upstream_node_ids: &HashSet<String>,
+    reused_upstream_node_ids: &HashSet<String>,
 ) -> Result<Vec<ShareNodeSpec>, String> {
     if nodes.len() != pairs.len() {
         return Err("端口数量与节点数量不一致".into());
@@ -823,8 +907,17 @@ pub fn build_specs(
                 (uuid::Uuid::new_v4().to_string(), None)
             };
             let source = if upstream_node_ids.contains(&n.id) {
-                // 上游出口只有 VLESS+REALITY 一种客户端形态；真出现别的协议说明
-                // 节点被别处改过，宁可显式拒绝，也不要拿错来源的配置去猜。
+                // 复用主入口的出口没有独立入站：入站与主协议共用，克隆时必须把
+                // 住宅出站/路由一起改造，当前未实现。显式拒绝，绝不静默降级成
+                // 「分享用户走主出口直连」——那会把住宅线路悄悄换成普通线路。
+                if reused_upstream_node_ids.contains(&n.id) {
+                    return Err(format!(
+                        "上游出口节点 {} 复用主入口，暂不支持分享（避免把住宅出口错接到直连）",
+                        n.name
+                    ));
+                }
+                // 旧专用实例的出口只有 VLESS+REALITY 一种客户端形态；真出现别的协议
+                // 说明节点被别处改过，宁可显式拒绝，也不要拿错来源的配置去猜。
                 if n.protocol != "vless" {
                     return Err(format!(
                         "上游出口节点 {} 的协议为 {}，当前只支持分享 VLESS 上游",
@@ -897,6 +990,7 @@ pub fn unit_contents(
     let specs = firewall_specs(pairs);
     let gateway = format!(
         "[Unit]\nDescription=vpn-ctl share {id} gateway\nAfter=network.target\n\n[Service]\n{h}\
+         MemoryHigh=256M\nMemoryMax=384M\nLimitNOFILE=2048\n\
          ExecStart=/usr/bin/env python3 {gateway_script} --config {dir}/gateway.json \
 --usage {dir}/usage.json --bind {bind}\n\
          ExecStartPost=+{firewall} open vpnshare-{id} {specs}\n\
@@ -956,6 +1050,13 @@ pub(crate) async fn rollback_created(
         }
     }
     if run_cmd_ok(
+        sess, cancel, "回滚公网计量",
+        &format!("if test -f /etc/systemd/system/vpnshare-{id}-meter.service; then python3 /srv/vpnshare/share_meter.py remove {id}; fi"),
+        CONFIG_TIMEOUT,
+    ).await.is_err() {
+        leftovers.push(format!("公网计量 {id}"));
+    }
+    if run_cmd_ok(
         sess,
         cancel,
         "回滚",
@@ -1008,6 +1109,8 @@ pub struct SummaryEntry {
     #[serde(default)]
     pub usage: Option<UsageState>,
     #[serde(default)]
+    pub meter: Option<TotalUsage>,
+    #[serde(default)]
     pub last_access: Option<LastAccess>,
     #[serde(default)]
     pub units: Option<HashMap<String, Option<String>>>,
@@ -1040,8 +1143,7 @@ pub fn parse_summary(json: &str) -> Result<Vec<SummaryEntry>, String> {
 /// 真机/本地测试与只关心分享列表的调用方。
 #[allow(dead_code)]
 pub async fn list_shares(state: &Arc<AppState>) -> Result<ShareList, String> {
-    let servers =
-        crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
+    let servers = crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
 
     let mut set = tokio::task::JoinSet::new();
     for (idx, server) in servers.into_iter().enumerate() {
@@ -1088,8 +1190,7 @@ pub async fn list_shares(state: &Arc<AppState>) -> Result<ShareList, String> {
 ///   的 `tls` 条目（向导会回落到按需实时查询）；
 /// - 返回快照由调用方写缓存并推送，前端切页不再触发这里。
 pub async fn refresh_share_snapshot(state: &Arc<AppState>) -> Result<ShareSnapshot, String> {
-    let servers =
-        crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
+    let servers = crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
     let email = tls::acme_email(state);
 
     let mut set = tokio::task::JoinSet::new();
@@ -1218,8 +1319,7 @@ async fn read_server_summaries_on(
                 if !unit.is_empty() && crate::share::unit_needs_upgrade(&unit) {
                     let port = crate::share::parse_port_from_unit(&unit).unwrap_or(0);
                     if port != 0 {
-                        crate::share::upgrade_share_unit(sess, cancel, &entry.id, port)
-                            .await?;
+                        crate::share::upgrade_share_unit(sess, cancel, &entry.id, port).await?;
                         active = run_cmd(
                             sess,
                             cancel,
@@ -1280,6 +1380,25 @@ fn new_info(server: &Server, entry: SummaryEntry) -> Option<ShareInfo> {
         .iter()
         .all(|unit| units.get(unit).and_then(|v| v.as_deref()) == Some("active"));
     let mut info = info_from_manifest(&manifest, &usage, server, active);
+    if manifest.quota_total_bytes.is_some() {
+        info.total_usage = entry.meter;
+        match info.total_usage.as_ref().map(|meter| meter.state.as_str()) {
+            Some("blocked_quota") => {
+                info.status = ShareStatus::BlockedQuota;
+                info.status_detail = Some("公网双向总额度已用完".into());
+            }
+            Some("ready") => {}
+            _ => {
+                info.status = ShareStatus::Degraded;
+                info.status_detail = Some(
+                    info.total_usage
+                        .as_ref()
+                        .and_then(|m| m.detail.clone())
+                        .unwrap_or_else(|| "总流量统计不可用，禁止按零用量处理".into()),
+                );
+            }
+        }
+    }
     if let Some(last) = entry.last_access {
         info.last_access_at = Some(last.at);
         info.last_access_ip = Some(last.ip);
@@ -1291,6 +1410,9 @@ fn new_info(server: &Server, entry: SummaryEntry) -> Option<ShareInfo> {
 /// xray/singbox）不参与判断——摘要脚本对不存在的单元返回 null。
 fn required_units(m: &ShareManifest) -> Vec<String> {
     let mut units = vec![unit_name(&m.id), gateway_unit_name(&m.id)];
+    if m.quota_total_bytes.is_some() {
+        units.push(format!("vpnshare-{}-meter", m.id));
+    }
     if m.nodes
         .iter()
         .any(|n| matches!(n.protocol.as_str(), "vless" | "trojan" | "vmess"))
@@ -1322,6 +1444,8 @@ pub(crate) fn legacy_info(
     let host = effective_host(server).to_string();
     ShareInfo {
         id: id.to_string(),
+        quota_total_bytes: None,
+        total_usage: None,
         server_id: server.id,
         server_name: server.name.clone(),
         host: host.clone(),
@@ -1379,8 +1503,7 @@ pub async fn update_share_with_nodes(
         return Err("分享 id 非法".into());
     }
     validate_options(&options)?;
-    let (auth, server) =
-        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
+    let (auth, server) = crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
     let mut sess = SshSession::connect(
         effective_host(&server),
         server.port as u16,
@@ -1393,36 +1516,81 @@ pub async fn update_share_with_nodes(
     let cancel = AtomicBool::new(false);
 
     let mut manifest = read_new_manifest(&mut sess, &cancel, id).await?;
+    // 旧分享没有总额度 → 这次保存要补装 meter（按 UI 预填的原合计配额迁移）。
+    let mut enabling_total = manifest.quota_total_bytes.is_none();
+    manifest.quota_total_bytes = Some(options.quota_total_bytes);
+    if !enabling_total {
+        enabling_total = run_cmd(
+            &mut sess,
+            &cancel,
+            "检查公网计量",
+            &format!("systemctl is-active vpnshare-{id}-meter"),
+            PROBE_TIMEOUT,
+        )
+        .await?
+        .stdout
+        .trim()
+            != "active";
+    }
     if manifest.server_id != server_id {
         return Err("分享不属于该服务器".into());
     }
-    let mut usage = read_usage(&mut sess, &cancel, id).await?;
-
     let expires_at_unix =
         server_now_unix(&mut sess, &cancel).await? + options.expires_in_days as i64 * 86400;
-    manifest.quota_bytes = options
-        .quota_up_bytes
-        .saturating_add(options.quota_down_bytes);
-    manifest.quota_up_bytes = Some(options.quota_up_bytes);
-    manifest.quota_down_bytes = Some(options.quota_down_bytes);
+    // 只按总额度判停：旧的方向配额与合计配额全部归零（0 = 不限），网关只继续
+    // 累计方向用量供展示。每次保存都会把旧分享迁移到这套口径。
+    manifest.quota_bytes = 0;
+    manifest.quota_up_bytes = Some(0);
+    manifest.quota_down_bytes = Some(0);
     manifest.rate_up_mbps = options.rate_up_mbps;
     manifest.rate_down_mbps = options.rate_down_mbps;
     manifest.expires_at_unix = expires_at_unix;
+    super::bandwidth::sync_manifest(&mut manifest)?;
     let gateway = gateway_from_manifest(&manifest);
 
-    usage.blocked = None;
-    usage.blocked_at = None;
-    usage.blocked_direction = None;
-    usage.updated_at = chrono::Utc::now().to_rfc3339();
-
     if let Some(node_ids) = node_ids {
-        return update_share_node_set(
-            state, &mut sess, &cancel, &server, id, manifest, usage, node_ids,
-        )
-        .await;
+        return update_share_node_set(state, &mut sess, &cancel, &server, id, manifest, node_ids)
+            .await;
     }
 
+    let subscriptions = if manifest.nodes.iter().any(|n| n.protocol == "hysteria2") {
+        let mut sources = Vec::new();
+        for path in [
+            yaml_path(id, &manifest.token),
+            singbox_path(id, &manifest.token),
+        ] {
+            match read_remote_file(&mut sess, &cancel, "读取订阅", &path, PROBE_TIMEOUT).await?
+            {
+                RemoteFile::Content(content) => sources.push(content),
+                RemoteFile::Absent => return Err("订阅文件缺失，未修改分享".into()),
+            }
+        }
+        Some(super::bandwidth::sync_documents(
+            &sources[0],
+            &sources[1],
+            manifest.rate_up_mbps,
+            manifest.rate_down_mbps,
+        )?)
+    } else {
+        None
+    };
+
     let gw_unit = gateway_unit_name(id);
+    if enabling_total {
+        for unit in required_units(&manifest)
+            .into_iter()
+            .filter(|u| !u.ends_with("-meter"))
+        {
+            run_cmd_ok(
+                &mut sess,
+                &cancel,
+                "启用总额度前停止分享",
+                &format!("systemctl stop {unit}"),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+        }
+    }
     run_cmd_ok(
         &mut sess,
         &cancel,
@@ -1433,6 +1601,26 @@ pub async fn update_share_with_nodes(
     .await?;
 
     let write_result = async {
+        // Stop waits for the gateway's final flush. Reading before it would
+        // overwrite the newest counters with a stale pre-stop snapshot.
+        let mut usage = read_usage(&mut sess, &cancel, id).await?;
+        clear_usage_block(&mut usage);
+        if let Some((yaml, singbox)) = &subscriptions {
+            for (path, content) in [
+                (yaml_path(id, &manifest.token), yaml),
+                (singbox_path(id, &manifest.token), singbox),
+            ] {
+                write_remote_file(
+                    &mut sess,
+                    &cancel,
+                    "更新订阅带宽",
+                    &path,
+                    content,
+                    CONFIG_TIMEOUT,
+                )
+                .await?;
+            }
+        }
         // 网关脚本是所有分享共用的。旧分享在服务器重启/单元重启后也会加载它，
         // 因此升级脚本必须保持对旧 gateway.json（只有 quota_bytes）的兼容。
         write_remote_file(
@@ -1441,6 +1629,27 @@ pub async fn update_share_with_nodes(
             "写入",
             &share_gateway_script_path(),
             &scripts::share_gateway_script(),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        // 订阅服务脚本也是所有分享共用的；编辑时一并升级，已有分享才能拿到
+        // `subscription-userinfo`（客户端显示已用/剩余流量）。Python 进程已加载
+        // 旧代码，写完用 try-restart 让正在运行的订阅单元换上新脚本；本来就停着
+        // 的单元保持停止（例如计量启用失败后的保护态）。
+        write_remote_file(
+            &mut sess,
+            &cancel,
+            "写入",
+            &share_server_script_path(),
+            &scripts::share_server_script(),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        run_cmd_ok(
+            &mut sess,
+            &cancel,
+            "重启订阅",
+            &format!("systemctl try-restart {}", unit_name(id)),
             CONFIG_TIMEOUT,
         )
         .await?;
@@ -1504,9 +1713,21 @@ pub async fn update_share_with_nodes(
             CONFIG_TIMEOUT,
         )
         .await?;
-        Ok::<(), String>(())
+        if enabling_total {
+            super::meter::install(&mut sess, &cancel, &manifest).await?;
+        } else {
+            super::meter::sync(&mut sess, &cancel, &manifest).await?;
+        }
+        Ok::<UsageState, String>(usage)
     }
     .await;
+    if enabling_total {
+        if let Err(e) = &write_result {
+            return Err(format!(
+                "启用总额度失败：{e}；分享保持停止，避免未计量流量，请修复后重试保存"
+            ));
+        }
+    }
     // 配置写失败也要试着把网关拉起来：半成品配置可能起不来，但让它一直停着
     // 更糟（用户失去所有连接且没有任何自动恢复）。
     let start_result = run_cmd_ok(
@@ -1517,10 +1738,20 @@ pub async fn update_share_with_nodes(
         CONFIG_TIMEOUT,
     )
     .await;
-    if let Err(e) = write_result {
-        return Err(format!("更新分享配置失败：{e}（已尝试重启网关）"));
-    }
+    let usage = write_result.map_err(|e| format!("更新分享配置失败：{e}（已尝试重启网关）"))?;
     start_result.map_err(|e| format!("启动网关失败：{e}"))?;
+    if enabling_total {
+        for unit in required_units(&manifest) {
+            run_cmd_ok(
+                &mut sess,
+                &cancel,
+                "恢复分享",
+                &format!("systemctl start {unit}"),
+                CONFIG_TIMEOUT,
+            )
+            .await?;
+        }
+    }
     ensure_gateway_active(&mut sess, &cancel, &gw_unit).await?;
 
     Ok(info_from_manifest(&manifest, &usage, &server, true))
@@ -1538,7 +1769,6 @@ async fn update_share_node_set(
     server: &Server,
     id: &str,
     mut manifest: ShareManifest,
-    usage: UsageState,
     node_ids: Vec<String>,
 ) -> Result<ShareInfo, String> {
     if node_ids.is_empty() {
@@ -1578,13 +1808,17 @@ async fn update_share_node_set(
         return Err("Shadowsocks 分享一次只允许一个节点".into());
     }
 
-    let upstream_node_ids: HashSet<String> = {
+    let (upstream_node_ids, reused_upstream_node_ids): (HashSet<String>, HashSet<String>) = {
         let conn = state.db.lock();
-        crate::db::repos::upstreams::list_by_server(&conn, manifest.server_id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|u| u.node_id)
-            .collect()
+        let rows = crate::db::repos::upstreams::list_by_server(&conn, manifest.server_id)
+            .map_err(|e| e.to_string())?;
+        let ids = rows.iter().filter_map(|u| u.node_id.clone()).collect();
+        let reused = rows
+            .iter()
+            .filter(|u| !u.entry_proto.is_empty())
+            .filter_map(|u| u.node_id.clone())
+            .collect();
+        (ids, reused)
     };
 
     // 只给新增节点分配端口；被保留的节点沿用原公网/回环端口，已发出去的订阅
@@ -1617,7 +1851,12 @@ async fn update_share_node_set(
     }
 
     let chosen_nodes: Vec<Node> = chosen.iter().map(|(n, _)| n.clone()).collect();
-    let mut specs = build_specs(&chosen_nodes, &pairs, &upstream_node_ids)?;
+    let mut specs = build_specs(
+        &chosen_nodes,
+        &pairs,
+        &upstream_node_ids,
+        &reused_upstream_node_ids,
+    )?;
     for (spec, (_, old)) in specs.iter_mut().zip(chosen.iter()) {
         if let Some(old) = old {
             let (credential, password) = existing_share_credential(old)?;
@@ -1630,7 +1869,7 @@ async fn update_share_node_set(
     let main_sb = read_main(sess, cancel, &specs, "hysteria2", SINGBOX_CONFIG_PATH).await?;
     let main_ss = read_main(sess, cancel, &specs, "ss", SS_CONFIG_PATH).await?;
     let upstream_xray = read_main(sess, cancel, &specs, "upstream", UPSTREAM_CONFIG_PATH).await?;
-    let cloned = clone_configs(
+    let mut cloned = clone_configs(
         main_xray.as_deref(),
         upstream_xray.as_deref(),
         main_sb.as_deref(),
@@ -1640,6 +1879,10 @@ async fn update_share_node_set(
         id,
         &[],
     )?;
+    if let Some(c) = &manifest.cdn {
+        super::cdn::apply(&mut cloned, c)?;
+    }
+    super::bandwidth::sync_cloned(&mut cloned, manifest.rate_up_mbps, manifest.rate_down_mbps)?;
     manifest.nodes = specs
         .iter()
         .zip(cloned.share_nodes.iter())
@@ -1743,16 +1986,23 @@ async fn update_share_node_set(
         }
     }
     if !still_active.is_empty() {
-        let leftovers = restore_share_after_failed_node_update(
-            sess,
-            cancel,
-            id,
-            &backup,
-            &old_nodes,
-            &manifest.nodes,
-            &old_start_units,
-        )
-        .await;
+        // No config has changed yet: restart in place rather than replacing
+        // the directory with a backup taken while traffic was still flowing.
+        let mut leftovers = Vec::new();
+        for unit in &old_start_units {
+            if run_cmd_ok(
+                sess,
+                cancel,
+                "恢复旧分享",
+                &format!("systemctl start {unit}"),
+                CONFIG_TIMEOUT,
+            )
+            .await
+            .is_err()
+            {
+                leftovers.push(format!("启动 {unit}"));
+            }
+        }
         return Err(format!(
             "单元未能停止：{}，未修改节点{}",
             still_active.join("、"),
@@ -1760,7 +2010,20 @@ async fn update_share_node_set(
         ));
     }
 
+    let mut usage = UsageState::default();
     let setup: Result<(), String> = async {
+        usage = read_usage(sess, cancel, id).await?;
+        // Rollback must retain the final counters as well as the old config.
+        write_remote_file(
+            sess,
+            cancel,
+            "备份最终用量",
+            &format!("{backup}/data/usage.json"),
+            &serde_json::to_string(&usage).map_err(|e| e.to_string())?,
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+        clear_usage_block(&mut usage);
         write_remote_file(
             sess,
             cancel,
@@ -1955,7 +2218,7 @@ async fn update_share_node_set(
             cancel,
             "写入",
             &unit_path(&unit_name(id)),
-            &share_units.http,
+            &super::cdn::http_unit(share_units.http.clone(), &manifest),
             CONFIG_TIMEOUT,
         )
         .await?;
@@ -1995,6 +2258,8 @@ async fn update_share_node_set(
         close_public_pairs(sess, cancel, id, &removed_pairs).await?;
 
         // 先起实例再起网关：网关开始转发时回环目标已经就绪。
+        super::meter::install(sess, cancel, &manifest).await?;
+        super::meter::sync(sess, cancel, &manifest).await?;
         let mut start_units = new_instance_units.clone();
         start_units.push(gateway_unit_name(id));
         start_units.push(unit_name(id));
@@ -2031,7 +2296,7 @@ async fn update_share_node_set(
             "自测",
             &format!(
                 "curl -s -o /dev/null -w '%{{http_code}}' --resolve {domain}:{port}:127.0.0.1 \
-                 https://{domain}:{port}/sub/{token} --max-time 10",
+                 https://{domain}:{port}/sub/{token} --max-time 5 --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 15",
                 domain = manifest.domain,
                 port = manifest.http_port,
                 token = manifest.token
@@ -2120,11 +2385,27 @@ async fn restore_share_after_failed_node_update(
         }
     }
     let dir = share_dir(id);
+    // New instances may already have served traffic before a later validation
+    // fails. Keep their final counters when restoring the previous config.
+    let mut final_usage = match read_usage(sess, cancel, id).await {
+        Ok(usage) => usage,
+        Err(e) => {
+            leftovers.push(format!("无法读取最终用量，保留当前数据目录：{e}"));
+            return leftovers;
+        }
+    };
+    clear_usage_block(&mut final_usage);
+    // Stop before restoring share.json so the ledger gets a clean final
+    // checkpoint instead of observing a transiently missing manifest.
+    if run_cmd_ok(sess,cancel,"停止公网计量回滚",&format!("if test -f /etc/systemd/system/vpnshare-{id}-meter.service; then systemctl stop vpnshare-{id}-meter; fi"),CONFIG_TIMEOUT).await.is_err() {
+        leftovers.push("公网计量未能停止，保留当前配置".into());
+        return leftovers;
+    }
     if run_cmd_ok(
         sess,
         cancel,
         "回滚",
-        &format!("rm -f /etc/systemd/system/vpnshare-{id}*.service"),
+        &format!("rm -f /etc/systemd/system/vpnshare-{id}.service /etc/systemd/system/vpnshare-{id}-gateway.service /etc/systemd/system/vpnshare-{id}-xray.service /etc/systemd/system/vpnshare-{id}-singbox.service /etc/systemd/system/vpnshare-{id}-ss.service"),
         CONFIG_TIMEOUT,
     )
     .await
@@ -2154,6 +2435,19 @@ async fn restore_share_after_failed_node_update(
     {
         leftovers.push(format!("目录 {dir}"));
     }
+    if write_remote_file(
+        sess,
+        cancel,
+        "保留最终用量",
+        &usage_path(id),
+        &serde_json::to_string(&final_usage).unwrap(),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        leftovers.push("最终用量恢复".into());
+    }
     if run_cmd_ok(
         sess,
         cancel,
@@ -2181,6 +2475,9 @@ async fn restore_share_after_failed_node_update(
         leftovers.push(format!("恢复旧端口：{e}"));
     }
 
+    if run_cmd_ok(sess,cancel,"恢复公网计量",&format!("if test -f /etc/systemd/system/vpnshare-{id}-meter.service; then python3 /srv/vpnshare/share_meter.py reconcile {id}; fi"),CONFIG_TIMEOUT).await.is_err() {
+        leftovers.push("公网计量恢复".into());
+    }
     for unit in old_units {
         if run_cmd_ok(
             sess,
@@ -2329,76 +2626,23 @@ fn existing_share_credential(node: &ShareNode) -> Result<(String, Option<String>
 /// 重置用量：把 `usage.json` 归零并重启网关。到期时间与配额不变；已到期的分享
 /// 会在网关启动时立刻再次停用。
 pub async fn reset_usage(
-    state: &Arc<AppState>,
-    server_id: i64,
+    _state: &Arc<AppState>,
+    _server_id: i64,
     id: &str,
 ) -> Result<ShareInfo, String> {
     if !is_valid_id(id) {
         return Err("分享 id 非法".into());
     }
-    let (auth, server) =
-        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
-    let mut sess = SshSession::connect(
-        effective_host(&server),
-        server.port as u16,
-        &server.user,
-        &auth,
-        CONNECT_TIMEOUT,
-    )
-    .await
-    .map_err(|e| format!("连接服务器失败: {e}"))?;
-    let cancel = AtomicBool::new(false);
-    let manifest = read_new_manifest(&mut sess, &cancel, id).await?;
-    if manifest.server_id != server_id {
-        return Err("分享不属于该服务器".into());
-    }
-    let usage = UsageState::default();
-    let gw_unit = gateway_unit_name(id);
-    run_cmd_ok(
-        &mut sess,
-        &cancel,
-        "停止网关",
-        &format!("systemctl stop {gw_unit}"),
-        CONFIG_TIMEOUT,
-    )
-    .await?;
-    let write_result = write_remote_file(
-        &mut sess,
-        &cancel,
-        "重置用量",
-        &usage_path(id),
-        &serde_json::to_string(&usage).map_err(|e| e.to_string())?,
-        CONFIG_TIMEOUT,
-    )
-    .await;
-    let start_result = run_cmd_ok(
-        &mut sess,
-        &cancel,
-        "启动网关",
-        &format!("systemctl start {gw_unit}"),
-        CONFIG_TIMEOUT,
-    )
-    .await;
-    if let Err(e) = write_result {
-        return Err(format!("重置用量失败：{e}（已尝试重启网关）"));
-    }
-    start_result.map_err(|e| format!("启动网关失败：{e}"))?;
-    ensure_gateway_active(&mut sess, &cancel, &gw_unit).await?;
-    Ok(info_from_manifest(&manifest, &usage, &server, true))
+    Err("历史用量必须保留；只有删除分享后新建链接才能重新计量".into())
 }
 
 /// 作废分享：停单元、删单元/目录、撤端口放行。幂等——重复调用不报错。
 /// 旧分享没有 `share.json`，端口从单元文件解析；新旧两种防火墙注释都清。
-pub async fn delete_share(
-    state: &Arc<AppState>,
-    server_id: i64,
-    id: &str,
-) -> Result<(), String> {
+pub async fn delete_share(state: &Arc<AppState>, server_id: i64, id: &str) -> Result<(), String> {
     if !is_valid_id(id) {
         return Err("分享 id 非法".into());
     }
-    let (auth, server) =
-        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
+    let (auth, server) = crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
     let mut sess = SshSession::connect(
         effective_host(&server),
         server.port as u16,
@@ -2422,6 +2666,19 @@ pub async fn delete_share(
         RemoteFile::Absent => None,
         RemoteFile::Content(c) => serde_json::from_str(&c).ok(),
     };
+    let metered = manifest
+        .as_ref()
+        .is_some_and(|m| m.quota_total_bytes.is_some());
+    if metered {
+        run_cmd_ok(
+            &mut sess,
+            &cancel,
+            "停止公网计量",
+            &format!("systemctl stop vpnshare-{id}-meter.service"),
+            CONFIG_TIMEOUT,
+        )
+        .await?;
+    }
     let mut ports: Vec<(u16, &'static str)> = Vec::new();
     match &manifest {
         Some(m) => {
@@ -2568,6 +2825,9 @@ pub async fn delete_share(
         CONFIG_TIMEOUT,
     )
     .await?;
+    // A retry may no longer have share.json, or an enablement rollback may
+    // have retained a ledger. Deletion must clean those resources too.
+    super::meter::remove(&mut sess, &cancel, id).await?;
     Ok(())
 }
 
@@ -2589,16 +2849,24 @@ async fn read_new_manifest(
     }
 }
 
-/// 用量文件缺失或内容损坏时按 0 处理；**读取命令本身失败必须上报**——把读失败
-/// 当成 0 会在编辑时静默清空已用字节。
+fn clear_usage_block(usage: &mut UsageState) {
+    usage.blocked = None;
+    usage.blocked_at = None;
+    usage.blocked_direction = None;
+    usage.updated_at = chrono::Utc::now().to_rfc3339();
+}
+
+/// Editing must not turn missing/corrupt counters into a silent usage reset.
 async fn read_usage(
     sess: &mut SshSession,
     cancel: &AtomicBool,
     id: &str,
 ) -> Result<UsageState, String> {
     match read_remote_file(sess, cancel, "读取", &usage_path(id), PROBE_TIMEOUT).await? {
-        RemoteFile::Content(c) => Ok(serde_json::from_str(&c).unwrap_or_default()),
-        RemoteFile::Absent => Ok(UsageState::default()),
+        RemoteFile::Content(c) => {
+            serde_json::from_str(&c).map_err(|e| format!("用量文件损坏，拒绝重置计数：{e}"))
+        }
+        RemoteFile::Absent => Err("用量文件缺失，拒绝重置计数".into()),
     }
 }
 

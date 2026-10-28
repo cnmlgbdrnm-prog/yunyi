@@ -264,6 +264,8 @@ impl SpeedEngine for MihomoEngine {
             .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| format!("构建代理客户端失败: {e}"))?)
             .build()
             .map_err(|e| format!("构建代理客户端失败: {e}"))?;
+        // 放在超时 future 外，采样窗口结束时仍可返回已经收到的正文。
+        let mut total: usize = 0;
         let fut = async {
             let mut resp = client
                 .get(url)
@@ -274,7 +276,6 @@ impl SpeedEngine for MihomoEngine {
                 return Err(format!("下载失败: HTTP {}", resp.status().as_u16()));
             }
             // 流式读 body：累计到 size_limit 提前结束；每块检查取消标志
-            let mut total: usize = 0;
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("已取消".to_string());
@@ -289,11 +290,17 @@ impl SpeedEngine for MihomoEngine {
                     None => break,
                 }
             }
-            Ok(total)
+            Ok(())
         };
-        let total = tokio::time::timeout(timeout, fut)
-            .await
-            .map_err(|_| "下载超时".to_string())??;
+        let outcome = tokio::time::timeout(timeout, fut).await;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".to_string());
+        }
+        match outcome {
+            Ok(result) => result?,
+            Err(_) if total > 0 => {}
+            Err(_) => return Err("下载超时".to_string()),
+        }
         // 只返回字节：聚合（Σ字节/墙钟）由执行器 download_aggregate 负责
         Ok(total as f64)
     }

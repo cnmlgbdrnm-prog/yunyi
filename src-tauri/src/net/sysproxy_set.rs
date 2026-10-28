@@ -1,6 +1,6 @@
 //! 系统代理设置（WinINET HKCU）：开启前快照、关闭时还原。
 //! 与 src/sysproxy.rs 的读取职责互补（那份只读，供更新下载跟随现有代理）；
-//! 本模块只写不读——快照语义「开前存原值，关时原样写回」保证绝不残留。
+//! 通过 WinINET 连接级 API 写入、通知并回读，快照涵盖 PAC、绕过规则及环境变量。
 //! 非 Windows 平台为 no-op（跨平台测试与打包一致不炸）。
 
 #[cfg(windows)]
@@ -19,6 +19,12 @@ pub struct ProxySnapshot {
     /// 开网络前的用户级环境变量原值（None = 原本就没设，还原时要删掉）。
     /// 与 WinINET 那两个值同生共死，一起快照、一起还原。
     pub env: Vec<(&'static str, Option<String>)>,
+    #[cfg(windows)]
+    pub connection: super::sysproxy_windows::ConnectionSettings,
+    #[cfg(windows)]
+    pub registry_bypass: Option<String>,
+    #[cfg(windows)]
+    pub registry_pac: Option<String>,
 }
 
 /// 所有 URL 共用一个 HTTP 代理；HTTPS / WSS 通过 CONNECT 把域名交给 mihomo。
@@ -173,14 +179,9 @@ fn broadcast_environment_change() {
 /// ProxyEnable=1 且 ProxyServer 非空 → Some(server 值)，否则 None。
 #[cfg(windows)]
 pub fn live_system_proxy() -> Result<Option<String>, String> {
-    let key = open()?;
-    let enable: u32 = key.get_value("ProxyEnable").unwrap_or(0);
-    let server: String = key.get_value("ProxyServer").unwrap_or_default();
-    if enable != 0 && !server.trim().is_empty() {
-        Ok(Some(server))
-    } else {
-        Ok(None)
-    }
+    Ok(super::sysproxy_windows::read()?
+        .manual_server()
+        .map(str::to_string))
 }
 
 /// 非 Windows：无系统代理语义。
@@ -201,49 +202,161 @@ pub fn apply_net_proxy(port: u16) -> Result<ProxySnapshot, String> {
         enable,
         server,
         env,
+        connection: super::sysproxy_windows::read()?,
+        registry_bypass: key.get_value("ProxyOverride").ok(),
+        registry_pac: key.get_value("AutoConfigURL").ok(),
     };
-    key.set_value("ProxyServer", &proxy_server_value(port))
-        .map_err(|e| format!("写 ProxyServer 失败: {e}"))?;
-    key.set_value("ProxyEnable", &1_u32)
-        .map_err(|e| format!("写 ProxyEnable 失败: {e}"))?;
-    // WinINET 与环境变量是**两套互不相干的机制**，缺一套就有一整类客户端收不到：
-    // WinINET 只覆盖读它的程序（浏览器），环境变量覆盖 reqwest/Go/Node/Python 那类。
-    for (name, value) in env_proxy_writes(port) {
-        write_user_env(name, Some(&value))?;
-    }
-    // 整批写完再广播一次（不是每个变量一次：见 write_user_env 的说明）
-    broadcast_environment_change();
+    apply_or_restore(
+        || {
+            let desired = super::sysproxy_windows::ConnectionSettings::for_port(port);
+            // WinINET 的连接配置与旧式 HKCU 值在本机实测可不同步；两套都写，
+            // 最后由连接 API 刷新。只写任意一套都会漏掉读取另一套的客户端。
+            key.set_value("ProxyServer", &proxy_server_value(port))
+                .map_err(|e| format!("写 ProxyServer 失败: {e}"))?;
+            key.set_value("ProxyEnable", &1_u32)
+                .map_err(|e| format!("写 ProxyEnable 失败: {e}"))?;
+            write_registry_string(&key, "ProxyOverride", Some(&desired.bypass))?;
+            write_registry_string(&key, "AutoConfigURL", Some(&desired.auto_config_url))?;
+            super::sysproxy_windows::write(&desired)?;
+            for (name, value) in env_proxy_writes(port) {
+                write_user_env(name, Some(&value))?;
+            }
+            broadcast_environment_change();
+            if !proxy_matches(port)? {
+                let native = super::sysproxy_windows::read()?;
+                let registry = open()?;
+                return Err(format!(
+                    "已写入系统代理，但回读未确认生效（WinINET flags={} server={}；注册表 enable={} server={}）",
+                    native.flags, native.server,
+                    registry.get_value::<u32, _>("ProxyEnable").unwrap_or(0),
+                    registry.get_value::<String, _>("ProxyServer").unwrap_or_default(),
+                ));
+            }
+            Ok(())
+        },
+        || restore_proxy(Some(&snap)),
+    )?;
     Ok(snap)
+}
+
+/// 任一步失败都还原原快照；不能留下「只有环境变量成功」的半接管状态。
+pub(crate) fn apply_or_restore(
+    apply: impl FnOnce() -> Result<(), String>,
+    restore: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    match apply() {
+        Ok(()) => Ok(()),
+        Err(error) => match restore() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(format!("{error}；还原原代理失败: {rollback}")),
+        },
+    }
+}
+
+#[cfg(windows)]
+pub fn proxy_matches(port: u16) -> Result<bool, String> {
+    // 旧客户端可能直接改注册表而不刷新 WinINET；两份状态都要一致才算接管成功。
+    let key = open()?;
+    let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+    let server: String = key.get_value("ProxyServer").unwrap_or_default();
+    if enabled != 1 || server != proxy_server_value(port) {
+        return Ok(false);
+    }
+    let desired = super::sysproxy_windows::ConnectionSettings::for_port(port);
+    if key
+        .get_value::<String, _>("ProxyOverride")
+        .unwrap_or_default()
+        != desired.bypass
+        || !key
+            .get_value::<String, _>("AutoConfigURL")
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Ok(false);
+    }
+    if super::sysproxy_windows::read()?
+        != super::sysproxy_windows::ConnectionSettings::for_port(port)
+    {
+        return Ok(false);
+    }
+    let env = env_snapshot()?;
+    Ok(env_proxy_writes(port).iter().all(|(name, value)| {
+        env.iter()
+            .any(|(key, actual)| key == name && actual.as_ref() == Some(value))
+    }))
+}
+
+#[cfg(not(windows))]
+pub fn proxy_matches(_port: u16) -> Result<bool, String> {
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn write_registry_string(key: &RegKey, name: &str, value: Option<&str>) -> Result<(), String> {
+    let result = match value {
+        Some(value) => key.set_value(name, &value),
+        None => key.delete_value(name),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if value.is_none() && e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("写代理注册表 {name} 失败: {e}")),
+    }
 }
 
 /// 关闭：还原快照；无快照（异常路径）安全置 0/清空，绝不残留指向死端口的代理。
 #[cfg(windows)]
 pub fn restore_proxy(snap: Option<&ProxySnapshot>) -> Result<(), String> {
-    let key = open()?;
+    // 代理或某个环境变量恢复失败，也要继续恢复其它值并广播，最终统一返回错误。
+    let mut errors = Vec::new();
+    let mut record = |result: Result<(), String>| {
+        if let Err(e) = result {
+            errors.push(e);
+        }
+    };
     match snap {
         Some(s) => {
-            key.set_value("ProxyEnable", &s.enable)
-                .map_err(|e| format!("还原 ProxyEnable 失败: {e}"))?;
-            key.set_value("ProxyServer", &s.server)
-                .map_err(|e| format!("还原 ProxyServer 失败: {e}"))?;
+            record(open().and_then(|key| {
+                key.set_value("ProxyServer", &s.server)
+                    .and_then(|_| key.set_value("ProxyEnable", &s.enable))
+                    .map_err(|e| format!("还原代理注册表失败: {e}"))?;
+                let bypass =
+                    write_registry_string(&key, "ProxyOverride", s.registry_bypass.as_deref());
+                let pac = write_registry_string(&key, "AutoConfigURL", s.registry_pac.as_deref());
+                bypass.and(pac)
+            }));
+            record(super::sysproxy_windows::write(&s.connection));
             for (name, value) in &s.env {
-                write_user_env(name, value.as_deref())?;
+                record(write_user_env(name, value.as_deref()));
             }
         }
         None => {
-            let _ = key.set_value("ProxyEnable", &0_u32);
-            let _ = key.set_value("ProxyServer", &"");
+            record(open().and_then(|key| {
+                key.set_value("ProxyEnable", &0_u32)
+                    .and_then(|_| key.set_value("ProxyServer", &""))
+                    .map_err(|e| format!("清理代理注册表失败: {e}"))
+            }));
+            // 无快照时仅撤手动代理，保留现有自动配置及绕过设置。
+            record(super::sysproxy_windows::read().and_then(|mut settings| {
+                settings.flags = (settings.flags & !2) | 1;
+                settings.server.clear();
+                super::sysproxy_windows::write(&settings)
+            }));
             // 异常路径（强杀后自愈、快照缺失）：没有原值可依，只能把本次可能写过的
             // 键一律清掉。宁可清掉用户手工设的值，也不留一个指向死端口的代理指针
             // ——与上面 WinINET 分支同样的取舍。
             for name in ENV_PROXY_KEYS.iter().chain(ENV_NO_PROXY_KEYS.iter()) {
-                let _ = write_user_env(name, None);
+                record(write_user_env(name, None));
             }
         }
     }
     // 与 apply 对称：整批改完广播一次
     broadcast_environment_change();
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
 }
 
 #[cfg(not(windows))]

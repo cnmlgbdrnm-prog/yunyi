@@ -46,3 +46,6 @@ src-tauri/binaries/
 
 # husky 生成的 hook 运行时代码（.husky/commit-msg 本身入库）
 .husky/_/
+
+# Python 字节码缓存
+__pycache__/

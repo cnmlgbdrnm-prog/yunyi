@@ -5,6 +5,7 @@
 
 pub mod channels;
 pub mod deploy;
+mod deploy_nodes;
 pub mod deploy_spec;
 pub mod ipv6_detect;
 pub mod privacy;

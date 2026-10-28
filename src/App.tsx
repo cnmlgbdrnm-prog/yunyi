@@ -10,6 +10,7 @@ import {
   useMonitorSummary,
 } from './monitor/registry'
 import NavItem from './components/NavItem'
+import ShareCreationNotice from './components/ShareCreationNotice'
 import ConnLog from './views/ConnLog'
 import Dashboard from './views/Dashboard'
 import Subscriptions from './views/Subscriptions'
@@ -102,6 +103,7 @@ export default function App() {
         {view === 'shares' && <Shares />}
         {view === 'settings' && <Settings />}
       </main>
+      {view !== 'shares' && <ShareCreationNotice onOpen={() => setView('shares')} />}
     </div>
   )
 }

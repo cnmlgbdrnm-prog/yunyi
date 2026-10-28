@@ -11,8 +11,11 @@ use crate::servers::deploy::{run_cmd_ok, write_remote_file, CONFIG_TIMEOUT};
 use crate::ssh::SshSession;
 use std::sync::atomic::AtomicBool;
 
+pub mod bandwidth;
+pub mod cdn;
 pub mod clone;
 pub mod install;
+pub mod meter;
 pub mod model;
 pub mod naming;
 pub mod plan;

@@ -22,7 +22,12 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 当前缓存快照；尚未完成第一轮时返回默认值（`checked_at = None`）。
 pub fn cached(state: &AppState) -> ShareSnapshot {
-    state.share_snapshot.lock().unwrap().clone().unwrap_or_default()
+    state
+        .share_snapshot
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default()
 }
 
 /// 采集一轮并替换缓存。失败时保留上一轮快照（不把界面推成空列表）。

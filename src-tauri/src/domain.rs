@@ -113,7 +113,7 @@ pub struct Server {
     pub system: String,
     pub notes: String,
     pub created_at: String,
-    /// 本机→服务器 TCP 延迟（ms，3 采样最小）。
+    /// 本机→服务器单次 SSH 端响应耗时（ms，包含建连；旧记录需重新测速）。
     pub latency: Option<i64>,
     /// 服务器下载带宽（bytes/s，SSH 内 curl 实测）。
     pub bandwidth: Option<i64>,
@@ -506,10 +506,18 @@ pub struct Upstream {
     pub host: String,
     pub port: i64,
     pub username: String,
-    /// 中转机上本实例的入站端口（客户端节点连的就是它）。
+    /// 旧专用实例的入站端口（客户端节点连的就是它）。复用主入口时恒为 0；
+    /// 复用入口的真实端口见 `entry_port`。
     pub listen_port: i64,
-    /// REALITY 伪装域名。
+    /// REALITY 伪装域名（仅旧专用实例使用；复用主入口时为空）。
     pub reality_dest: String,
+    /// 复用入口的主节点 id（`nodes.id`）。`None` = 旧专用实例或尚未部署。
+    /// 仅用于展示/失效检测；渲染按 `entry_proto` 匹配主配置里的入站。
+    pub entry_node_id: Option<String>,
+    /// 复用入口的协议（vless/trojan/vmess/hysteria2/tuic）。空串 = 旧专用实例。
+    pub entry_proto: String,
+    /// 复用入口当前的端口。0 = 该协议尚未部署，下一次部署会补上并回写这里。
+    pub entry_port: i64,
     /// 写回的节点 id（拆除时按它删，不能用 protocol+addr 定位——同一中转机上
     /// 多条出口的节点协议与地址都相同，会互相误删）。
     pub node_id: Option<String>,
@@ -518,6 +526,26 @@ pub struct Upstream {
     /// 最近一次失败原因（脱敏）。
     pub last_check_error: Option<String>,
     pub created_at: String,
+}
+
+/// 上游出口「入口协议」下拉里的一项：服务器上已经部署、可直接复用的主入站。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpstreamEntryOption {
+    /// 主节点 id（`nodes.id`），选中后作为 `upstreams.entry_node_id`
+    pub node_id: String,
+    pub protocol: String,
+    pub port: u16,
+    /// 与「已部署协议」一致的人类可读变体名（VLESS + REALITY + Vision 等）
+    pub label: String,
+}
+
+/// 入口协议选项：`deployed` 是可直接复用的主入站；`supported` 是支持复用、
+/// 但当前尚未部署的协议（选中 = 先部署再复用）。SS 不在 `supported` 里：
+/// 它由独立的 ssserver 承载，没有按用户分流的能力，无法把出口接到住宅代理。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpstreamEntryOptions {
+    pub deployed: Vec<UpstreamEntryOption>,
+    pub supported: Vec<String>,
 }
 
 /// 隐私保护：**某条既有线路的 Tor 入口**（开关，不是新节点）。

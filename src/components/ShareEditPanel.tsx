@@ -2,8 +2,8 @@
 // 编辑会停-写-起网关并保留已用字节；到期时间按「从现在起 N 天」重新计算。
 // 节点只在选择集合发生变化时才提交：仍被选中的节点沿用原端口与凭据，链接不变。
 import { useEffect, useState } from 'react'
-import { listShareCandidates, resetShareUsage, updateShare } from '../api'
-import ConfirmButton from './ConfirmButton'
+import { listShareCandidates, updateShare } from '../api'
+import { SHARE_GB as GB } from '../utils/shareTraffic'
 import type { ShareCandidate, ShareInfo } from '../api/types'
 
 interface Props {
@@ -11,8 +11,6 @@ interface Props {
   onClose: () => void
   onSaved: (info: ShareInfo) => void
 }
-
-const GB = 1024 ** 3
 
 function remainingDays(expiresAt: string | null): string {
   if (!expiresAt) return '30'
@@ -26,16 +24,13 @@ function validNumber(raw: string, min: number, max: number): boolean {
 }
 
 export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
-  // 旧分享只有合计配额：首次编辑时把它当作下行配额，上行默认不限（0）。
-  // 这与网关的迁移规则一致——历史合计全部计入下行，避免凭空多出额度。
-  const [quotaUpGb, setQuotaUpGb] = useState(
-    share.split_quota ? String(Math.round(share.quota_up_bytes / GB)) : '0',
-  )
-  const [quotaDownGb, setQuotaDownGb] = useState(
+  // 总额度是唯一闸门。旧分享没有总额度时，用原来的合计配额作为初始值：
+  // 保存后就从「合计/分方向配额」迁移成「只按总额度停用」，上限不会被悄悄放大或清掉。
+  const [quotaTotalGb, setQuotaTotalGb] = useState(
     String(
-      share.split_quota
-        ? Math.round(share.quota_down_bytes / GB)
-        : Math.max(1, Math.round(share.quota_bytes / GB)),
+      share.quota_total_bytes != null
+        ? Math.round(share.quota_total_bytes / GB)
+        : Math.round(share.quota_bytes / GB),
     ),
   )
   const [rateUp, setRateUp] = useState(String(share.rate_up_mbps))
@@ -109,8 +104,7 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
     !nodesReady || !nodeSetChanged || (picked.size > 0 && ssPicked <= 1)
 
   const optionsValid =
-    validNumber(quotaUpGb, 0, Number.MAX_SAFE_INTEGER) &&
-    validNumber(quotaDownGb, 0, Number.MAX_SAFE_INTEGER) &&
+    validNumber(quotaTotalGb, 0, Number.MAX_SAFE_INTEGER) &&
     validNumber(rateUp, 0, 100_000) &&
     validNumber(rateDown, 0, 100_000) &&
     validNumber(days, 1, 3650)
@@ -125,26 +119,14 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
         await updateShare(
           share.server_id,
           share.id,
-          Number(quotaUpGb),
-          Number(quotaDownGb),
           Number(rateUp),
           Number(rateDown),
           Number(days),
           nodeSetChanged ? [...picked] : undefined,
+          // 始终带上总额度：旧分享会借此从「合计/方向配额」迁移到只按总额度停用。
+          Number(quotaTotalGb),
         ),
       )
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleReset = async () => {
-    setError(null)
-    setBusy(true)
-    try {
-      onSaved(await resetShareUsage(share.server_id, share.id))
     } catch (e) {
       setError(String(e))
     } finally {
@@ -173,7 +155,7 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
       )}
       {!share.split_quota && (
         <p className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-400">
-          旧口径：当前只有一个合计配额。保存后改为上下行分开配额，历史合计用量计入下行，上行默认不限。
+          旧口径：当前只有一个合计配额。保存后统一按总额度停用，上下行只记录用量。
         </p>
       )}
       {error && (
@@ -238,28 +220,16 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
         )}
       </div>
 
+      <p className="text-xs text-neutral-500">
+        1 GB = 10 亿字节。只按公网双向总额度停用；上行、下行只记录用量，不再单独限额。
+      </p>
       <div className="grid grid-cols-2 gap-2">
-        <label className="flex flex-col gap-1 text-xs text-neutral-400">
-          上行配额（GB，0 = 不限）
-          <input
-            aria-label="上行配额（GB）"
-            type="number"
-            min={0}
-            value={quotaUpGb}
-            onChange={(e) => setQuotaUpGb(e.target.value)}
-            className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-100"
-          />
-        </label>
-        <label className="flex flex-col gap-1 text-xs text-neutral-400">
-          下行配额（GB，0 = 不限）
-          <input
-            aria-label="下行配额（GB）"
-            type="number"
-            min={0}
-            value={quotaDownGb}
-            onChange={(e) => setQuotaDownGb(e.target.value)}
-            className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-100"
-          />
+        <label className="col-span-2 flex flex-col gap-1 text-xs text-neutral-400">
+          公网双向总额度（GB，0 = 不限）
+          <input aria-label="总额度（GB）" type="number" min={0} value={quotaTotalGb}
+            onChange={(e) => setQuotaTotalGb(e.target.value)}
+            className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-100" />
+          <span>首次启用按原上下行合计 ×2 折算历史；之后累计公网实测。历史用量保留，调整额度不会清零。</span>
         </label>
         <label className="flex flex-col gap-1 text-xs text-neutral-400">
           有效期（天）
@@ -308,13 +278,6 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
         >
           {busy ? '保存中…' : '保存'}
         </button>
-        <ConfirmButton
-          label="重置用量"
-          confirmLabel="确认重置"
-          busyLabel="重置中…"
-          busy={busy}
-          onConfirm={() => void handleReset()}
-        />
         <button
           type="button"
           onClick={onClose}
@@ -325,7 +288,7 @@ export default function ShareEditPanel({ share, onClose, onSaved }: Props) {
         </button>
       </div>
       <p className="text-xs text-neutral-500">
-        重置只清空已用流量并解除停用，不改配额与到期时间；已导入的客户端仍使用原链接。
+        用量持续累计；编辑、重启不会清零。只有删除分享后新建链接才会重新计量。
       </p>
     </div>
   )

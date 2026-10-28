@@ -40,6 +40,7 @@ import type {
   UpdateInfo,
   UpdateServerResult,
   Upstream,
+  UpstreamEntryOptions,
 } from './types'
 
 export function listSubscriptions(): Promise<Subscription[]> {
@@ -147,24 +148,23 @@ export function listShareCandidates(serverId: number): Promise<ShareCandidate[]>
   return invoke('list_share_candidates_cmd', { serverId })
 }
 
-/** 新建分享。TLS 未就绪、空列表或准入失败都会被后端拒绝，前端不会走到。 */
+/** 新建分享。TLS 未就绪、空列表或准入失败都会被后端拒绝，前端不会走到。
+ *  配额只有公网双向总额度一个闸门；上下行用量由服务器记录、仅展示。 */
 export function createShare(
   serverId: number,
   nodeIds: string[],
-  quotaUpGb: number,
-  quotaDownGb: number,
   rateUpMbps: number,
   rateDownMbps: number,
   expiresInDays: number,
+  quotaTotalGb: number,
 ): Promise<ShareInfo> {
   return invoke('create_share_cmd', {
     serverId,
     nodeIds,
-    quotaUpGb,
-    quotaDownGb,
     rateUpMbps,
     rateDownMbps,
     expiresInDays,
+    quotaTotalGb,
   })
 }
 
@@ -173,22 +173,20 @@ export function createShare(
 export function updateShare(
   serverId: number,
   id: string,
-  quotaUpGb: number,
-  quotaDownGb: number,
   rateUpMbps: number,
   rateDownMbps: number,
   expiresInDays: number,
-  nodeIds?: string[],
+  nodeIds: string[] | undefined,
+  quotaTotalGb: number,
 ): Promise<ShareInfo> {
   return invoke('update_share_cmd', {
     serverId,
     id,
-    quotaUpGb,
-    quotaDownGb,
     rateUpMbps,
     rateDownMbps,
     expiresInDays,
     nodeIds,
+    quotaTotalGb,
   })
 }
 
@@ -405,6 +403,11 @@ export function listUpstreams(serverId: number): Promise<Upstream[]> {
   return invoke('list_upstreams_cmd', { serverId })
 }
 
+/** 入口协议下拉：已部署可复用的主节点 + 支持复用的协议白名单。 */
+export function listUpstreamEntryOptions(serverId: number): Promise<UpstreamEntryOptions> {
+  return invoke('list_upstream_entry_options_cmd', { serverId })
+}
+
 export function addUpstream(input: {
   serverId: number
   name: string
@@ -415,8 +418,16 @@ export function addUpstream(input: {
   password: string
   listenPort: number
   realityDest?: string
+  /** 复用已部署的主节点（优先于 entryProto） */
+  entryNodeId?: string | null
+  /** 复用尚未部署的协议（保存后先部署再接入出口） */
+  entryProto?: string | null
 }): Promise<Upstream> {
-  return invoke('add_upstream_cmd', { ...input })
+  return invoke('add_upstream_cmd', {
+    ...input,
+    entryNodeId: input.entryNodeId ?? null,
+    entryProto: input.entryProto ?? null,
+  })
 }
 
 /** 编辑出口（名称/协议/地址/端口/凭据/监听端口/伪装域名）。
@@ -437,6 +448,8 @@ export function updateUpstream(
     password?: string
     listenPort: number
     realityDest: string
+    entryNodeId?: string | null
+    entryProto?: string | null
   },
 ): Promise<Upstream> {
   return invoke('update_upstream_cmd', {
@@ -445,6 +458,8 @@ export function updateUpstream(
     // 空串一律当「不改」：后端把 Option::None 与空串都按「不动密码」处理，
     // 但显式传 undefined 更不容易被后来者当成「有意清空」
     password: input.password?.trim() ? input.password : undefined,
+    entryNodeId: input.entryNodeId ?? null,
+    entryProto: input.entryProto ?? null,
   })
 }
 
@@ -452,8 +467,17 @@ export function removeUpstream(id: number): Promise<void> {
   return invoke('remove_upstream_cmd', { id })
 }
 
-export function startUpstreamJob(serverId: number): Promise<number> {
-  return invoke('start_upstream_job_cmd', { serverId })
+/**
+ * 重新部署上游出口。
+ *
+ * `cleanupProtocols` 只在**删除复用出口**时传：行已删，后端读不到它原来的入口协议，
+ * 需要靠这份清单把主配置里残留的 `up-<id>` 用户/住宅出站摘掉。
+ */
+export function startUpstreamJob(
+  serverId: number,
+  cleanupProtocols: string[] = [],
+): Promise<number> {
+  return invoke('start_upstream_job_cmd', { serverId, cleanupProtocols })
 }
 
 export function probeEgressIp(id: number): Promise<string> {

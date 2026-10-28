@@ -63,6 +63,7 @@ interface Props {
   netSelectBusy: boolean
   netTunBusy: boolean
   proxyRepairBusy: boolean
+  proxyUnknown?: boolean
   /** 出口选择模式：auto = 交给「测速最快」，manual = 钉住某个节点 */
   exitMode: 'auto' | 'manual'
   /** 后端回读到的当前出口（auto 模式下它才是实际上生效的那个） */
@@ -88,6 +89,7 @@ export default function NetworkCard({
   netSelectBusy,
   netTunBusy,
   proxyRepairBusy,
+  proxyUnknown = false,
   exitMode,
   selectedNode,
   clientNodes,
@@ -111,7 +113,11 @@ export default function NetworkCard({
             {net === null
               ? '后端状态查询失败，可重启应用后再试'
               : net.running
-              ? proxyDetached
+              ? net.tun
+                ? 'TUN 已开启 · 智能分流（国内直连/国外走节点）'
+                : proxyUnknown
+                ? '系统代理状态未知 · 尚未确认接管'
+                : proxyDetached
                 ? '系统代理未接入 · 浏览器可能没有经过本应用'
                 : '系统代理已接入 · 智能分流（国内直连/国外走节点）'
                 : '一键开启：国内直连，国外经落地机节点'}

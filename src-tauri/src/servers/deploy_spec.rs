@@ -23,6 +23,30 @@ pub const XRAY_INSTALL_SHA: &str = "e741a4f56d368afbb9e5be3361b40c4552d3710d";
 pub const XRAY_INSTALL_SCRIPT_SHA256: &str =
     "7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555";
 
+/// 部署钉住的 Xray 版本。
+///
+/// **不要用 latest**：2026-10-14 Xray 把 REALITY 依赖切到 Go 1.27 同步后的实现，
+/// 26.10.21 与内置的 mihomo 1.19.10 握手不兼容——同一份节点参数（公钥/shortId/
+/// SNI 全对），Xray 26.10.21 客户端能过，mihomo 报
+/// `REALITY: authentication failed`；把服务端换成 26.3.27 后同一 mihomo 节点
+/// 602ms 通过（2026-10-28 圣克拉拉真机，复制配置在备用端口复现）。
+/// 这就是「新部署的服务器 REALITY 全 503、老服务器正常」的分界。
+///
+/// 长期应升级内置 mihomo；在那之前 Xray 只能跟着客户端的兼容面走。
+pub const XRAY_PIN_VERSION: &str = "v26.3.27";
+
+/// 探测远端是否已是钉住的 Xray 版本。
+///
+/// 不能用 `command -v xray`：SC 上已经装了 26.10.21，重部署时会被当成「已安装」
+/// 而跳过安装，版本永远不会回到兼容面。这里比对 `xray version` 第一行；只要不是
+/// 26.3.27（没装、版本漂移、输出异常）就返回非零，让部署重新执行安装命令。
+pub fn xray_installed_probe_cmd() -> String {
+    format!(
+        "xray version 2>/dev/null | head -n1 | grep -Fq 'Xray {} ('",
+        XRAY_PIN_VERSION.trim_start_matches('v')
+    )
+}
+
 /// Xray 安装命令：取固定 commit 的脚本 → **核对内容哈希** → 执行。
 ///
 /// 三处刻意的形状：
@@ -38,7 +62,7 @@ pub fn xray_install_cmd() -> String {
     format!(
         "curl -fL -o /tmp/xray-install.sh '{url}' \
          && echo '{XRAY_INSTALL_SCRIPT_SHA256}  /tmp/xray-install.sh' | sha256sum -c - \
-         && bash -c \"$(cat /tmp/xray-install.sh)\" @ install \
+         && bash -c \"$(cat /tmp/xray-install.sh)\" @ install --version {XRAY_PIN_VERSION} \
          && rm -f /tmp/xray-install.sh"
     )
 }
@@ -431,7 +455,23 @@ pub fn parse_xray_inbounds(json: &str) -> std::collections::HashMap<u16, XrayInb
         let Some(port) = ib.get("port").and_then(|p| p.as_u64()).map(|p| p as u16) else {
             continue;
         };
-        let client = ib.pointer("/settings/clients/0");
+        // 主配置里可能同时有主用户与复用入口的上游用户（up-<id>）。必须取主用户：
+        // 拿成上游用户会把它的 uuid/口令当成主凭据写回主节点，重部署后主节点立刻变砖。
+        // 老配置没有 email 字段 → find 落空，回落到第一个（仍是主用户）。
+        let client = ib
+            .pointer("/settings/clients")
+            .and_then(|v| v.as_array())
+            .and_then(|clients| {
+                clients
+                    .iter()
+                    .find(|c| {
+                        !c.get("email")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("")
+                            .starts_with("up-")
+                    })
+                    .or_else(|| clients.first())
+            });
         let reality = ib.pointer("/streamSettings/realitySettings");
         let s = |v: Option<&serde_json::Value>, k: &str| -> String {
             v.and_then(|x| x.get(k))
@@ -536,12 +576,19 @@ pub fn parse_singbox_ports(json: &str) -> Vec<(String, u16)> {
         .unwrap_or_default()
 }
 
+/// hysteria2 凭据：(密码, obfs 密码)。旧配置没有 obfs 块时第二项为 None。
+pub type Hy2Creds = (String, Option<String>);
+/// tuic 凭据：(uuid, 密码)。
+pub type TuicCreds = (String, String);
+
 /// 解析 sing-box 配置里 hysteria2/tuic 的凭据（重部署复用凭据用）。
 ///
 /// 形状见 [`singbox_config_json`]：`inbounds[]` 各带 `users[0]`——hysteria2 是
-/// `password`，tuic 是 `uuid` + `password`。返回 `(hy2 密码, tuic (uuid,密码))`，
-/// 缺失或内容损坏一律 `None`（调用方退回新生成）。
-pub fn parse_singbox_creds(json: &str) -> (Option<String>, Option<(String, String)>) {
+/// `password`，tuic 是 `uuid` + `password`。返回
+/// `(hy2 (密码, obfs 密码), tuic (uuid, 密码))`；旧配置没有 obfs 块时第二项为
+/// `None`（部署器会复用密码、另生成 obfs 密码）。缺失或内容损坏一律 `None`
+/// （调用方退回新生成）。
+pub fn parse_singbox_creds(json: &str) -> (Option<Hy2Creds>, Option<TuicCreds>) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return (None, None);
     };
@@ -565,7 +612,16 @@ pub fn parse_singbox_creds(json: &str) -> (Option<String>, Option<(String, Strin
         match ib.get("type").and_then(|t| t.as_str()).unwrap_or_default() {
             // 同一个配置里出现多个同类入站时取**第一个**能解析出凭据的：后一个覆盖
             // 前一个会让「复用」复用到一个与客户端不一致的值
-            "hysteria2" if hy2.is_none() => hy2 = field("password"),
+            "hysteria2" if hy2.is_none() => {
+                if let Some(pw) = field("password") {
+                    let obfs = ib
+                        .get("obfs")
+                        .and_then(|o| o.get("password"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                    hy2 = Some((pw, obfs));
+                }
+            }
             "tuic" if tuic.is_none() => {
                 if let (Some(u), Some(p)) = (field("uuid"), field("password")) {
                     tuic = Some((u, p));
@@ -626,6 +682,38 @@ pub fn parse_x25519_keys(stdout: &str) -> Result<(String, String), String> {
         (Some(p), Some(q)) => Ok((p, q)),
         _ => Err("x25519 输出缺少密钥".into()),
     }
+}
+
+/// 一条「复用主入口」的上游出口在服务端配置里的投影。
+///
+/// 主配置按 `entry_proto` 找到对应入站，给该出口追加一个独立用户（`up-<id>`），
+/// 再用路由规则把这个用户送到它的住宅代理出站。凭据（`credential`/`credential_password`）
+/// 是该出口自己的，绝不能抄主入口用户——否则同一入口上的多个出口会变成同一用户。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamRoute {
+    pub id: i64,
+    pub entry_proto: String,
+    pub entry_port: u16,
+    /// vless/vmess: uuid；trojan/hysteria2: 密码；tuic: uuid
+    pub credential: String,
+    /// tuic 的密码（其它协议空）
+    pub credential_password: String,
+    /// 住宅代理协议：socks5 | http
+    pub outbound_proto: String,
+    pub outbound_host: String,
+    pub outbound_port: u16,
+    pub outbound_username: String,
+    pub outbound_password: String,
+}
+
+/// 主配置里给上游出口使用的用户名/email（路由规则按它匹配）。
+pub fn upstream_user_tag(id: i64) -> String {
+    format!("up-{id}")
+}
+
+/// 主配置里住宅代理出站的 tag。
+pub fn upstream_outbound_tag(id: i64) -> String {
+    format!("out-up-{id}")
 }
 
 /// 多入站单条:一个协议一个列表项,由 xray_config_json_multi 组装。
@@ -708,10 +796,36 @@ pub fn parse_singbox_version(stdout: &str) -> Option<(u32, u32)> {
 ///
 /// `egress` 决定 freedom 出站解析域名时限定哪个地址族。只影响 **VPS → 目标域名**；
 /// 客户端发来的字面 IP、客户端侧 DNS/分流都不受它控制。
+///
+/// 生产部署走 [`xray_config_json_multi_routed`]；这个薄封装只给测试与分享克隆用
+/// （无复用出口 = 空路由），`allow(dead_code)` 是因为非测试构建里没有调用方。
+#[allow(dead_code)]
 pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily) -> String {
+    xray_config_json_multi_routed(entries, egress, &[])
+}
+
+/// 带复用入口的主配置渲染。`routes` 里的每个出口都会在**同协议**入站里追加一个
+/// `up-<id>` 用户，并配一个住宅代理出站 + `user=up-<id>` 路由。
+///
+/// 主用户带上 `email: "main"`：路由规则只匹配 `up-*`，主用户走默认的第一条出站
+/// （freedom），行为与没有路由块时逐字节等价；这个 email 也让解析器能把主用户与
+/// 上游用户区分开（见 `parse_xray_inbounds`）。
+pub fn xray_config_json_multi_routed(
+    entries: &[XrayInboundEntry],
+    egress: EgressFamily,
+    routes: &[UpstreamRoute],
+) -> String {
+    let xray_routes: Vec<&UpstreamRoute> = routes
+        .iter()
+        .filter(|r| matches!(r.entry_proto.as_str(), "vless" | "trojan" | "vmess"))
+        .collect();
     let inbounds: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
+            let mine: Vec<&&UpstreamRoute> = xray_routes
+                .iter()
+                .filter(|r| r.entry_proto == e.proto)
+                .collect();
             let mut stream = serde_json::Map::new();
             let settings = match e.proto {
                 "vless" => {
@@ -726,8 +840,18 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily
                             "shortIds": [e.short_id]
                         }),
                     );
+                    let mut clients = vec![serde_json::json!({
+                        "id": e.uuid, "flow": "xtls-rprx-vision", "email": "main"
+                    })];
+                    for r in &mine {
+                        clients.push(serde_json::json!({
+                            "id": r.credential,
+                            "flow": "xtls-rprx-vision",
+                            "email": upstream_user_tag(r.id)
+                        }));
+                    }
                     serde_json::json!({
-                        "clients": [{ "id": e.uuid, "flow": "xtls-rprx-vision" }],
+                        "clients": clients,
                         "decryption": "none"
                     })
                 }
@@ -743,7 +867,16 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily
                             "shortIds": [e.short_id]
                         }),
                     );
-                    serde_json::json!({ "clients": [{ "password": e.password }], "fallbacks": [] })
+                    let mut clients = vec![serde_json::json!({
+                        "password": e.password, "email": "main"
+                    })];
+                    for r in &mine {
+                        clients.push(serde_json::json!({
+                            "password": r.credential,
+                            "email": upstream_user_tag(r.id)
+                        }));
+                    }
+                    serde_json::json!({ "clients": clients, "fallbacks": [] })
                 }
                 _ => {
                     let path = if e.ws_path.is_empty() {
@@ -753,7 +886,16 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily
                     };
                     stream.insert("network".into(), "ws".into());
                     stream.insert("wsSettings".into(), serde_json::json!({ "path": path }));
-                    serde_json::json!({ "clients": [{ "id": e.uuid, "alterId": 0 }] })
+                    let mut clients = vec![serde_json::json!({
+                        "id": e.uuid, "alterId": 0, "email": "main"
+                    })];
+                    for r in &mine {
+                        clients.push(serde_json::json!({
+                            "id": r.credential, "alterId": 0,
+                            "email": upstream_user_tag(r.id)
+                        }));
+                    }
+                    serde_json::json!({ "clients": clients })
                 }
             };
             serde_json::json!({
@@ -769,8 +911,9 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily
             })
         })
         .collect();
-    serde_json::json!({
-        "inbounds": inbounds,
+    let mut outbounds = vec![serde_json::json!({
+        "protocol": "freedom",
+        "tag": "direct",
         // 出口地址族由服务器行的 egress_family 决定（默认 v4）。默认的 AsIs 把域名
         // 交给 Go 的解析器，按 RFC 6724 **优先 IPv6**，而 Google 对机房 IPv6 段的
         // 地理判定是坏的：同一个出口 IP，v6 出去报「Gemini 不支持你所在的地区」，
@@ -780,13 +923,58 @@ pub fn xray_config_json_multi(entries: &[XrayInboundEntry], egress: EgressFamily
         // domainStrategy 必须写在 settings 里：写出站顶层会被 Xray 忽略而**静默失效**。
         // 非 AsIs 会让下游 sockopt 的 domainStrategy/happyEyeballs 失效——这里要的
         // 正是它，不是副作用。
-        "outbounds": [{
-            "protocol": "freedom",
-            "tag": "direct",
-            "settings": { "domainStrategy": egress.xray_domain_strategy() }
-        }]
-    })
-    .to_string()
+        "settings": { "domainStrategy": egress.xray_domain_strategy() }
+    })];
+    for r in &xray_routes {
+        outbounds.push(serde_json::json!({
+            // socks5 在 Xray 里叫 "socks"；http 就是 "http"。
+            // settings 是扁平结构（address/port/user/pass），与入站的 servers[] 不同。
+            "protocol": if r.outbound_proto == "http" { "http" } else { "socks" },
+            "tag": upstream_outbound_tag(r.id),
+            "settings": {
+                "address": r.outbound_host,
+                "port": r.outbound_port,
+                "user": r.outbound_username,
+                "pass": r.outbound_password
+            }
+        }));
+    }
+    let rules: Vec<serde_json::Value> = xray_routes
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "type": "field",
+                "user": [upstream_user_tag(r.id)],
+                "outboundTag": upstream_outbound_tag(r.id)
+            })
+        })
+        .collect();
+    let mut root = serde_json::json!({
+        "inbounds": inbounds,
+        // 显式给 Xray 内部解析器配上游。新版 freedom 在 UseIPv4/UseIPv6 下会用它；
+        // 没有 dns.servers 时会打出 `features/dns: empty response`（2026-10-28
+        // 圣克拉拉真机日志）。注意：同一条日志更可能是 REALITY 握手失败后回落伪装
+        // 站时的次生现象，**不是**那次 503 的根因（根因见 XRAY_PIN_VERSION）；但让
+        // 内部解析器有确定的上游仍然必要，否则域名解析取决于本机 resolver 实现。
+        //
+        // queryStrategy 必须跟着出口族走：出口钉了 IPv4 却用 UseIP 查询，解析出的
+        // AAAA 目标仍会被出口丢掉，等于换一种方式失败。
+        "dns": {
+            "servers": ["8.8.8.8", "1.1.1.1"],
+            "queryStrategy": egress.xray_domain_strategy()
+        },
+        "outbounds": outbounds
+    });
+    if !rules.is_empty() {
+        // AsIs：域名保持未解析交给住宅代理远端解析（避开 DNS 污染/泄漏）。
+        // 主用户不命中任何规则，仍走首条 freedom 出站；freedom 自己的 domainStrategy
+        // 仍按出口族解析，与没有 routing 块时一致。
+        root["routing"] = serde_json::json!({
+            "domainStrategy": "AsIs",
+            "rules": rules
+        });
+    }
+    root.to_string()
 }
 
 /// SS 服务端配置（2022-blake3-aes-256-gcm）。
@@ -855,6 +1043,8 @@ pub fn singbox_cert_cmd() -> String {
 
 /// L2 sing-box 服务端配置：按选中协议生成 inbounds（hysteria2/tuic 同进程，
 /// 各自可缺省——只勾一个 L2 是合法部署形态，未选中的 inbound 不得出现）。
+/// `hy2` 的三元组是 `(端口, 密码, obfs 密码)`；obfs 密码由部署器生成，必须非空
+/// （客户端要带同一个值才能完成 Salamander 握手）。
 /// 注意：sing-box 两个入站**强制要求显式 tls 块**（无 certificate 直接 FATAL
 /// “TLS required”，实测 h2/tuic 部署失败 exit=3）。部署器先幂等生成自签证书
 /// （/etc/sing-box/self.crt/key），客户端 skip-cert-verify 跳过校验。
@@ -863,26 +1053,71 @@ pub fn singbox_cert_cmd() -> String {
 /// `0.0.0.0` 是纯 IPv4（实测 `ss -uln` 显示 `0.0.0.0:2097`），而香港这类机器
 /// 登记的是 IPv6 地址，客户端把 UDP 发到 `[v6]:2097` 永远到不了；Xray 的
 /// `0.0.0.0` 实际是双栈（`ss -tln` 显示 `*:443`），所以只有 h2/tuic 会坏。
+///
+/// 生产部署走 [`singbox_config_json_routed`]；这个薄封装只给测试与分享克隆用
+/// （无复用出口 = 空路由），`allow(dead_code)` 是因为非测试构建里没有调用方。
+#[allow(dead_code)]
 pub fn singbox_config_json(
-    hy2: Option<(u16, &str)>,
+    hy2: Option<(u16, &str, &str)>,
     tuic: Option<(u16, &str, &str)>,
     egress: EgressFamily,
     version: Option<(u32, u32)>,
     inbound_listen: &str,
 ) -> String {
+    singbox_config_json_routed(hy2, tuic, egress, version, inbound_listen, &[])
+}
+
+/// 带复用入口的 sing-box 配置。`routes` 里 hysteria2/tuic 的出口会在同协议入站里
+/// 追加一个带 `name=up-<id>` 的用户，并用 `auth_user` 路由把它送到住宅代理出站。
+/// 主用户也显式命名为 `main`，路由规则只匹配 `up-*`，主用户仍走首条 direct 出站。
+pub fn singbox_config_json_routed(
+    hy2: Option<(u16, &str, &str)>,
+    tuic: Option<(u16, &str, &str)>,
+    egress: EgressFamily,
+    version: Option<(u32, u32)>,
+    inbound_listen: &str,
+    routes: &[UpstreamRoute],
+) -> String {
+    let sb_routes: Vec<&UpstreamRoute> = routes
+        .iter()
+        .filter(|r| matches!(r.entry_proto.as_str(), "hysteria2" | "tuic"))
+        .collect();
     let mut inbounds = Vec::new();
-    if let Some((port, pw)) = hy2 {
+    if let Some((port, pw, obfs_pw)) = hy2 {
+        let mut users = vec![serde_json::json!({ "name": "main", "password": pw })];
+        for r in &sb_routes {
+            if r.entry_proto == "hysteria2" {
+                users.push(serde_json::json!({
+                    "name": upstream_user_tag(r.id),
+                    "password": r.credential
+                }));
+            }
+        }
         inbounds.push(serde_json::json!({
             "type": "hysteria2", "listen": inbound_listen, "listen_port": port,
+            // Salamander 混淆：裸 QUIC 的包特征会被 DPI 识别后限速。
+            "obfs": { "type": "salamander", "password": obfs_pw },
             "tls": {
                 "enabled": true,
                 "certificate_path": "/etc/sing-box/self.crt",
                 "key_path": "/etc/sing-box/self.key"
             },
-            "users": [{ "password": pw }]
+            "users": users
         }));
     }
     if let Some((port, uuid, pw)) = tuic {
+        let mut users = vec![serde_json::json!({
+            "name": "main", "uuid": uuid, "password": pw
+        })];
+        for r in &sb_routes {
+            if r.entry_proto == "tuic" {
+                users.push(serde_json::json!({
+                    "name": upstream_user_tag(r.id),
+                    "uuid": r.credential,
+                    "password": r.credential_password
+                }));
+            }
+        }
         inbounds.push(serde_json::json!({
             "type": "tuic", "listen": inbound_listen, "listen_port": port,
             "tls": {
@@ -895,7 +1130,7 @@ pub fn singbox_config_json(
                 // 客户端仍 503；补上该行后 gstatic 204，约 0.4s）。
                 "alpn": ["h3"]
             },
-            "users": [{ "uuid": uuid, "password": pw }]
+            "users": users
         }));
     }
     // 出口族写法按版本分支：
@@ -911,18 +1146,44 @@ pub fn singbox_config_json(
     let outbound = match version {
         Some((major, minor)) if (major, minor) >= (1, 12) => serde_json::json!({
             "type": "direct",
+            "tag": "direct",
             "domain_resolver": { "server": "egress", "strategy": egress.singbox_strategy() }
         }),
         Some(_) => serde_json::json!({
             "type": "direct",
+            "tag": "direct",
             "domain_strategy": egress.singbox_strategy()
         }),
-        None => serde_json::json!({ "type": "direct" }),
+        None => serde_json::json!({ "type": "direct", "tag": "direct" }),
     };
+    let mut outbounds = vec![outbound];
+    for r in &sb_routes {
+        outbounds.push(serde_json::json!({
+            "type": if r.outbound_proto == "http" { "http" } else { "socks" },
+            "tag": upstream_outbound_tag(r.id),
+            "server": r.outbound_host,
+            "server_port": r.outbound_port,
+            "username": r.outbound_username,
+            "password": r.outbound_password
+        }));
+    }
     let mut root = serde_json::json!({
         "inbounds": inbounds,
-        "outbounds": [outbound]
+        "outbounds": outbounds
     });
+    if !sb_routes.is_empty() {
+        // auth_user 匹配入站用户的 name（hysteria2/tuic 均支持）。主用户叫 main，
+        // 不命中这些规则，继续走首条 direct 出站。
+        root["route"] = serde_json::json!({
+            "rules": sb_routes
+                .iter()
+                .map(|r| serde_json::json!({
+                    "auth_user": [upstream_user_tag(r.id)],
+                    "outbound": upstream_outbound_tag(r.id)
+                }))
+                .collect::<Vec<_>>()
+        });
+    }
     if version.is_some_and(|(major, minor)| (major, minor) >= (1, 12)) {
         // 新版 DNS 格式：local 类型解析器按出站策略选族
         root["dns"] = serde_json::json!({
@@ -947,11 +1208,20 @@ mod firewall_tests {
     fn firewall_allow_cmd_uses_persistent_ufw_first() {
         let cmd = firewall_allow_cmd(&[("vless", 443), ("vmess", 8443)]);
         assert!(cmd.contains("command -v ufw"), "必须优先探测 ufw：{cmd}");
-        assert!(cmd.contains("ufw allow 443/tcp"), "缺少 443/tcp 放行：{cmd}");
-        assert!(cmd.contains("ufw allow 8443/tcp"), "缺少 8443/tcp 放行：{cmd}");
+        assert!(
+            cmd.contains("ufw allow 443/tcp"),
+            "缺少 443/tcp 放行：{cmd}"
+        );
+        assert!(
+            cmd.contains("ufw allow 8443/tcp"),
+            "缺少 8443/tcp 放行：{cmd}"
+        );
         let ufw_at = cmd.find("ufw allow 443/tcp").unwrap();
         let fallback_at = cmd.find("iptables -C INPUT").unwrap();
-        assert!(ufw_at < fallback_at, "ufw 分支必须排在 iptables 回退之前：{cmd}");
+        assert!(
+            ufw_at < fallback_at,
+            "ufw 分支必须排在 iptables 回退之前：{cmd}"
+        );
     }
 
     /// 套接字类型随协议：ss 是 tcp_and_udp，Hysteria2/TUIC 只绑 UDP，其余 TCP。

@@ -22,10 +22,10 @@ use crate::servers::deploy::{
     run_cmd, run_cmd_ok, write_remote_file, CONFIG_TIMEOUT, INSTALL_TIMEOUT,
 };
 use crate::servers::{CONNECT_TIMEOUT, PROBE_TIMEOUT};
+use crate::settings::SHARE_ACME_EMAIL_KEY;
 use crate::share::model::ShareTlsStatus;
 use crate::share::naming::{firewall_script_path, tls_dir};
 use crate::share::scripts;
-use crate::settings::SHARE_ACME_EMAIL_KEY;
 use crate::ssh::SshSession;
 use crate::state::AppState;
 use std::collections::HashSet;
@@ -201,10 +201,7 @@ pub(crate) async fn probe_python3(
     Ok(())
 }
 
-async fn install_certbot(
-    sess: &mut SshSession,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
+async fn install_certbot(sess: &mut SshSession, cancel: &AtomicBool) -> Result<(), String> {
     match run_cmd_ok(
         sess,
         cancel,
@@ -228,12 +225,8 @@ async fn install_certbot(
 /// SAN 自动检测 → IP 推导的 sslip.io 域名）→ DNS 交集 → 80 空闲 →
 /// 创建 vpnshare 用户与 TLS 目录 → 放行 80 → 安装 certbot → 签发 → 复制证书 →
 /// 续期钩子 → 校验到期时间 → **无论成败都撤回 80 放行**。
-pub async fn prepare_tls(
-    state: &Arc<AppState>,
-    server_id: i64,
-) -> Result<ShareTlsStatus, String> {
-    let (auth, server) =
-        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
+pub async fn prepare_tls(state: &Arc<AppState>, server_id: i64) -> Result<ShareTlsStatus, String> {
+    let (auth, server) = crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
     let configured = crate::servers::normalize_share_domain(&server.share_domain)?;
     let email = state
         .settings
@@ -469,12 +462,8 @@ pub async fn prepare_tls(
 /// 有效证书时，向导仍应显示可用的 HTTPS 域名并允许创建；首次配置时也能直接
 /// 用推导出的域名签发。ACME 邮箱只用于**签发新证书**（且为选填），不影响已有
 /// 证书的使用。
-pub async fn tls_status(
-    state: &Arc<AppState>,
-    server_id: i64,
-) -> Result<ShareTlsStatus, String> {
-    let (auth, server) =
-        crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
+pub async fn tls_status(state: &Arc<AppState>, server_id: i64) -> Result<ShareTlsStatus, String> {
+    let (auth, server) = crate::servers::load_auth(state, server_id).map_err(|e| e.to_string())?;
     let email = acme_email(state)?;
     let mut sess = SshSession::connect(
         effective_host(&server),

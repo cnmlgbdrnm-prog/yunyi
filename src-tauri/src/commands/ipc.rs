@@ -183,11 +183,10 @@ pub async fn create_share_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
     node_ids: Vec<String>,
-    quota_up_gb: u64,
-    quota_down_gb: u64,
     rate_up_mbps: u32,
     rate_down_mbps: u32,
     expires_in_days: u32,
+    quota_total_gb: u64,
 ) -> R<crate::share::ShareInfo> {
     crate::share::create_share(
         state.inner(),
@@ -195,8 +194,7 @@ pub async fn create_share_cmd(
             server_id,
             node_ids,
             options: crate::share::ShareOptions {
-                quota_up_bytes: crate::share::quota_gb_to_bytes(quota_up_gb),
-                quota_down_bytes: crate::share::quota_gb_to_bytes(quota_down_gb),
+                quota_total_bytes: crate::share::quota_gb_to_bytes(quota_total_gb),
                 rate_up_mbps,
                 rate_down_mbps,
                 expires_in_days,
@@ -212,20 +210,18 @@ pub async fn update_share_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     server_id: i64,
     id: String,
-    quota_up_gb: u64,
-    quota_down_gb: u64,
     rate_up_mbps: u32,
     rate_down_mbps: u32,
     expires_in_days: u32,
     node_ids: Option<Vec<String>>,
+    quota_total_gb: u64,
 ) -> R<crate::share::ShareInfo> {
     crate::share::update_share_with_nodes(
         state.inner(),
         server_id,
         &id,
         crate::share::ShareOptions {
-            quota_up_bytes: crate::share::quota_gb_to_bytes(quota_up_gb),
-            quota_down_bytes: crate::share::quota_gb_to_bytes(quota_down_gb),
+            quota_total_bytes: crate::share::quota_gb_to_bytes(quota_total_gb),
             rate_up_mbps,
             rate_down_mbps,
             expires_in_days,
@@ -474,6 +470,15 @@ pub fn list_upstreams_cmd(
     list_upstreams(state.inner().clone(), server_id)
 }
 
+/// 上游出口的「入口协议」下拉：已部署可复用的主节点 + 支持复用的协议。
+#[tauri::command]
+pub fn list_upstream_entry_options_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+) -> R<crate::domain::UpstreamEntryOptions> {
+    list_upstream_entry_options(state.inner().clone(), server_id)
+}
+
 /// realityDest 缺省时用与部署向导同一个默认伪装域名（两处不一致会让用户以为配置没生效）。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -488,6 +493,8 @@ pub fn add_upstream_cmd(
     password: String,
     listen_port: Option<i64>,
     reality_dest: Option<String>,
+    entry_node_id: Option<String>,
+    entry_proto: Option<String>,
 ) -> R<Upstream> {
     add_upstream(
         state.inner().clone(),
@@ -502,6 +509,8 @@ pub fn add_upstream_cmd(
             listen_port: listen_port.unwrap_or(servers::upstream::DEFAULT_LISTEN_PORT as i64),
             reality_dest: reality_dest
                 .unwrap_or_else(|| servers::upstream::DEFAULT_REALITY_DEST.to_string()),
+            entry_node_id,
+            entry_proto: entry_proto.unwrap_or_default(),
         },
     )
 }
@@ -522,6 +531,8 @@ pub fn update_upstream_cmd(
     password: Option<String>,
     listen_port: i64,
     reality_dest: String,
+    entry_node_id: Option<String>,
+    entry_proto: Option<String>,
 ) -> R<Upstream> {
     update_upstream(
         state.inner().clone(),
@@ -535,6 +546,8 @@ pub fn update_upstream_cmd(
             password,
             listen_port,
             reality_dest,
+            entry_node_id,
+            entry_proto: entry_proto.unwrap_or_default(),
         },
     )
 }
@@ -545,8 +558,16 @@ pub fn remove_upstream_cmd(state: tauri::State<'_, Arc<AppState>>, id: i64) -> R
 }
 
 #[tauri::command]
-pub fn start_upstream_job_cmd(state: tauri::State<'_, Arc<AppState>>, server_id: i64) -> R<i64> {
-    start_upstream_job(state.inner().clone(), server_id)
+pub fn start_upstream_job_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+    cleanup_protocols: Option<Vec<String>>,
+) -> R<i64> {
+    start_upstream_job(
+        state.inner().clone(),
+        server_id,
+        cleanup_protocols.unwrap_or_default(),
+    )
 }
 
 #[tauri::command]
@@ -1004,9 +1025,7 @@ pub async fn refresh_link_status_cmd(
 
 /// 最近一轮后端轮询的链路状态快照（纯读内存，不发 SSH）。
 #[tauri::command]
-pub fn relay_statuses_cmd(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> R<HashMap<i64, LinkStatus>> {
+pub fn relay_statuses_cmd(state: tauri::State<'_, Arc<AppState>>) -> R<HashMap<i64, LinkStatus>> {
     relay_statuses(state.inner())
 }
 

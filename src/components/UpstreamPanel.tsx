@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   addUpstream,
   listNodes,
+  listUpstreamEntryOptions,
   listUpstreams,
   probeEgressIp,
   removeUpstream,
@@ -14,12 +15,11 @@ import {
   startUpstreamJob,
   updateUpstream,
 } from '../api'
-import type { Upstream } from '../api/types'
+import type { Upstream, UpstreamEntryOptions } from '../api/types'
 import { bindJob, jobForTarget, progressView, release, reserveJob, useJobTerminal, useTrackedJobs } from '../jobs/registry'
 import JobProgressPanel from './JobProgressPanel'
 import UpstreamForm, { type UpstreamFormValues } from './upstream/UpstreamForm'
 import UpstreamRow from './upstream/UpstreamRow'
-import { nodesToVerify } from '../utils/postDeployVerify'
 import { DEFAULT_REALITY_DEST } from '../utils/realityDest'
 
 const DEFAULT_LISTEN_PORT = '443'
@@ -32,6 +32,31 @@ const EMPTY_FORM: UpstreamFormValues = {
   password: '',
   listenPort: DEFAULT_LISTEN_PORT,
   realityDest: DEFAULT_REALITY_DEST,
+  entry: '',
+}
+
+/** 默认入口：优先复用第一台已部署的主入站；一条都没有时选第一个支持复用的协议
+ *  （保存后会先部署它）。返回值是表单的 entry 编码。 */
+function defaultEntry(options: UpstreamEntryOptions | null): string {
+  const first = options?.deployed[0]
+  if (first != null) return `node:${first.node_id}`
+  const proto = options?.supported[0]
+  return proto != null ? `proto:${proto}` : ''
+}
+
+/** 把表单的 entry 编码拆成 IPC 需要的两组参数。legacy 时两项都为空。 */
+function parseEntry(entry: string): {
+  entryNodeId: string | null
+  entryProto: string | null
+  legacy: boolean
+} {
+  if (entry.startsWith('node:')) {
+    return { entryNodeId: entry.slice('node:'.length), entryProto: null, legacy: false }
+  }
+  if (entry.startsWith('proto:')) {
+    return { entryNodeId: null, entryProto: entry.slice('proto:'.length), legacy: false }
+  }
+  return { entryNodeId: null, entryProto: null, legacy: entry === 'legacy' }
 }
 
 export default function UpstreamPanel({
@@ -55,6 +80,8 @@ export default function UpstreamPanel({
   // 改过但还没重新部署的出口——远端仍是老配置，行上要留痕
   const [staleEdits, setStaleEdits] = useState<Set<number>>(new Set())
   const [form, setForm] = useState<UpstreamFormValues>(EMPTY_FORM)
+  // 入口协议下拉的数据源。null = 还没读到（表单里下拉显示「读取中」）。
+  const [entryOptions, setEntryOptions] = useState<UpstreamEntryOptions | null>(null)
   // 部署任务与「部署后自动验证」的进度。此前上游部署在 UI 上完全不可见：
   // 出口行一落库就显示，任务若失败只表现为「节点一直不出现」，没有第二处线索。
   // 两个任务都用本面板的 server id 作目标——同一页展开多个面板时不会互相串进度。
@@ -75,15 +102,37 @@ export default function UpstreamPanel({
     }
   }, [serverId])
 
+  const loadEntryOptions = useCallback(async (): Promise<UpstreamEntryOptions | null> => {
+    try {
+      const opts = await listUpstreamEntryOptions(serverId)
+      setEntryOptions(opts)
+      return opts
+    } catch (e) {
+      setError(String(e))
+      return null
+    }
+  }, [serverId])
+
   useEffect(() => {
     void refresh()
-  }, [refresh])
+    void loadEntryOptions()
+  }, [refresh, loadEntryOptions])
 
-  /** 上游出口写回的节点协议恒为 vless（专用实例走 REALITY），据此筛出出口节点 */
+  /** 出口写回的节点 id：入口协议可以随意切换（vless/trojan/vmess/h2/tuic），
+   *  不能再按「协议恒为 vless」筛选；按 upstreams.node_id 精确定位。
+   *  从 DB 现读而不是用 rows state：新增出口后 refresh 还没落地时就要送验。 */
+  const upstreamNodeIds = useCallback(async (): Promise<string[]> => {
+    const ups = await listUpstreams(serverId)
+    return ups.map((u) => u.node_id).filter((id): id is string => id != null)
+  }, [serverId])
+
   const runVerify = useCallback(async () => {
     const ticket = reserveJob('verify', [String(serverId)])
     try {
-      const ids = nodesToVerify(await listNodes(), serverHost, ['vless']).map((n) => n.id)
+      const wanted = new Set(await upstreamNodeIds())
+      const ids = (await listNodes())
+        .filter((n) => wanted.has(n.id) && n.addr === serverHost)
+        .map((n) => n.id)
       setVerifyFailures([])
       if (ids.length === 0) {
         release(ticket)
@@ -94,23 +143,22 @@ export default function UpstreamPanel({
       release(ticket)
       setVerifyFailures([`无法启动自动验证：${String(e)}`])
     }
-  }, [serverHost, serverId])
+  }, [serverHost, serverId, upstreamNodeIds])
 
-  /** 验证终态读回：本次送验的节点里谁还带着 last_check_error（节点协议恒为 vless，
-   *  按 serverHost 重新筛一遍即可，不必记「刚才送了哪几个」——那份记忆切页就没） */
+  /** 验证终态读回：本次送验的节点里谁还带着 last_check_error */
   const readVerifyResult = useCallback(async () => {
     try {
+      const wanted = new Set(await upstreamNodeIds())
       const nodes = await listNodes()
-      const sentIds = nodesToVerify(nodes, serverHost, ['vless']).map((n) => n.id)
       setVerifyFailures(
         nodes
-          .filter((n) => sentIds.includes(n.id) && n.last_check_error)
+          .filter((n) => wanted.has(n.id) && n.last_check_error)
           .map((n) => `${n.name}：${n.last_check_error}`),
       )
     } catch {
       /* 回读失败不阻断：终态已经显示在进度面板上 */
     }
-  }, [serverHost])
+  }, [upstreamNodeIds])
 
   // 部署终态 → 刷新出口列表 + 自动验证刚写回的节点；验证终态 → 列出没连上的节点。
   // 事件丢失由注册表那个唯一的 5s 对账兜底。
@@ -120,6 +168,8 @@ export default function UpstreamPanel({
       return
     }
     void refresh()
+    // 部署可能新建了入口协议（选「尚未部署」的协议时），下拉要跟着更新
+    void loadEntryOptions()
     void runVerify()
   })
   useJobTerminal('verify', () => {
@@ -164,6 +214,11 @@ export default function UpstreamPanel({
 
   const handleAdd = async () => {
     setError(null)
+    const parsed = parseEntry(form.entry)
+    if (!parsed.legacy && parsed.entryNodeId == null && parsed.entryProto == null) {
+      setError('请选择入口协议')
+      return
+    }
     setAdding(true)
     try {
       await addUpstream({
@@ -174,14 +229,18 @@ export default function UpstreamPanel({
         port: Number(form.port),
         username: form.username.trim(),
         password: form.password,
-        listenPort: Number(form.listenPort),
-        realityDest: form.realityDest.trim() || undefined,
+        // 复用入口不占独立端口；legacy 才需要这两项
+        listenPort: parsed.legacy ? Number(form.listenPort) : 0,
+        realityDest: parsed.legacy ? form.realityDest.trim() || undefined : undefined,
+        entryNodeId: parsed.entryNodeId,
+        entryProto: parsed.entryProto,
       })
       // 落库成功即触发部署：否则用户会看到一条「存在但服务器上还没有」的出口
-      await watchJob(startUpstreamJob(serverId))
+      await watchJob(startUpstreamJob(serverId, []))
       resetForm()
       setShowForm(false)
       await refresh()
+      void loadEntryOptions()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -189,20 +248,25 @@ export default function UpstreamPanel({
     }
   }
 
-  const handleRemove = (id: number) =>
-    withBusy(id, async () => {
-      await removeUpstream(id)
-      // 远端配置要跟着重渲染，否则端口还开着而界面上已经没这条了
-      await watchJob(startUpstreamJob(serverId))
+  const handleRemove = (u: Upstream) =>
+    withBusy(u.id, async () => {
+      await removeUpstream(u.id)
+      // 远端配置要跟着重渲染。复用出口的行已删，必须把它原来的入口协议带过去，
+      // 主配置才会摘掉 up-<id> 用户与住宅出站（否则凭据一直留在主配置里）。
+      await watchJob(
+        startUpstreamJob(serverId, u.entry_proto ? [u.entry_proto] : []),
+      )
       await refresh()
     })
 
-  const handleRedeploy = (id: number) =>
-    withBusy(id, async () => {
-      await watchJob(startUpstreamJob(serverId))
+  const handleRedeploy = (u: Upstream) =>
+    withBusy(u.id, async () => {
+      await watchJob(
+        startUpstreamJob(serverId, u.entry_proto ? [u.entry_proto] : []),
+      )
       setStaleEdits((s) => {
         const next = new Set(s)
-        next.delete(id)
+        next.delete(u.id)
         return next
       })
       await refresh()
@@ -212,6 +276,10 @@ export default function UpstreamPanel({
    *  后端撞车时会自动改用空闲端口，所以按返回值回显：与用户填的不同就说明被占了。 */
   const handleSavePort = (u: Upstream, raw: string) =>
     withBusy(u.id, async () => {
+      if (u.entry_proto) {
+        setError('复用入口的端口由主协议决定；要换入口请在「编辑」里切换入口协议')
+        return
+      }
       const port = Number(raw)
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         setError('监听端口必须是 1-65535 之间的整数')
@@ -238,11 +306,25 @@ export default function UpstreamPanel({
       await refresh()
     })
 
-  /** 把表单切成「编辑这条出口」，字段按现有值预填（密码留空 = 不改） */
+  /** 把表单切成「编辑这条出口」，字段按现有值预填（密码留空 = 不改）。
+   *  入口优先用 node id（能精确指向已部署的主节点）；节点已失效就回落 `proto:`，
+   *  保存后由部署按协议重新建立入口。旧专用实例保持 legacy。 */
+  const entryFor = (u: Upstream): string => {
+    if (!u.entry_proto) return 'legacy'
+    if (
+      u.entry_node_id &&
+      entryOptions?.deployed.some((o) => o.node_id === u.entry_node_id)
+    ) {
+      return `node:${u.entry_node_id}`
+    }
+    return `proto:${u.entry_proto}`
+  }
+
   const startEdit = (u: Upstream) => {
     setError(null)
     setNotice(null)
     setEditingId(u.id)
+    void loadEntryOptions()
     setForm({
       name: u.name,
       proto: u.proto,
@@ -252,6 +334,7 @@ export default function UpstreamPanel({
       password: '',
       listenPort: String(u.listen_port),
       realityDest: u.reality_dest,
+      entry: entryFor(u),
     })
     setShowForm(true)
   }
@@ -261,13 +344,18 @@ export default function UpstreamPanel({
     const id = editingId
     if (id == null) return
     return withBusy(id, async () => {
+      const parsed = parseEntry(form.entry)
+      if (!parsed.legacy && parsed.entryNodeId == null && parsed.entryProto == null) {
+        setError('请选择入口协议')
+        return
+      }
       const p = Number(form.port)
-      const lp = Number(form.listenPort)
       if (!Number.isInteger(p) || p < 1 || p > 65535) {
         setError('上游端口必须是 1-65535 之间的整数')
         return
       }
-      if (!Number.isInteger(lp) || lp < 1 || lp > 65535) {
+      const lp = parsed.legacy ? Number(form.listenPort) : 0
+      if (parsed.legacy && (!Number.isInteger(lp) || lp < 1 || lp > 65535)) {
         setError('监听端口必须是 1-65535 之间的整数')
         return
       }
@@ -280,18 +368,23 @@ export default function UpstreamPanel({
         // 留空 = 不改：凭据不回显，把空串发下去等于把已存口令擦掉
         password: form.password.trim() ? form.password : undefined,
         listenPort: lp,
-        realityDest: form.realityDest.trim(),
+        realityDest: parsed.legacy ? form.realityDest.trim() : '',
+        entryNodeId: parsed.entryNodeId,
+        entryProto: parsed.entryProto,
       })
       setNotice(
-        saved.listen_port === lp
-          ? '改动已保存，点「重新部署」后在远端生效'
-          : `监听端口 ${lp} 已被占用，已自动改用 ${saved.listen_port}，点「重新部署」后在远端生效`,
+        parsed.legacy
+          ? saved.listen_port === lp
+            ? '改动已保存，点「重新部署」后在远端生效'
+            : `监听端口 ${lp} 已被占用，已自动改用 ${saved.listen_port}，点「重新部署」后在远端生效`
+          : '改动已保存，点「重新部署」后在远端生效（复用入口的端口由主协议决定）',
       )
       setEditingId(null)
       setShowForm(false)
       resetForm()
       setStaleEdits((s) => new Set(s).add(id))
       await refresh()
+      void loadEntryOptions()
     })
   }
 
@@ -318,7 +411,8 @@ export default function UpstreamPanel({
       )}
       {rows.length === 0 && (
         <p className="mt-1 text-xs text-neutral-500">
-          还没有上游出口。添加后会在这台中转机上部署一个专用 Xray 实例，并写回一条普通节点。
+          还没有上游出口。添加后会复用这台中转机上已部署的入口协议（没有的话先选一条部署），
+          再写回一条普通节点；不会为每条出口重复开端口。
         </p>
       )}
       {rows.length > 0 && (
@@ -338,8 +432,8 @@ export default function UpstreamPanel({
               onCancelEditPort={() => setEditing(null)}
               onEdit={() => startEdit(u)}
               onProbe={() => void handleProbe(u.id)}
-              onRedeploy={() => void handleRedeploy(u.id)}
-              onRemove={() => void handleRemove(u.id)}
+              onRedeploy={() => void handleRedeploy(u)}
+              onRemove={() => void handleRemove(u)}
             />
           ))}
         </ul>
@@ -351,6 +445,13 @@ export default function UpstreamPanel({
           onClick={() => {
             // 从编辑态切回新增：字段要清干净，否则会把上一条的值带进新出口
             if (editingId != null) resetForm()
+            if (!showForm) {
+              void (async () => {
+                const loaded = await loadEntryOptions()
+                const opts = loaded ?? entryOptions
+                setForm((f) => ({ ...f, entry: f.entry || defaultEntry(opts) }))
+              })()
+            }
             setShowForm((v) => !v)
           }}
           className="rounded bg-neutral-800 px-3 py-1 text-xs text-sky-300 hover:bg-neutral-700"
@@ -365,6 +466,7 @@ export default function UpstreamPanel({
           onChange={setField}
           editing={editingId != null}
           adding={adding}
+          options={entryOptions}
           onSubmit={() => void (editingId != null ? handleSaveEdit() : handleAdd())}
           onCancel={() => {
             resetForm()

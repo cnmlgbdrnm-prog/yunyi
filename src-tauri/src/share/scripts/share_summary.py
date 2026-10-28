@@ -53,13 +53,14 @@ def main():
             except (ValueError, KeyError):
                 continue
             units = {}
-            for suffix in ("", "-gateway", "-xray", "-singbox", "-ss"):
+            for suffix in ("", "-gateway", "-xray", "-singbox", "-ss", "-meter"):
                 units[f"vpnshare-{mid}{suffix}"] = unit_state(f"vpnshare-{mid}{suffix}")
             out.append(
                 {
                     "kind": "new",
                     "id": mid,
                     "manifest": m,
+                    "meter": read_json(os.path.join(d, "meter-status.json")),
                     "usage": read_json(os.path.join(d, "usage.json")),
                     "last_access": read_json(os.path.join(d, "last_access.json")),
                     "units": units,

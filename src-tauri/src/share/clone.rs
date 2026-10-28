@@ -21,7 +21,7 @@ pub struct ShareNodeSpec {
     pub internal_port: u16,
     pub transport: &'static str, // tcp | udp | tcp_and_udp
     pub original_params: serde_json::Value,
-    pub new_credential: String,       // vless/vmess: uuid; trojan/hy2/ss: password; tuic: uuid
+    pub new_credential: String, // vless/vmess: uuid; trojan/hy2/ss: password; tuic: uuid
     pub new_password: Option<String>, // 仅 tuic 需要
     pub source: ShareSource,
 }
@@ -72,7 +72,10 @@ pub fn clone_configs(
     let ss_config = if ss_specs.is_empty() {
         None
     } else {
-        Some(clone_ss(main_ss.ok_or("缺少 Shadowsocks 主配置")?, &ss_specs)?)
+        Some(clone_ss(
+            main_ss.ok_or("缺少 Shadowsocks 主配置")?,
+            &ss_specs,
+        )?)
     };
 
     let mut share_nodes = Vec::new();
@@ -87,9 +90,8 @@ pub fn clone_configs(
             }
             "tuic" => {
                 params["uuid"] = serde_json::Value::String(s.new_credential.clone());
-                params["password"] = serde_json::Value::String(
-                    s.new_password.clone().ok_or("tuic 缺新密码")?,
-                );
+                params["password"] =
+                    serde_json::Value::String(s.new_password.clone().ok_or("tuic 缺新密码")?);
             }
             "ss" => {
                 params["password"] = serde_json::Value::String(s.new_credential.clone());
@@ -121,8 +123,9 @@ pub fn clone_configs(
     let (yaml, _) =
         crate::config::build_yaml_with_privacy(&share_nodes, false, &[], &[], privacies)
             .map_err(|e| e.to_string())?;
-    let (singbox_json, _) = crate::config::singbox::build_singbox_with_privacy(&share_nodes, privacies)
-        .map_err(|e| e.to_string())?;
+    let (singbox_json, _) =
+        crate::config::singbox::build_singbox_with_privacy(&share_nodes, privacies)
+            .map_err(|e| e.to_string())?;
     Ok(ClonedConfigs {
         xray_config,
         singbox_config,
@@ -131,6 +134,39 @@ pub fn clone_configs(
         yaml,
         singbox_json,
     })
+}
+
+/// 主配置里给复用上游出口用的出站 tag（见 `servers::deploy_spec::upstream_outbound_tag`）。
+fn is_upstream_outbound_tag(tag: &str) -> bool {
+    tag.starts_with("out-up-")
+}
+
+/// 取规则里的字符串列表字段：Xray/sing-box 都允许 string 或 string[]。
+fn string_list(value: Option<&serde_json::Value>) -> Vec<&str> {
+    match value {
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
+        _ => vec![],
+    }
+}
+
+/// 这条规则是不是「复用上游出口」的专用规则。分享是给外部用户的快照，必须剔除：
+/// 规则本身不会命中分享用户，但出站里带着住宅代理的 SOCKS/HTTP 凭据——把整个
+/// 主配置原样复制过去，等于把凭据交给分享实例。宁可分享实例没有住宅线路，也不能泄漏。
+fn rule_targets_upstream(rule: &serde_json::Value) -> bool {
+    rule.get("outboundTag")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_upstream_outbound_tag)
+        || rule
+            .get("outbound")
+            .and_then(|v| v.as_str())
+            .is_some_and(is_upstream_outbound_tag)
+        || string_list(rule.get("user"))
+            .iter()
+            .any(|u| u.starts_with("up-"))
+        || string_list(rule.get("auth_user"))
+            .iter()
+            .any(|u| u.starts_with("up-"))
 }
 
 fn clone_xray(
@@ -181,15 +217,12 @@ fn clone_xray(
             })
             .ok_or(label)?;
         if s.source == ShareSource::Upstream {
-            let tag = orig
-                .get("tag")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    format!(
-                        "上游配置里 {}:{} 入站缺 tag，无法配对出站",
-                        s.protocol, s.original_port
-                    )
-                })?;
+            let tag = orig.get("tag").and_then(|v| v.as_str()).ok_or_else(|| {
+                format!(
+                    "上游配置里 {}:{} 入站缺 tag，无法配对出站",
+                    s.protocol, s.original_port
+                )
+            })?;
             if !inbound_tags.insert(tag.to_string()) {
                 return Err(format!("入站 tag 重复: {tag}"));
             }
@@ -239,6 +272,10 @@ fn clone_xray(
         if let Some(list) = root.get("outbounds").and_then(|v| v.as_array()) {
             for ob in list {
                 if let Some(tag) = ob.get("tag").and_then(|v| v.as_str()) {
+                    // 住宅代理出站不进分享：它的 settings 里是明文 SOCKS/HTTP 凭据。
+                    if is_upstream_outbound_tag(tag) {
+                        continue;
+                    }
                     if !outbound_tags.insert(tag.to_string()) {
                         return Err(format!("出站 tag 重复: {tag}"));
                     }
@@ -251,7 +288,7 @@ fn clone_xray(
                 domain_strategy = routing.get("domainStrategy").cloned();
             }
             if let Some(rules) = routing.get("rules").and_then(|v| v.as_array()) {
-                main_rules.extend(rules.iter().cloned());
+                main_rules.extend(rules.iter().filter(|r| !rule_targets_upstream(r)).cloned());
             }
         }
     }
@@ -325,11 +362,7 @@ fn clone_xray(
     Ok(out.to_string())
 }
 
-fn clone_singbox(
-    main: &str,
-    specs: &[&ShareNodeSpec],
-    share_id: &str,
-) -> Result<String, String> {
+fn clone_singbox(main: &str, specs: &[&ShareNodeSpec], share_id: &str) -> Result<String, String> {
     let root: serde_json::Value = serde_json::from_str(main).map_err(|e| e.to_string())?;
     let main_inbounds = root
         .get("inbounds")
@@ -345,9 +378,7 @@ fn clone_singbox(
                     && ib.get("listen_port").and_then(|v| v.as_u64())
                         == Some(s.original_port as u64)
             })
-            .ok_or_else(|| {
-                format!("主配置里找不到 {}:{} 入站", s.protocol, s.original_port)
-            })?;
+            .ok_or_else(|| format!("主配置里找不到 {}:{} 入站", s.protocol, s.original_port))?;
         let mut ib = orig.clone();
         ib["listen"] = serde_json::json!("127.0.0.1");
         ib["listen_port"] = serde_json::json!(s.internal_port);
@@ -378,10 +409,34 @@ fn clone_singbox(
         inbounds.push(ib);
     }
     let mut out = serde_json::json!({ "inbounds": inbounds });
-    for key in ["outbounds", "route", "dns"] {
-        if let Some(v) = root.get(key) {
-            out[key] = v.clone();
+    // 与 Xray 同一条纪律：剔除住宅出站与其路由规则，既不把凭据带进分享实例，
+    // 也不让分享用户有机会命中它们。
+    if let Some(list) = root.get("outbounds").and_then(|v| v.as_array()) {
+        let filtered: Vec<_> = list
+            .iter()
+            .filter(|o| {
+                !o.get("tag")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(is_upstream_outbound_tag)
+            })
+            .cloned()
+            .collect();
+        out["outbounds"] = serde_json::json!(filtered);
+    }
+    if let Some(route) = root.get("route") {
+        let mut route = route.clone();
+        if let Some(rules) = route.get("rules").and_then(|v| v.as_array()) {
+            let filtered: Vec<_> = rules
+                .iter()
+                .filter(|r| !rule_targets_upstream(r))
+                .cloned()
+                .collect();
+            route["rules"] = serde_json::json!(filtered);
         }
+        out["route"] = route;
+    }
+    if let Some(dns) = root.get("dns") {
+        out["dns"] = dns.clone();
     }
     Ok(out.to_string())
 }

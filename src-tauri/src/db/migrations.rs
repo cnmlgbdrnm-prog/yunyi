@@ -313,6 +313,17 @@ CREATE INDEX idx_server_alerts_opened_at ON server_alerts(opened_at);
 -- 空串 = 未配置，新建分享会被拒绝（绝不退回 HTTP）。
 ALTER TABLE servers ADD COLUMN share_domain TEXT NOT NULL DEFAULT '';
 "#,
+    r#"
+-- v19：上游出口复用主入口。此前每条出口都在专用 xray-upstream 实例里再开一个
+-- VLESS+REALITY 端口（listen_port）；用户已有协议时既多开端口又不能切换协议。
+-- entry_proto 非空 = 复用主配置里同协议的入站（entry_port 是它的端口，部署回写时
+-- 校正；0 = 该协议尚未部署，下一次部署会补上）。entry_node_id 指向复用入口的主节点，
+-- 仅用于展示与失效检测；真正渲染按 entry_proto 匹配（主配置每协议一个入站）。
+-- 存量行 entry_proto 为空 = 保持旧专用实例语义，逐字节不变。
+ALTER TABLE upstreams ADD COLUMN entry_node_id TEXT;
+ALTER TABLE upstreams ADD COLUMN entry_proto TEXT NOT NULL DEFAULT '';
+ALTER TABLE upstreams ADD COLUMN entry_port INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 /// 当前 schema 版本（= 已应用迁移条数）。测试断言用，避免把版本号写死在断言里——

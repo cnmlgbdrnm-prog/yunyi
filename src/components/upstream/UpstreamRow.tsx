@@ -1,5 +1,6 @@
-// 上游出口列表的一行：名称/协议/地址、行内改监听端口、编辑/探测/重部署/删除。
+// 上游出口列表的一行：名称/协议/地址、复用入口或旧实例监听端口、编辑/探测/重部署/删除。
 import type { Upstream } from '../../api/types'
+import { entryProtoLabel } from '../../utils/upstreamEntry'
 
 export default function UpstreamRow({
   u,
@@ -37,7 +38,13 @@ export default function UpstreamRow({
           {u.name}{' '}
           <span className="text-xs text-neutral-500">
             {u.proto} {u.host}:{u.port} ·{' '}
-            {editingValue != null ? (
+            {u.entry_proto ? (
+              <>
+                入口 {entryProtoLabel(u.entry_proto)}
+                {u.entry_port > 0 ? ` · 复用端口 ${u.entry_port}` : ' · 待部署'}
+                {stale && <span className="ml-1 text-amber-400">（已改，重新部署后生效）</span>}
+              </>
+            ) : editingValue != null ? (
               <>
                 监听{' '}
                 <input

@@ -6,7 +6,7 @@ use crate::domain::{
     AdoptLinkInput, BuildLinkInput, Channel, ChannelStatus, ConnectionTest, CreateServerInput,
     DeployInput, DevicePeer, Job, LinkBuildReq, LinkStatus, LinkTeardownReq, Node, Privacy,
     ProbeResult, RelayRule, Server, ServerSpeedReq, SpeedTestReq, Subscription, ThroughputReq,
-    ThroughputTest, UpdateServerInput, UpdateServerResult, Upstream,
+    ThroughputTest, UpdateServerInput, UpdateServerResult, Upstream, UpstreamEntryOptions,
 };
 use crate::relay;
 use crate::serve;
@@ -218,7 +218,8 @@ pub async fn rename_node(state: Arc<AppState>, id: String, name: String) -> R<()
             .ok_or_else(|| AppError::NotFound("节点不存在".into()))?;
         let nodes = repos::nodes::list(&conn, &state.creds).map_err(err)?;
         let privacies = repos::privacies::list_all(&conn).map_err(err)?;
-        let private = crate::servers::privacy::effective_privacy(&old_node.id, &privacies).is_some();
+        let private =
+            crate::servers::privacy::effective_privacy(&old_node.id, &privacies).is_some();
         let new_effective = if private {
             crate::servers::privacy::display_name(&name)
         } else {
@@ -776,6 +777,14 @@ pub fn list_upstreams(state: Arc<AppState>, server_id: i64) -> R<Vec<Upstream>> 
     repos::upstreams::list_by_server(&conn, server_id).map_err(err)
 }
 
+/// 「入口协议」下拉：已部署可复用的主节点 + 支持复用的协议白名单。
+pub fn list_upstream_entry_options(
+    state: Arc<AppState>,
+    server_id: i64,
+) -> R<UpstreamEntryOptions> {
+    servers::upstream::entry_options(&state, server_id).map_err(AppError::Validation)
+}
+
 /// 这台机器上**除上游之外**已占用的端口，交给 `upstream::validate` 拒绝。
 ///
 /// 两处来源都要，且都是在入口处拒绝而不是等远端报错：
@@ -829,20 +838,43 @@ pub fn add_upstream(state: Arc<AppState>, input: servers::upstream::UpstreamInpu
         let conn = state.db.lock();
         repos::upstreams::list_by_server(&conn, input.server_id).map_err(err)?
     };
-    let reserved = upstream_reserved_ports(&state, input.server_id)?;
-    // 端口撞了就**自动改用空闲端口**（首选能用则原样保留）：报错会让用户卡在「换个端口」
-    // 上反复试，而挤掉已有占用更糟——那会把他正在用的线路弄断。挑中的值随返回值带回，
-    // 界面据此提示「已被占用，已改用 X」。
-    let taken: Vec<i64> = existing
-        .iter()
-        .map(|u| u.listen_port)
-        .chain(reserved.iter().copied())
-        .collect();
-    let input = servers::upstream::UpstreamInput {
-        listen_port: servers::upstream::pick_listen_port(input.listen_port, &taken),
-        ..input
+    // 入口选择先解析：复用主入口时既不占监听端口，也不校验伪装域名。
+    let entry = servers::upstream::resolve_entry(
+        &state,
+        input.server_id,
+        input.entry_node_id.as_deref(),
+        &input.entry_proto,
+    )
+    .map_err(AppError::Validation)?;
+    let (input, reserved) = match &entry {
+        Some(_) => (
+            servers::upstream::UpstreamInput {
+                listen_port: 0,
+                reality_dest: String::new(),
+                ..input
+            },
+            Vec::new(),
+        ),
+        None => {
+            let reserved = upstream_reserved_ports(&state, input.server_id)?;
+            // 端口撞了就**自动改用空闲端口**（首选能用则原样保留）：报错会让用户卡在
+            // 「换个端口」上反复试，而挤掉已有占用更糟——那会把他正在用的线路弄断。
+            // 挑中的值随返回值带回，界面据此提示「已被占用，已改用 X」。
+            let taken: Vec<i64> = existing
+                .iter()
+                .map(|u| u.listen_port)
+                .chain(reserved.iter().copied())
+                .collect();
+            (
+                servers::upstream::UpstreamInput {
+                    listen_port: servers::upstream::pick_listen_port(input.listen_port, &taken),
+                    ..input
+                },
+                reserved,
+            )
+        }
     };
-    servers::upstream::validate(&input, &existing, &reserved).map_err(err)?;
+    servers::upstream::validate(&input, &existing, &reserved, entry.as_ref()).map_err(err)?;
 
     let row = Upstream {
         id: 0,
@@ -854,6 +886,9 @@ pub fn add_upstream(state: Arc<AppState>, input: servers::upstream::UpstreamInpu
         username: input.username.clone(),
         listen_port: input.listen_port,
         reality_dest: servers::clean_text(&input.reality_dest),
+        entry_node_id: entry.as_ref().and_then(|e| e.node_id.clone()),
+        entry_proto: entry.as_ref().map(|e| e.proto.clone()).unwrap_or_default(),
+        entry_port: entry.as_ref().map(|e| e.port).unwrap_or(0),
         node_id: None,
         egress_ip: None,
         last_check_error: None,
@@ -892,16 +927,31 @@ pub fn update_upstream(
         let existing = repos::upstreams::list_by_server(&conn, row.server_id).map_err(err)?;
         (row, existing)
     };
-    let reserved = upstream_reserved_ports(&state, row.server_id)?;
     // 编辑场景的约定：被编辑行自己不算冲突，否则「改成原值」也会被判成撞车
     let others: Vec<Upstream> = existing.into_iter().filter(|u| u.id != id).collect();
-    // 与新增同一套语义：撞了就自动改用空闲端口，不报错、也不挤掉别人
-    let taken: Vec<i64> = others
-        .iter()
-        .map(|u| u.listen_port)
-        .chain(reserved.iter().copied())
-        .collect();
-    let listen_port = servers::upstream::pick_listen_port(edit.listen_port, &taken);
+    let entry = servers::upstream::resolve_entry(
+        &state,
+        row.server_id,
+        edit.entry_node_id.as_deref(),
+        &edit.entry_proto,
+    )
+    .map_err(AppError::Validation)?;
+    let (listen_port, reserved) = match &entry {
+        Some(_) => (0, Vec::new()),
+        None => {
+            let reserved = upstream_reserved_ports(&state, row.server_id)?;
+            // 与新增同一套语义：撞了就自动改用空闲端口，不报错、也不挤掉别人
+            let taken: Vec<i64> = others
+                .iter()
+                .map(|u| u.listen_port)
+                .chain(reserved.iter().copied())
+                .collect();
+            (
+                servers::upstream::pick_listen_port(edit.listen_port, &taken),
+                reserved,
+            )
+        }
+    };
     let input = servers::upstream::UpstreamInput {
         server_id: row.server_id,
         // 名称可改；重新部署时部署 job 按 node_id 用新名字覆盖写回的节点
@@ -912,9 +962,15 @@ pub fn update_upstream(
         username: edit.username.clone(),
         password: edit.password.clone().unwrap_or_default(),
         listen_port,
-        reality_dest: edit.reality_dest.clone(),
+        reality_dest: if entry.is_some() {
+            String::new()
+        } else {
+            edit.reality_dest.clone()
+        },
+        entry_node_id: edit.entry_node_id.clone(),
+        entry_proto: edit.entry_proto.clone(),
     };
-    servers::upstream::validate(&input, &others, &reserved).map_err(err)?;
+    servers::upstream::validate(&input, &others, &reserved, entry.as_ref()).map_err(err)?;
     let next = Upstream {
         name: servers::clean_text(&input.name),
         proto: input.proto.clone(),
@@ -923,6 +979,9 @@ pub fn update_upstream(
         username: input.username.clone(),
         listen_port,
         reality_dest: servers::clean_text(&input.reality_dest),
+        entry_node_id: entry.as_ref().and_then(|e| e.node_id.clone()),
+        entry_proto: entry.as_ref().map(|e| e.proto.clone()).unwrap_or_default(),
+        entry_port: entry.as_ref().map(|e| e.port).unwrap_or(0),
         ..row
     };
     // 留空 = 不动：空串与 None 都当「不改」，绝不用空值覆盖已存凭据
@@ -958,18 +1017,34 @@ pub async fn probe_egress_ip(state: Arc<AppState>, upstream_id: i64) -> R<String
 }
 
 /// 提交部署/拆除任务：该中转机全部出口整份重渲染（DB 是唯一事实源，只带 server_id）。
-pub fn start_upstream_job(state: Arc<AppState>, server_id: i64) -> R<i64> {
+///
+/// `cleanup_protocols` 只用于「删除复用出口」：行已经删了，job 从 DB 读不到它原来
+/// 用的入口协议，必须由调用方带进来，主配置才会重渲染并摘掉 `up-<id>` 用户/路由
+/// （否则住宅出站与其凭据会一直留在主配置里）。新增/改入口时传空即可——行还在。
+pub fn start_upstream_job(
+    state: Arc<AppState>,
+    server_id: i64,
+    cleanup_protocols: Vec<String>,
+) -> R<i64> {
     {
         let conn = state.db.lock();
         repos::servers::get(&conn, server_id)
             .map_err(err)?
             .ok_or_else(|| AppError::NotFound("服务器不存在".into()))?;
     }
+    let cleanup_protocols: Vec<String> = cleanup_protocols
+        .into_iter()
+        .filter(|p| servers::upstream::REUSABLE_PROTOS.contains(&p.as_str()))
+        .collect();
     let job_id = repos::jobs::insert(&state.db.lock(), "upstream", "queued").map_err(err)?;
     state
         .job_queue
         .submit(crate::jobs::JobRequest::Upstream(
-            crate::jobs::UpstreamReq { job_id, server_id },
+            crate::jobs::UpstreamReq {
+                job_id,
+                server_id,
+                cleanup_protocols,
+            },
         ))
         .map_err(AppError::Message)?;
     Ok(job_id)
@@ -1561,9 +1636,7 @@ pub fn relay_statuses(state: &AppState) -> R<std::collections::HashMap<i64, Link
 /// 手动刷新：全量采集分享列表与各服务器证书状态，写回缓存后返回。
 ///
 /// 这是分享页唯一会主动发 SSH 的入口（用户点「刷新」或完成增删改后）。
-pub async fn refresh_shares(
-    state: Arc<AppState>,
-) -> R<crate::share::model::ShareSnapshot> {
+pub async fn refresh_shares(state: Arc<AppState>) -> R<crate::share::model::ShareSnapshot> {
     let snapshot = crate::share::install::refresh_share_snapshot(&state)
         .await
         .map_err(err)?;
@@ -1610,11 +1683,7 @@ pub async fn prepare_share_tls(
     Ok(status)
 }
 
-fn cache_share_tls(
-    state: &AppState,
-    server_id: i64,
-    status: crate::share::model::ShareTlsStatus,
-) {
+fn cache_share_tls(state: &AppState, server_id: i64, status: crate::share::model::ShareTlsStatus) {
     let mut guard = state.share_snapshot.lock().unwrap();
     guard
         .get_or_insert_with(Default::default)

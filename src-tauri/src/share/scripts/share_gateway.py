@@ -41,6 +41,7 @@ class Gateway:
     def __init__(self, cfg, usage_path):
         self.cfg = cfg
         self.usage_path = usage_path
+        self.history_path = usage_path + '.history'
         self.used = 0
         self.used_up = 0
         self.used_down = 0
@@ -57,6 +58,24 @@ class Gateway:
         self.servers = []
         self.transports = []
         self.conns = set()  # 已建立的 TCP 客户端连接；停用时主动断开
+        self.upstreams = set()
+        self.tcp_tasks = set()
+        self.udp_protocols = []
+        self.stopping = False
+        # Per-share bounds shared by all listeners; old configs need no migration.
+        self.max_tcp_connections = max(1, int(cfg.get("max_tcp_connections", 256)))
+        self.max_udp_peers = max(1, int(cfg.get("max_udp_peers", 256)))
+        self.max_udp_pending_packets = max(1, int(cfg.get("max_udp_pending_packets", 1024)))
+        self.max_udp_pending_bytes = max(65536, int(cfg.get("max_udp_pending_bytes", 4 * 1024 * 1024)))
+        self.max_udp_buffer_bytes = max(65536, int(cfg.get("max_udp_buffer_bytes", 128 * 1024)))
+        self.tcp_idle_timeout = max(1, float(cfg.get("tcp_idle_timeout", 300)))
+        self.connect_timeout = max(0.1, float(cfg.get("connect_timeout", 10)))
+        self.udp_peer_count = 0
+        self.udp_pending_packets = 0
+        self.udp_pending_bytes = 0
+        self.rejected_tcp = 0
+        self.dropped_rate = {"up": 0, "down": 0}
+        self.dropped_resource = {"up": 0, "down": 0}
         self.up = Bucket(cfg.get("rate_up_mbps", 0) * 125000)
         self.down = Bucket(cfg.get("rate_down_mbps", 0) * 125000)
         self.load()
@@ -81,12 +100,22 @@ class Gateway:
             self.blocked_at = u.get("blocked_at")
             self.blocked_direction = u.get("blocked_direction")
         except (OSError, ValueError, TypeError):
+            if os.path.exists(self.usage_path) and not os.path.exists(self.history_path):
+                raise  # Never turn damaged historical usage into free quota.
             self.used = 0
             self.used_up = 0
             self.used_down = 0
             self.blocked = None
             self.blocked_at = None
             self.blocked_direction = None
+        if os.path.exists(self.history_path):
+            with open(self.history_path, 'r', encoding='utf-8') as f:
+                previous = json.load(f)
+            self.used_up = max(self.used_up, int(previous['used_up_bytes']))
+            self.used_down = max(self.used_down, int(previous['used_down_bytes']))
+            self.used = max(self.used, int(previous['used_bytes']))
+            if self.split_quota:
+                self.used = self.used_up + self.used_down
 
     def flush(self):
         data = {
@@ -97,7 +126,23 @@ class Gateway:
             "blocked_at": self.blocked_at,
             "blocked_direction": self.blocked_direction,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            # Diagnostics since process start, not additional billable bytes.
+            "runtime": {
+                "tcp_connections": len(self.conns),
+                "udp_peers": self.udp_peer_count,
+                "udp_pending_packets": self.udp_pending_packets,
+                "udp_pending_bytes": self.udp_pending_bytes,
+                "rejected_tcp": self.rejected_tcp,
+                "dropped_rate_bytes": self.dropped_rate.copy(),
+                "dropped_resource_bytes": self.dropped_resource.copy(),
+            },
         }
+        # A separate high-water record survives legacy clients writing zero to
+        # usage.json. Only deletion of the whole share removes its history.
+        history_tmp = self.history_path + '.tmp'
+        with open(history_tmp, 'w', encoding='utf-8') as f:
+            json.dump({k:data[k] for k in ('used_bytes','used_up_bytes','used_down_bytes')},f)
+        os.replace(history_tmp, self.history_path)
         tmp = self.usage_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
@@ -105,7 +150,7 @@ class Gateway:
 
     def charge(self, n, direction):
         """按方向计费；direction 只会是 "up" 或 "down"。"""
-        if self.blocked:
+        if self.blocked or self.stopping:
             return False
         if self.split_quota:
             quota = self.quota_up if direction == "up" else self.quota_down
@@ -144,6 +189,9 @@ class Gateway:
         self.blocked_direction = direction
         self.blocked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.flush()
+        self.close_connections()
+
+    def close_connections(self):
         for s in self.servers:
             s.close()
         self.servers.clear()
@@ -153,80 +201,115 @@ class Gateway:
             except Exception:
                 pass
         self.transports.clear()
-        for w in list(self.conns):
+        for protocol in self.udp_protocols:
+            protocol.close()
+        for w in list(self.conns | self.upstreams):
             try:
                 w.close()
             except Exception:
                 pass
-        self.conns.clear()
+
+    def send_datagram(self, transport, data, addr, direction):
+        # asyncio UDP transports otherwise buffer without a size limit when
+        # their socket becomes unwritable.
+        if (transport.is_closing()
+                or transport.get_write_buffer_size() + len(data) > self.max_udp_buffer_bytes):
+            self.dropped_resource[direction] += len(data)
+            return
+        try:
+            transport.sendto(data, addr)
+        except OSError:
+            self.dropped_resource[direction] += len(data)
 
     def expired(self):
         exp = int(self.cfg.get("expires_at_unix", 0))
         return exp > 0 and time.time() >= exp
 
-    async def pipe(self, reader, writer, bucket, direction):
-        try:
-            while not self.blocked:
-                # 1s 超时只为定期检查 blocked；超时不会丢已缓冲数据。
-                try:
-                    data = await asyncio.wait_for(reader.read(65536), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-                if not data:
-                    break
-                if not self.charge(len(data), direction):
-                    break
-                await bucket.take(len(data))
-                if self.blocked:
-                    break
-                writer.write(data)
-                await writer.drain()
-        except (ConnectionError, OSError):
-            pass
-        finally:
+    async def pipe(self, reader, writer, bucket, direction, activity):
+        while not self.blocked and not self.stopping:
             try:
-                writer.close()
-            except Exception:
-                pass
+                data = await asyncio.wait_for(reader.read(65536), timeout=1.0)
+            except asyncio.TimeoutError:
+                if time.monotonic() - activity[0] >= self.tcp_idle_timeout:
+                    raise TimeoutError("TCP connection idle")
+                continue
+            if not data:
+                # EOF ends only this direction: a peer can still send its
+                # response after receiving the complete request.
+                if writer.can_write_eof():
+                    writer.write_eof()
+                    await writer.drain()
+                return
+            activity[0] = time.monotonic()
+            if not self.charge(len(data), direction):
+                break
+            await bucket.take(len(data))
+            if self.blocked or self.stopping:
+                break
+            writer.write(data)
+            await asyncio.wait_for(writer.drain(), timeout=self.tcp_idle_timeout)
+            activity[0] = time.monotonic()
 
     async def handle_tcp(self, reader, writer, target):
-        if self.blocked:
+        if self.blocked or self.stopping or len(self.conns) >= self.max_tcp_connections:
+            self.rejected_tcp += 1
             writer.close()
             return
         self.conns.add(writer)
+        task = asyncio.current_task()
+        self.tcp_tasks.add(task)
+        uw = None
+        pipes = []
         try:
-            ur, uw = await asyncio.open_connection("127.0.0.1", target)
-        except OSError:
-            self.conns.discard(writer)
-            writer.close()
-            return
-        try:
+            ur, uw = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", target, limit=32768),
+                timeout=self.connect_timeout,
+            )
+            self.upstreams.add(uw)
+            for w in (writer, uw):
+                w.transport.set_write_buffer_limits(high=65536, low=16384)
+            activity = [time.monotonic()]
+            pipes = [
+                asyncio.create_task(self.pipe(reader, uw, self.up, "up", activity)),
+                asyncio.create_task(self.pipe(ur, writer, self.down, "down", activity)),
+            ]
+            await asyncio.gather(*pipes)
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            for pipe in pipes:
+                if not pipe.done():
+                    pipe.cancel()
+            await asyncio.gather(*pipes, return_exceptions=True)
+            writers = [writer] + ([uw] if uw is not None else [])
+            for w in writers:
+                w.close()
             await asyncio.gather(
-                self.pipe(reader, uw, self.up, "up"),
-                self.pipe(ur, writer, self.down, "down"),
+                *(asyncio.wait_for(w.wait_closed(), timeout=1) for w in writers),
                 return_exceptions=True,
             )
-        finally:
             self.conns.discard(writer)
-            try:
-                writer.close()
-            except Exception:
-                pass
+            self.upstreams.discard(uw)
+            self.tcp_tasks.discard(task)
 
 
 class UdpUpstream(asyncio.DatagramProtocol):
-    def __init__(self, public, client, gateway):
+    def __init__(self, public, client, gateway, touch=None):
         self.public = public
         self.client = client
         self.gateway = gateway
+        self.touch = touch
 
     def datagram_received(self, data, addr):
         # 目标返回客户端：下行。
+        if self.touch:
+            self.touch()
         if not self.gateway.charge(len(data), "down"):
             return
         if not self.gateway.down.try_take(len(data)):
+            self.gateway.dropped_rate["down"] += len(data)
             return
-        self.public.sendto(data, self.client)
+        self.gateway.send_datagram(self.public, data, self.client, "down")
 
 
 class UdpPublic(asyncio.DatagramProtocol):
@@ -234,36 +317,108 @@ class UdpPublic(asyncio.DatagramProtocol):
         self.target = target
         self.gateway = gateway
         self.peers = {}
-        self.lock = asyncio.Lock()
+        self.queue = asyncio.Queue(maxsize=gateway.max_udp_pending_packets)
+        self.transport = None
+        self.worker = None
+        self.sweeper = None
+        self.closed = False
+        gateway.udp_protocols.append(self)
 
     def connection_made(self, transport):
         self.transport = transport
+        self.worker = asyncio.create_task(self.drain_queue())
+        self.sweeper = asyncio.create_task(self.sweep())
+
+    def touch(self, addr):
+        if addr in self.peers:
+            self.peers[addr][1] = time.monotonic()
 
     async def _upstream(self, addr):
-        async with self.lock:
-            entry = self.peers.get(addr)
-            if entry:
-                entry[1] = time.monotonic()
-                return entry[0]
+        entry = self.peers.get(addr)
+        if entry:
+            entry[1] = time.monotonic()
+            return entry[0]
+        if self.closed or self.gateway.udp_peer_count >= self.gateway.max_udp_peers:
+            return None
+        # Reserve before awaiting: the limit applies to all UDP listeners.
+        self.gateway.udp_peer_count += 1
+        tr = None
+        try:
             loop = asyncio.get_running_loop()
-            tr, _ = await loop.create_datagram_endpoint(
-                lambda: UdpUpstream(self.transport, addr, self.gateway),
-                remote_addr=("127.0.0.1", self.target),
+            tr, _ = await asyncio.wait_for(
+                loop.create_datagram_endpoint(
+                    lambda: UdpUpstream(self.transport, addr, self.gateway, lambda: self.touch(addr)),
+                    remote_addr=("127.0.0.1", self.target),
+                ), timeout=self.gateway.connect_timeout,
             )
+            if self.closed or self.gateway.blocked or self.gateway.stopping:
+                return None
             self.peers[addr] = [tr, time.monotonic()]
             return tr
+        finally:
+            if addr not in self.peers:
+                self.gateway.udp_peer_count -= 1
+                if tr is not None:
+                    tr.close()
 
     def datagram_received(self, data, addr):
         # 客户端发往目标：上行。
-        if self.gateway.blocked or not self.gateway.charge(len(data), "up"):
+        if self.closed or not self.gateway.charge(len(data), "up"):
             return
         if not self.gateway.up.try_take(len(data)):
+            self.gateway.dropped_rate["up"] += len(data)
             return
-        asyncio.create_task(self._send(data, addr))
+        entry = self.peers.get(addr)
+        if entry:
+            self.touch(addr)
+            self.gateway.send_datagram(entry[0], data, None, "up")
+            return
+        gw = self.gateway
+        if (gw.udp_pending_packets >= gw.max_udp_pending_packets
+                or gw.udp_pending_bytes + len(data) > gw.max_udp_pending_bytes):
+            gw.dropped_resource["up"] += len(data)
+            return
+        self.queue.put_nowait((data, addr))
+        gw.udp_pending_packets += 1
+        gw.udp_pending_bytes += len(data)
 
-    async def _send(self, data, addr):
-        tr = await self._upstream(addr)
-        tr.sendto(data)
+    async def drain_queue(self):
+        while not self.closed:
+            data, addr = await self.queue.get()
+            try:
+                tr = await self._upstream(addr)
+                if tr is not None:
+                    self.gateway.send_datagram(tr, data, None, "up")
+                else:
+                    self.gateway.dropped_resource["up"] += len(data)
+            except OSError:
+                self.gateway.dropped_resource["up"] += len(data)
+            finally:
+                self.gateway.udp_pending_packets -= 1
+                self.gateway.udp_pending_bytes -= len(data)
+                self.queue.task_done()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for task in (self.worker, self.sweeper):
+            if task is not None:
+                task.cancel()
+        while not self.queue.empty():
+            data, _ = self.queue.get_nowait()
+            self.gateway.udp_pending_packets -= 1
+            self.gateway.udp_pending_bytes -= len(data)
+            self.queue.task_done()
+        for tr, _ in self.peers.values():
+            tr.close()
+            self.gateway.udp_peer_count -= 1
+        self.peers.clear()
+        if self.transport is not None:
+            self.transport.close()
+
+    def connection_lost(self, exc):
+        self.close()
 
     async def sweep(self):
         while True:
@@ -273,6 +428,7 @@ class UdpPublic(asyncio.DatagramProtocol):
                 if now - entry[1] > 60:
                     entry[0].close()
                     del self.peers[addr]
+                    self.gateway.udp_peer_count -= 1
 
 
 async def flusher(gw):
@@ -321,11 +477,16 @@ async def main():
     stopping = asyncio.Event()
 
     async def stop():
+        if gw.stopping:
+            return
+        gw.stopping = True
+        gw.close_connections()
+        tasks = list(gw.tcp_tasks)
+        tasks += [task for p in gw.udp_protocols for task in (p.worker, p.sweeper) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         gw.flush()
-        for s in gw.servers:
-            s.close()
-        for t in gw.transports:
-            t.close()
         stopping.set()
 
     # 先注册信号再进任何等待：已到期的分享启动后不监听，也必须能被 systemctl
@@ -351,6 +512,7 @@ async def main():
             srv = await asyncio.start_server(
                 lambda r, w, t=target: gw.handle_tcp(r, w, t),
                 sock=bind_socket(socket.SOCK_STREAM, args.bind, public),
+                limit=32768,
             )
             gw.servers.append(srv)
         if "udp" in proto:
@@ -360,7 +522,6 @@ async def main():
                 sock=bind_socket(socket.SOCK_DGRAM, args.bind, public),
             )
             gw.transports.append(tr)
-            asyncio.create_task(proto_obj.sweep())
 
     asyncio.create_task(flusher(gw))
     while not stopping.is_set():

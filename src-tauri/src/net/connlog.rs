@@ -31,6 +31,8 @@
 //!
 //! 0. 目标在**我们自己的节点**上（`endpoint_map` 里的地址，中继生效时是入口地址）
 //!    → [`Verdict::ProxyEgress`]：隧道自身的出站，不经 mihomo 是必然；
+//!    其余目标若属于用户已添加的服务器/中转/节点 IP → [`Verdict::KnownServer`]，
+//!    按用户设定排除泄漏检测，不限制端口或进程；此类行仍可查看。
 //! 1. 目标在**国内**（`country_of(ip) == "CN"`）→ [`Verdict::DirectCn`]：设计意图，不是泄漏；
 //! 2. 非 CN（含**国家未知**）→ 原来的两条：在关注名单里、或同程序另有连接走了代理 → Leak
 //!    （「同程序」对**宿主型镜像**按 pid 认，见 [`is_host_image`]）；
@@ -40,6 +42,7 @@
 //! 「程序名在你编辑的名单里」都硬。
 //!
 //! 国家未知时**不放宽**：宁可多报，不可把真泄漏说成「国内直连，属设计意图」。
+//! CLOSED/TIME_WAIT/DELETE_TCB 不进入当前连接分类；SYN_SENT 等连接尝试仍检测。
 //!
 //! 直连行的域名尽力补上（`mihomo` 的 host 优先，否则查系统 DNS 缓存），拿不到就留空
 //! ——见 [`domain_of`] 与 `net::dnscache` 的模块注释。**绝不做反向 DNS**。
@@ -49,7 +52,7 @@
 use crate::crypto::CredentialService;
 use crate::db::Db;
 use crate::domain::{Node, RelayRule, Server};
-use crate::net::winprobe::{Proto, SockRow};
+use crate::net::winprobe::{Proto, SockRow, TcpState};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -103,6 +106,8 @@ pub enum Verdict {
     /// 「规则直连」这个标签撒谎。同理不并进 `Proxied`：它是**没有**被代理的那一半。
     #[serde(rename = "proxy_egress")]
     ProxyEgress,
+    /// 用户在应用中添加的服务器/中转/节点 IP；按目标 IP 排除，不限制端口或进程。
+    KnownServer,
 }
 
 /// 连接日志的一行：前 8 列是用户点名要的，后面是判据与排障信息。
@@ -222,6 +227,8 @@ pub struct Sample {
     pub watch: Vec<String>,
     /// 节点名 → `addr:port`（已按 `effective_node` 折算成中转机地址）
     pub endpoints: HashMap<String, String>,
+    /// 应用中添加的目标 IP → 来源说明。不是程序名豁免，也不是整个网段放行。
+    pub known_servers: HashMap<IpAddr, String>,
     /// 国家查询器。默认 = `NoGeo`（什么都不知道 → 不降级），
     /// 于是所有既有调用点（`..Default::default()`）保持加这个功能之前的行为。
     pub geo: Arc<dyn CountryLookup>,
@@ -239,6 +246,7 @@ impl Default for Sample {
             images: Vec::new(),
             watch: Vec::new(),
             endpoints: HashMap::new(),
+            known_servers: HashMap::new(),
             geo: Arc::new(NoGeo),
             domains: HashMap::new(),
         }
@@ -505,6 +513,7 @@ fn rank(v: Verdict) -> u8 {
         Verdict::Direct => 3,
         Verdict::Proxied => 4,
         Verdict::ProxyEgress => 5,
+        Verdict::KnownServer => 5,
     }
 }
 
@@ -517,6 +526,13 @@ fn rank(v: Verdict) -> u8 {
 /// 锚点选 OS 行：有 OS 行时行由 OS 行产出（拿得到 PROCESS），mihomo 那一侧补
 /// 域名/规则/出口；反过来只有 mihomo 有的话，就只能给一行没有进程名的记录。
 pub fn classify(s: &Sample) -> Vec<ConnRow> {
+    // TIME_WAIT 等残留常被 Windows 记为 PID 0。它们不是“system process 正在直连”。
+    // 过滤同样用于 join 旁证，避免已关闭的源端口污染当前进程归属。
+    let active_socks: Vec<&SockRow> = s
+        .socks
+        .iter()
+        .filter(|r| r.proto != Proto::Tcp || r.state != TcpState::Closed)
+        .collect();
     let images: HashMap<u32, String> = s
         .images
         .iter()
@@ -527,7 +543,7 @@ pub fn classify(s: &Sample) -> Vec<ConnRow> {
         by_port.entry((c.proto(), c.source_port)).or_insert(c);
     }
     let mut os_by_port: HashMap<(Proto, u16), &SockRow> = HashMap::new();
-    for r in &s.socks {
+    for r in &active_socks {
         os_by_port.entry((r.proto, r.local_port)).or_insert(r);
     }
 
@@ -557,7 +573,7 @@ pub fn classify(s: &Sample) -> Vec<ConnRow> {
 
     let mut out: Vec<ConnRow> = Vec::new();
     // 一、逐条 OS 行：被 mihomo 认领的走 join，没被认领的才是泄漏候选
-    for r in &s.socks {
+    for r in active_socks {
         let proc = images.get(&r.pid).cloned().unwrap_or_default();
         match by_port.get(&(r.proto, r.local_port)) {
             Some(c) => out.push(joined_row(r, c, s, proc)),
@@ -775,6 +791,14 @@ fn unclaimed_row(
         (
             Verdict::ProxyEgress,
             format!("隧道自身的出站：目标是本机代理自己的节点「{name}」"),
+        )
+    } else if let Some(source) = s.known_servers.get(&r.remote_addr.to_canonical()) {
+        (
+            Verdict::KnownServer,
+            format!(
+            "目标 IP {} 已在应用中添加（{source}），按已知目标排除泄漏检测，不限定连接端口或进程",
+            r.remote_addr,
+        ),
         )
     } else if country == "CN" {
         // 国内目标**先于**名单与旁证判定：走直连的国内流量结果与 `GEOIP,CN,DIRECT` /
@@ -1124,12 +1148,14 @@ async fn sample_once(
     // 解析器，见 net::dnscache 的模块注释），代价实测 ~10-40ms（本机缓存几十到几百条），
     // 与四张 socket 表的枚举同一量级；库查不到就留空，界面渲染 `—`。
     let domains = crate::net::dnscache::read_cache();
+    let known_servers = read_known_servers(&run.db, &run.creds, &domains);
     let sample = Sample {
         socks,
         conns,
         images,
         watch: watch.clone(),
         endpoints,
+        known_servers,
         geo,
         domains,
     };
@@ -1182,4 +1208,52 @@ fn read_endpoints(db: &Db, creds: &CredentialService) -> HashMap<String, String>
     let rules = crate::relay::list_relay_rules_inner(db).unwrap_or_default();
     let servers = crate::db::repos::servers::list(&db.lock()).unwrap_or_default();
     endpoint_map(&nodes, &rules, &servers)
+}
+
+/// 精确匹配保存的 IP；域名仅使用已有 DNS 缓存解析结果，不为检测器额外发起 DNS 查询。
+pub(crate) fn known_server_ips(
+    nodes: &[Node],
+    servers: &[Server],
+    domains: &HashMap<IpAddr, String>,
+) -> HashMap<IpAddr, String> {
+    let mut out = HashMap::new();
+    let mut add = |host: &str, source: String| {
+        let host = host.trim().trim_matches(['[', ']']);
+        if host.is_empty() {
+            return;
+        }
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            out.entry(ip.to_canonical()).or_insert(source);
+        } else {
+            for (ip, domain) in domains {
+                if domain
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(host.trim_end_matches('.'))
+                {
+                    out.entry(ip.to_canonical())
+                        .or_insert_with(|| source.clone());
+                }
+            }
+        }
+    };
+    for server in servers {
+        add(&server.host, format!("服务器「{}」", server.name));
+        add(&server.host_v6, format!("服务器「{}」IPv6", server.name));
+    }
+    for node in nodes {
+        add(&node.addr, format!("节点「{}」", node.name));
+    }
+    out
+}
+
+pub(crate) fn read_known_servers(
+    db: &Db,
+    creds: &CredentialService,
+    domains: &HashMap<IpAddr, String>,
+) -> HashMap<IpAddr, String> {
+    // 每轮重新读，删除/更换地址后不留下永久白名单；读取失败保持原检测，而非全局放行。
+    let conn = db.lock();
+    let servers = crate::db::repos::servers::list(&conn).unwrap_or_default();
+    let nodes = crate::db::repos::nodes::list(&conn, creds).unwrap_or_default();
+    known_server_ips(&nodes, &servers, domains)
 }

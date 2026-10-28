@@ -7,7 +7,7 @@
 import { useSyncExternalStore } from 'react'
 import type { listen } from '@tauri-apps/api/event'
 import { shareStatus } from '../api'
-import type { ShareList, ShareTlsStatus } from '../api/types'
+import type { ShareInfo, ShareList, ShareTlsStatus } from '../api/types'
 
 let store: ShareList | null = null
 const listeners = new Set<() => void>()
@@ -34,6 +34,28 @@ export function useShareStatus(): ShareList | null {
 /** 整份替换（后端每轮推送的完整快照 / 手动刷新结果）。 */
 export function applyShareStatus(snapshot: ShareList): void {
   store = snapshot
+  emit()
+}
+
+/**
+ * 新建分享成功后就地并入列表：创建结果由后端在命令返回时给出，已经足够权威。
+ * 不能只等下一轮轮询——用户可能在别的视图里完成创建，切回来时列表还是旧的。
+ */
+export function upsertShare(info: ShareInfo): void {
+  const base = store
+  if (base == null) {
+    store = { shares: [info], unreachable: [], checked_at: null }
+  } else {
+    store = {
+      ...base,
+      shares: [
+        ...base.shares.filter(
+          (s) => !(s.server_id === info.server_id && s.id === info.id),
+        ),
+        info,
+      ],
+    }
+  }
   emit()
 }
 

@@ -68,8 +68,7 @@ pub struct AppState {
     ///
     /// 中转页只读这份缓存，不再在挂载/切页时发 SSH；后台轮询器定时刷新并推
     /// `relay://status` 事件，切页/重开界面都直接拿后端已知的最近状态。
-    pub relay_statuses:
-        std::sync::Mutex<std::collections::HashMap<i64, crate::domain::LinkStatus>>,
+    pub relay_statuses: std::sync::Mutex<std::collections::HashMap<i64, crate::domain::LinkStatus>>,
     /// 后端轮询得到的分享快照（服务器上的分享 + 各服务器证书状态）。
     ///
     /// 分享列举要逐台 SSH（实测一轮 ~14 秒），前端切页只读这份缓存；后台轮询器

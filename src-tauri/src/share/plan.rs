@@ -5,6 +5,7 @@
 use crate::domain::{direct_addr, server_owns_addr, Node, Privacy, Server};
 use crate::share::model::ShareCandidate;
 use crate::state::AppState;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// 单节点准入。`Err` 直接作为前端置灰原因；创建时同样用它拒绝。
@@ -42,13 +43,22 @@ pub fn share_candidates(
     state: &Arc<AppState>,
     server_id: i64,
 ) -> Result<Vec<ShareCandidate>, String> {
-    let (server, privacies) = {
+    let (server, privacies, reused_upstream_nodes) = {
         let conn = state.db.lock();
         let server = crate::db::repos::servers::get(&conn, server_id)
             .map_err(|e| e.to_string())?
             .ok_or("服务器不存在")?;
         let privacies = crate::db::repos::privacies::list_all(&conn).map_err(|e| e.to_string())?;
-        (server, privacies)
+        // 复用主入口的出口没有独立入站：克隆时要把「分享用户」也接进住宅路由，
+        // 当前未实现。必须在候选阶段就置灰——否则用户选完才在 build_specs 报错，
+        // 或者更糟：克隆成直连出口（现已由 build_specs 兜底拒绝）。
+        let reused: HashSet<String> = crate::db::repos::upstreams::list_by_server(&conn, server_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|u| !u.entry_proto.is_empty())
+            .filter_map(|u| u.node_id)
+            .collect();
+        (server, privacies, reused)
     };
     let nodes = state.subs.visible_nodes().map_err(|e| e.to_string())?;
     Ok(nodes
@@ -56,7 +66,11 @@ pub fn share_candidates(
         // 向导只列属于该服务器的节点；别把别的机器/机场节点混进来
         .filter(|node| server_owns_addr(&server, &direct_addr(node)))
         .map(|node| {
-            let reason = check_eligibility(&node, &server, &privacies).err();
+            let mut reason = check_eligibility(&node, &server, &privacies).err();
+            if reason.is_none() && reused_upstream_nodes.contains(&node.id) {
+                reason =
+                    Some("复用主入口的上游出口暂不支持分享（避免把住宅出口错接到直连）".into());
+            }
             ShareCandidate {
                 shareable: reason.is_none(),
                 reason,

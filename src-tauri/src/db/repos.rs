@@ -1261,7 +1261,8 @@ pub mod upstreams {
     use super::*;
 
     const COLS: &str = "id,server_id,name,proto,host,port,username,listen_port,\
-                        reality_dest,node_id,egress_ip,last_check_error,created_at";
+                        reality_dest,entry_node_id,entry_proto,entry_port,node_id,\
+                        egress_ip,last_check_error,created_at";
 
     fn row_to_upstream(r: &rusqlite::Row<'_>) -> rusqlite::Result<Upstream> {
         Ok(Upstream {
@@ -1274,10 +1275,13 @@ pub mod upstreams {
             username: r.get(6)?,
             listen_port: r.get(7)?,
             reality_dest: r.get(8)?,
-            node_id: r.get(9)?,
-            egress_ip: r.get(10)?,
-            last_check_error: r.get(11)?,
-            created_at: r.get(12)?,
+            entry_node_id: r.get(9)?,
+            entry_proto: r.get(10)?,
+            entry_port: r.get(11)?,
+            node_id: r.get(12)?,
+            egress_ip: r.get(13)?,
+            last_check_error: r.get(14)?,
+            created_at: r.get(15)?,
         })
     }
 
@@ -1311,8 +1315,9 @@ pub mod upstreams {
     ) -> rusqlite::Result<i64> {
         conn.execute(
             "INSERT INTO upstreams (server_id,name,proto,host,port,username,password,\
-             listen_port,reality_dest,material_json,node_id,egress_ip,last_check_error,created_at)\
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             listen_port,reality_dest,entry_node_id,entry_proto,entry_port,material_json,\
+             node_id,egress_ip,last_check_error,created_at)\
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 u.server_id,
                 u.name,
@@ -1323,6 +1328,9 @@ pub mod upstreams {
                 password_sealed,
                 u.listen_port,
                 u.reality_dest,
+                u.entry_node_id,
+                u.entry_proto,
+                u.entry_port,
                 material_json,
                 u.node_id,
                 u.egress_ip,
@@ -1362,7 +1370,8 @@ pub mod upstreams {
             Some(sealed) => {
                 conn.execute(
                     "UPDATE upstreams SET name=?2,proto=?3,host=?4,port=?5,username=?6,\
-                     listen_port=?7,reality_dest=?8,password=?9 WHERE id=?1",
+                     listen_port=?7,reality_dest=?8,entry_node_id=?9,entry_proto=?10,\
+                     entry_port=?11,password=?12 WHERE id=?1",
                     params![
                         u.id,
                         u.name,
@@ -1372,6 +1381,9 @@ pub mod upstreams {
                         u.username,
                         u.listen_port,
                         u.reality_dest,
+                        u.entry_node_id,
+                        u.entry_proto,
+                        u.entry_port,
                         sealed
                     ],
                 )?;
@@ -1379,7 +1391,8 @@ pub mod upstreams {
             None => {
                 conn.execute(
                     "UPDATE upstreams SET name=?2,proto=?3,host=?4,port=?5,username=?6,\
-                     listen_port=?7,reality_dest=?8 WHERE id=?1",
+                     listen_port=?7,reality_dest=?8,entry_node_id=?9,entry_proto=?10,\
+                     entry_port=?11 WHERE id=?1",
                     params![
                         u.id,
                         u.name,
@@ -1388,7 +1401,10 @@ pub mod upstreams {
                         u.port,
                         u.username,
                         u.listen_port,
-                        u.reality_dest
+                        u.reality_dest,
+                        u.entry_node_id,
+                        u.entry_proto,
+                        u.entry_port
                     ],
                 )?;
             }
@@ -1400,6 +1416,21 @@ pub mod upstreams {
         conn.execute(
             "UPDATE upstreams SET node_id=?2 WHERE id=?1",
             params![id, node_id],
+        )?;
+        Ok(())
+    }
+
+    /// 部署回写：校正复用入口的主节点/端口。主协议未变时只是把首次部署后才知道的
+    /// 端口补上（新增时选「尚未部署」的协议 `entry_port=0`）。
+    pub fn set_entry(
+        conn: &Connection,
+        id: i64,
+        entry_node_id: Option<&str>,
+        entry_port: i64,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE upstreams SET entry_node_id=?2,entry_port=?3 WHERE id=?1",
+            params![id, entry_node_id, entry_port],
         )?;
         Ok(())
     }

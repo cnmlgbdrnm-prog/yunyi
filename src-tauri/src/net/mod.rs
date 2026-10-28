@@ -12,6 +12,8 @@ pub mod private_gate;
 pub mod runtime;
 pub mod runtime_conns;
 pub mod sysproxy_set;
+#[cfg(windows)]
+pub(crate) mod sysproxy_windows;
 pub mod takeover;
 pub mod winprobe;
 

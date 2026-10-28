@@ -423,23 +423,20 @@ async fn test_one(
     }
     // 延迟失败跳过带宽：仍记录 latency=NULL + 错误（update_speed 语义）。
     // 带宽为自适应下载量（8 路并行聚合）：慢节点先小量估速，快节点再拉大量确认。
-    // 聚合任务层兜底 DOWNLOAD_TIMEOUT 保证 30s 内必返回。
+    // 探针与确认共享 DOWNLOAD_TIMEOUT；聚合层负责终止未响应的流。
+    // 不能再套同期限的外层 timeout，否则它会抢先丢掉探针结果。
     if error.is_none() {
-        match tokio::time::timeout(
+        match download_adaptive(
+            &engine,
+            download_port,
+            SPEED_TEST_ENDPOINT,
             DOWNLOAD_TIMEOUT,
-            download_adaptive(
-                &engine,
-                download_port,
-                SPEED_TEST_ENDPOINT,
-                DOWNLOAD_TIMEOUT,
-                cancel,
-            ),
+            cancel,
         )
         .await
         {
-            Ok(Ok(bps)) => bandwidth = Some(bps.round() as i64),
-            Ok(Err(e)) => error = Some(e),
-            Err(_) => error = Some("下载超时".to_string()),
+            Ok(bps) => bandwidth = Some(bps.round() as i64),
+            Err(e) => error = Some(e),
         }
     }
     // 尽力清理注入的代理（失败不覆盖已有错误：指标已取得，残留由下次 PUT 覆盖）
@@ -479,24 +476,22 @@ async fn download_adaptive(
     timeout: Duration,
     cancel: Arc<AtomicBool>,
 ) -> Result<f64, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
     // 快慢阈值：256KB 在 <FAST_PROBE_SECS(2s) 内拉满 = Σ字节/墙钟 ≥ 256KB/2s → 快节点。
     let fast_threshold = SIZE_LIMIT_SMALL as f64 / FAST_PROBE_SECS;
     // 阶段一：小量估速。聚合内部 8 流同时拉，慢节点超时后按实际到位字节估算（不因
     // 拉不满 256KB 而报错，只要 Σ字节>0）；极慢断流（Σ字节=0）才返回错误。
-    let probe = tokio::time::timeout(
+    let probe = download_aggregate(
+        engine,
+        mixed_port,
+        url,
+        SIZE_LIMIT_SMALL,
         timeout,
-        download_aggregate(
-            engine,
-            mixed_port,
-            url,
-            SIZE_LIMIT_SMALL,
-            timeout,
-            cancel.clone(),
-        ),
+        cancel.clone(),
     )
-    .await
-    .map_err(|_| "下载超时".to_string())??;
-    if probe >= fast_threshold {
+    .await?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if probe >= fast_threshold && remaining > DOWNLOAD_SAMPLE_SETTLE {
         // 快节点：按探针估值反推确认量，确认它在 CONFIRM_SECS 量级内跑得完。
         // 固定请求量（曾是每流 10MB）等于给「多久拉完」钉死门槛：8×10MB 要在 30s 内
         // 完成需 2.67MB/s，而快阈值只要求 128KB/s——中间这段（实测经中转的链路
@@ -506,21 +501,30 @@ async fn download_adaptive(
         // 真失败（断流/限流/超时）仍回退阶段一估值：探针刚成功，说明链路可用。
         let confirm_size = ((probe * CONFIRM_SECS / STREAMS as f64) as usize)
             .clamp(CONFIRM_MIN_PER_STREAM, CONFIRM_MAX_PER_STREAM);
-        match tokio::time::timeout(
-            timeout,
-            download_aggregate(engine, mixed_port, url, confirm_size, timeout, cancel),
+        match download_aggregate(
+            engine,
+            mixed_port,
+            url,
+            confirm_size,
+            remaining,
+            cancel.clone(),
         )
         .await
         {
-            Ok(Ok(bps)) => Ok(bps),
-            // Ok(Err) = 8 路全失败/全超时（Σ字节为 0）；Err = 聚合整体超时
-            Ok(Err(_)) | Err(_) => Ok(probe),
+            Ok(bps) => Ok(bps),
+            Err(_) if cancel.load(Ordering::Relaxed) => Err("已取消".to_string()),
+            // 确认没有可用样本时保留已成功的探针，不把限流/超时当成断连。
+            Err(_) => Ok(probe),
         }
     } else {
         // 慢节点：小量估算即为其真实带宽（继续拉大量只会超时），直接返回。
         Ok(probe)
     }
 }
+
+// 引擎先结束采样并交还部分字节，聚合层稍后终止真正不响应的任务。
+// 两层共享同一个总预算，避免相同期限的 timeout 抢先丢弃有效进度。
+const DOWNLOAD_SAMPLE_SETTLE: Duration = Duration::from_millis(100);
 
 /// 拼本次下载请求 URL：`bytes=` 必须等于本次实际读取量（size_limit）。
 ///
@@ -535,7 +539,8 @@ pub fn download_url(endpoint: &str, size_limit: usize) -> String {
 /// 8 路并行聚合带宽测速：每路经 mixed-port 代理拉取同一测试文件，每个流自身拉取上限
 /// 为 size_limit（快节点确认大量/down_adaptive 小量估速共用），**请求量与之保持一致**
 /// （见 download_url）。返回 Σ已下载字节 / 总墙钟（bytes/s）。各流自身超时容错：
-/// 超时/失败流计 0 字节，全部流失败才返回第一个错误；取消 → '已取消'。虚拟时钟冻结
+/// 超时流保留引擎返回的部分字节，真正失败流计 0；全部流失败才返回第一个错误。
+/// 聚合期限内结束，取消 → '已取消'。虚拟时钟冻结
 /// （测试环境墙钟为 0）时按 1s 归一：聚合值等于 Σ字节，可确定性断言。
 async fn download_aggregate(
     engine: &Arc<dyn SpeedEngine>,
@@ -545,8 +550,13 @@ async fn download_aggregate(
     timeout: Duration,
     cancel: Arc<AtomicBool>,
 ) -> Result<f64, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("已取消".to_string());
+    }
     let url = download_url(url, size_limit);
     let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let sample_timeout = timeout.saturating_sub(DOWNLOAD_SAMPLE_SETTLE);
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..STREAMS {
         let engine = engine.clone();
@@ -554,18 +564,35 @@ async fn download_aggregate(
         let url = url.clone();
         set.spawn(async move {
             engine
-                .download_bytes(mixed_port, &url, size_limit, timeout, cancel)
+                .download_bytes(mixed_port, &url, size_limit, sample_timeout, cancel)
                 .await
         });
     }
     let mut total_bytes: f64 = 0.0;
     let mut errors: Vec<String> = Vec::new();
-    while let Some(res) = set.join_next().await {
+    while !set.is_empty() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".to_string());
+        }
+        let res = tokio::select! {
+            biased;
+            res = set.join_next() => res,
+            _ = tokio::time::sleep_until(deadline) => {
+                errors.push("下载超时".to_string());
+                set.abort_all();
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
+        };
+        let Some(res) = res else { break };
         match res {
             Ok(Ok(bytes)) => total_bytes += bytes,
             Ok(Err(e)) => errors.push(e),
             Err(e) => errors.push(format!("测速流异常: {e}")),
         }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("已取消".to_string());
     }
     if total_bytes <= 0.0 || !total_bytes.is_finite() {
         return Err(errors

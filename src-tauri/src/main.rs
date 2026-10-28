@@ -292,6 +292,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_upstreams_cmd,
+            commands::list_upstream_entry_options_cmd,
             commands::add_upstream_cmd,
             commands::update_upstream_cmd,
             commands::remove_upstream_cmd,

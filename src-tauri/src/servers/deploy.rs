@@ -30,6 +30,8 @@ const SS_UNIT_PATH: &str = "/etc/systemd/system/ssserver.service";
 
 // 协议/命令/配置生成与既有配置解析集中在 deploy_spec；原 `crate::servers::deploy::*`
 // 路径经此重导出保持不变（测试与 relay 等模块按旧路径引用）。
+pub use super::deploy_nodes::deploy_managed_nodes;
+use super::deploy_nodes::deployed_node_ports;
 pub use crate::servers::deploy_spec::*;
 
 /// 查看某台服务器**当前可用的**已部署协议，以 `nodes` 里的自建节点为准。
@@ -120,8 +122,9 @@ pub fn firewall_ports(
             out.push((protocol.to_string(), port));
         }
     };
-    // 上游出口节点在 xray-upstream 里一律是 vless/REALITY 入站（出站才是住宅协议）。
-    for u in upstreams {
+    // 只有旧专用实例的出口需要单独放行端口（入站恒为 vless/REALITY）。
+    // 复用主入口的出口 listen_port 为 0，端口已由主协议节点覆盖。
+    for u in upstreams.iter().filter(|u| u.entry_proto.is_empty()) {
         push("vless", u.listen_port);
     }
     for n in nodes {
@@ -135,42 +138,6 @@ pub fn firewall_ports(
         push(&n.protocol, n.port);
     }
     out
-}
-
-/// 部署「复用既有入站」时可选的节点（按协议索引，每协议一条）。
-///
-/// **必须排除上游出口节点**：同一个协议名（vless）在两类节点上重名，而上游节点
-/// 的 sni/公钥属于各自的 xray-upstream 入口。混进来会让主入站复用错公钥或拿错
-/// 伪装域名——重复 key 时旧代码的 `collect::<HashMap>` 由哈希顺序决定谁留下，
-/// 表现为时好时坏、极难复现。这里统一用「先到先得」且显式排除，行为确定。
-pub fn deploy_managed_nodes(
-    nodes: Vec<crate::domain::Node>,
-    server: &crate::domain::Server,
-    upstream_node_ids: &HashSet<String>,
-) -> HashMap<String, crate::domain::Node> {
-    let mut out = HashMap::new();
-    for n in nodes {
-        if n.source != "self-built"
-            || upstream_node_ids.contains(&n.id)
-            || !crate::domain::server_owns_addr(server, &crate::domain::direct_addr(&n))
-        {
-            continue;
-        }
-        out.entry(n.protocol.clone()).or_insert(n);
-    }
-    out
-}
-
-/// 从库里收集 [`firewall_ports`] 的输入（读库失败按空表处理：放行是增益，
-/// 不能因为读不到节点就让整次部署失败）。
-fn deployed_node_ports(
-    state: &Arc<AppState>,
-    server: &crate::domain::Server,
-) -> Vec<(String, u16)> {
-    let conn = state.db.lock();
-    let upstreams = repos::upstreams::list_by_server(&conn, server.id).unwrap_or_default();
-    let nodes = repos::nodes::list(&conn, &state.creds).unwrap_or_default();
-    firewall_ports(&nodes, &upstreams, server)
 }
 
 /// 端口占用检查：true=端口已被监听（占用），false=空闲可部署。
@@ -273,7 +240,7 @@ async fn read_existing_ports(
     let mut xray_inbounds: std::collections::HashMap<u16, XrayInboundEntry> =
         std::collections::HashMap::new();
     let mut ss_password: Option<String> = None;
-    let mut singbox_hy2_pw: Option<String> = None;
+    let mut singbox_hy2: Option<(String, Option<String>)> = None;
     let mut singbox_tuic_uuid: Option<String> = None;
     let mut singbox_tuic_pw: Option<String> = None;
     if need_xray {
@@ -310,7 +277,7 @@ async fn read_existing_ports(
                 ports.insert(proto, port);
             }
             let (hy2, tuic) = parse_singbox_creds(c);
-            singbox_hy2_pw = hy2;
+            singbox_hy2 = hy2;
             if let Some((uuid, pw)) = tuic {
                 singbox_tuic_uuid = Some(uuid);
                 singbox_tuic_pw = Some(pw);
@@ -321,7 +288,7 @@ async fn read_existing_ports(
         ports,
         xray_inbounds,
         ss_password,
-        singbox_hy2_pw,
+        singbox_hy2,
         singbox_tuic_uuid,
         singbox_tuic_pw,
     })
@@ -337,8 +304,9 @@ struct ExistingRemote {
     xray_inbounds: std::collections::HashMap<u16, XrayInboundEntry>,
     /// shadowsocks 既有密码（复用避免轮换）
     ss_password: Option<String>,
-    /// sing-box hysteria2 既有密码（同上，缺失才新生成）
-    singbox_hy2_pw: Option<String>,
+    /// sing-box hysteria2 既有凭据：(密码, obfs 密码)。旧配置没有 obfs 时第二项为
+    /// None（同上，密码复用，obfs 另生成）。
+    singbox_hy2: Option<(String, Option<String>)>,
     /// sing-box tuic 既有 uuid / 密码（同上）
     singbox_tuic_uuid: Option<String>,
     singbox_tuic_pw: Option<String>,
@@ -361,7 +329,7 @@ pub fn prod_runner(
     })
 }
 
-struct ProdRunner {
+pub(crate) struct ProdRunner {
     state: Arc<OnceLock<Arc<AppState>>>,
     http: reqwest::Client,
     ss_api_base: String,
@@ -389,7 +357,8 @@ impl JobRunner for ProdRunner {
         match req {
             JobRequest::Deploy(r) => self.run_deploy(&state, r, &cancel, &emit).await,
             JobRequest::Upstream(r) => {
-                crate::servers::upstream::run_upstream_job(&state, &r, &cancel, &emit).await
+                crate::servers::upstream::run_upstream_job(&state, &r, &cancel, &emit, Some(self))
+                    .await
             }
             JobRequest::Privacy(r) => {
                 crate::servers::privacy::run_privacy_job(&state, &r, &cancel, &emit).await
@@ -797,6 +766,26 @@ pub(crate) async fn run_cmd_ok(
     }
 }
 
+/// 部署进度事件的归属与区间。上游 job 复用同一套部署主线时：
+/// - `kind="upstream"`：事件必须仍以 upstream 上报，否则前端注册表按 kind 丢弃；
+/// - `from/to`：把 5→100 的部署进度压进上游 job 的一段区间（之后还要跑旧实例）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeployProgress {
+    pub kind: &'static str,
+    pub from: i64,
+    pub to: i64,
+}
+
+impl Default for DeployProgress {
+    fn default() -> Self {
+        Self {
+            kind: "deploy",
+            from: 0,
+            to: 100,
+        }
+    }
+}
+
 impl ProdRunner {
     /// 部署主线。步骤：探测(5→20)→安装(30→45)→配置(55)→启动(80)→优化(88→90，仅勾选 BBR)
     /// →放行(92)→写回(95→100)。进度单调递增；全协议验证失败在「优化」之前中止，不发 95/100。
@@ -809,12 +798,41 @@ impl ProdRunner {
         cancel: &Arc<AtomicBool>,
         emit: &EmitFn,
     ) -> Result<(), String> {
+        self.run_deploy_with(state, req, cancel, emit, DeployProgress::default())
+            .await
+    }
+
+    /// `run_deploy` 的可复用主体：上游 job 用它把「复用主入口」的出口一并渲染进主配置。
+    /// 与普通部署的唯一差别是进度事件的 kind/区间（见 [`DeployProgress`]）；远端动作完全相同。
+    pub(crate) async fn run_deploy_with(
+        &self,
+        state: &Arc<AppState>,
+        mut req: DeployRequest,
+        cancel: &Arc<AtomicBool>,
+        emit: &EmitFn,
+        job_progress: DeployProgress,
+    ) -> Result<(), String> {
         let server = {
             let conn = state.db.lock();
             repos::servers::get(&conn, req.server_id)
                 .map_err(|e| e.to_string())?
                 .ok_or("服务器不存在")?
         };
+        // 复用主入口的出口必须与主协议一起重渲染：用户只勾了 vless 时，若某条出口
+        // 复用 trojan，不把 trojan 加回来就会把它的入站连同 up-<id> 用户一起删掉，
+        // 出口静默变砖。读不出路线时**中止**而不是忽略——忽略等于静默删配置。
+        let reused_routes = crate::servers::upstream::load_routes(state, req.server_id)
+            .map_err(|e| format!("读取复用入口失败: {e}"))?;
+        let mut auto_added: Vec<String> = Vec::new();
+        for route in &reused_routes {
+            if !req.protocols.iter().any(|p| p == &route.entry_proto) {
+                req.protocols.push(route.entry_proto.clone());
+                auto_added.push(route.entry_proto.clone());
+            }
+        }
+        // 去重，保持首次出现顺序（部署顺序与端口分配依赖它）
+        let mut seen = std::collections::HashSet::new();
+        req.protocols.retain(|p| seen.insert(p.clone()));
         let need_xray = ["vless", "trojan", "vmess"]
             .iter()
             .any(|p| req.protocols.iter().any(|x| x == p));
@@ -826,15 +844,25 @@ impl ProdRunner {
         // 只决定 VPS→目标域名时优先/限定哪一族。字面 IP 目标不受影响。
         let egress = EgressFamily::from_db(&server.egress_family);
         let emit_progress = |step: &str, message: &str, progress: i64| {
+            let mapped = job_progress.from + progress * (job_progress.to - job_progress.from) / 100;
             emit(JobProgress {
                 job_id: req.job_id,
-                kind: "deploy".into(),
+                kind: job_progress.kind.into(),
                 step: step.to_string(),
                 message: message.to_string(),
-                progress,
+                progress: mapped,
                 error: None,
             });
         };
+        if !auto_added.is_empty() {
+            auto_added.sort();
+            auto_added.dedup();
+            emit_progress(
+                "配置",
+                &format!("复用出口依赖的入口协议一并保留：{}", auto_added.join(", ")),
+                2,
+            );
+        }
         emit_progress("探测", "连接服务器", 5);
         let (auth, _) =
             load_auth_parts(&state.db, &state.creds, req.server_id).map_err(|e| e.to_string())?;
@@ -875,11 +903,19 @@ impl ProdRunner {
             return Err(format!("该系统未运行 systemd（{os}），暂不支持自动部署"));
         }
         check_cancel(cancel)?;
-        // 组件安装状态：只探测选中协议需要的组件（对未选组件不产生命令）
+        // 组件安装状态：只探测选中协议需要的组件（对未选组件不产生命令）。
+        // Xray 探的是**版本**而不是存在性：新版 REALITY 与内置 mihomo 不兼容，
+        // 已装 26.10.21 的机器（如 SC）必须重部署时降级到钉住的 26.3.27。
         let xray_installed = if need_xray {
-            run_cmd(&mut sess, cancel, "探测", "command -v xray", PROBE_TIMEOUT)
-                .await?
-                .exit_code
+            run_cmd(
+                &mut sess,
+                cancel,
+                "探测",
+                &xray_installed_probe_cmd(),
+                PROBE_TIMEOUT,
+            )
+            .await?
+            .exit_code
                 == 0
         } else {
             true
@@ -1128,7 +1164,9 @@ impl ProdRunner {
                     ws_path: "/ray".into(),
                 });
             }
-            let cfg = xray_config_json_multi(&entries, egress);
+            // 把复用主入口的出口用户/出站/路由一并渲染进去。旧专用实例的出口
+            // （entry_proto 空）不在 routes 里，仍由 xray-upstream 独立配置承载。
+            let cfg = xray_config_json_multi_routed(&entries, egress, &reused_routes);
             write_remote_file(
                 &mut sess,
                 cancel,
@@ -1201,10 +1239,10 @@ impl ProdRunner {
             // 同 xray/ss 两段：既有凭据原样复用，重复部署不轮换（轮换 = 服务端新凭据 +
             // 客户端旧凭据 = 静默变砖，界面还显示「部署成功」）。只有首次部署、
             // 或既有配置里读不回该项时才新生成。
-            let hy2_pw = existing
-                .singbox_hy2_pw
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let (hy2_pw, hy2_obfs_pw) = match existing.singbox_hy2.clone() {
+                Some((pw, obfs)) => (pw, obfs.unwrap_or_else(|| Uuid::new_v4().to_string())),
+                None => (Uuid::new_v4().to_string(), Uuid::new_v4().to_string()),
+            };
             let tuic_uuid = existing
                 .singbox_tuic_uuid
                 .clone()
@@ -1270,12 +1308,13 @@ impl ProdRunner {
                     55,
                 );
             }
-            let cfg = singbox_config_json(
-                hy2_selected.then(|| (ports["hysteria2"], hy2_pw.as_str())),
+            let cfg = singbox_config_json_routed(
+                hy2_selected.then(|| (ports["hysteria2"], hy2_pw.as_str(), hy2_obfs_pw.as_str())),
                 tuic_selected.then(|| (ports["tuic"], tuic_uuid.as_str(), tuic_pw.as_str())),
                 egress,
                 singbox_ver,
                 inbound_listen,
+                &reused_routes,
             );
             write_remote_file(
                 &mut sess,
@@ -1300,7 +1339,10 @@ impl ProdRunner {
                     "hysteria2".into(),
                     ports["hysteria2"],
                     serde_json::json!({
-                        "password": hy2_pw, "skip-cert-verify": "1"
+                        "password": hy2_pw,
+                        "obfs": "salamander",
+                        "obfs-password": hy2_obfs_pw,
+                        "skip-cert-verify": "1"
                     })
                     .to_string(),
                 ));
@@ -1487,113 +1529,7 @@ impl ProdRunner {
         // 5 写回：仅写成功协议节点(含端口验证通过);failed 在成功节点写回后随 error 上报
         // （ok_protocols 已在上方 4.4 守卫处算出，非空已保证）
         emit_progress("写回", "写入节点与部署记录", 95);
-        {
-            let conn = state.db.lock();
-            let upstream_ids: HashSet<String> =
-                repos::upstreams::list_by_server(&conn, req.server_id)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .filter_map(|u| u.node_id)
-                    .collect();
-            for (proto, port, params) in &ok_protocols {
-                let name = format!("{}-{}", server.name, proto);
-                // 同名旧行必须**原地更新**，不能按地址删了重建：
-                // - 切过地址族的机器（香港/ashura 登记 v6，旧行 addr 还是 v4）按新地址
-                //   删不到旧行，重建后库里出现两个同名节点，mihomo 热重载直接 400
-                //   `proxy <name> is the duplicate name`（2026-10-23 真机）；
-                // - 旧行上的 relay_rule_id 与用户改名也跟着丢。
-                // 只认「同服务器 + 同协议 + 同名」；用户改过名的节点不算，另起一行。
-                // ` #N` 是重名自愈给历史副本加的后缀，同样属于这条线（见
-                // matches_deployed_name 的说明）。
-                let rows: Vec<Node> = repos::nodes::list(&conn, &state.creds)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .filter(|n| {
-                        n.source == "self-built"
-                            && n.protocol == *proto
-                            && matches_deployed_name(&n.name, &name)
-                            && crate::domain::server_owns_addr(&server, &n.addr)
-                            && !upstream_ids.contains(&n.id)
-                    })
-                    .collect();
-                // 优先保留挂了中转的那行：链路是按节点行 id/端口建的，换行即丢挂载。
-                let keep = rows
-                    .iter()
-                    .position(|n| n.relay_rule_id.is_some())
-                    .unwrap_or(0);
-                let mut node = if rows.is_empty() {
-                    Node {
-                        id: Uuid::new_v4().simple().to_string(),
-                        name: name.clone(),
-                        source: "self-built".into(),
-                        protocol: proto.clone(),
-                        addr: String::new(),
-                        port: 0,
-                        params_json: String::new(),
-                        group_name: "自建".into(),
-                        sub_id: None,
-                        relay_rule_id: None,
-                        enabled: true,
-                        latency: None,
-                        bandwidth: None,
-                        last_checked_at: None,
-                        last_check_error: None,
-                        direct_latency: None,
-                        hop_relay_ms: None,
-                        hop_landing_ms: None,
-                        hop_tunnel_ms: None,
-                    }
-                } else {
-                    rows[keep].clone()
-                };
-                node.addr = crate::domain::effective_host(&server).to_string();
-                node.port = *port as i64;
-                node.params_json = params.clone();
-                node.enabled = true;
-                for (i, extra) in rows.iter().enumerate() {
-                    if i != keep {
-                        repos::nodes::delete(&conn, &extra.id).map_err(|e| e.to_string())?;
-                    }
-                }
-                repos::nodes::upsert(&conn, &node, &state.creds).map_err(|e| e.to_string())?;
-            }
-            // 自动补挂中转：建链只改指「当时已存在」的节点，之后部署上来的节点
-            // relay_rule_id 恒为 None，客户端就按直连拨——落地机直连不通时表现为
-            // 测速 504，节点行上却毫无线索。这里补上，并把挂不上的原因写进摘要。
-            let deployed: Vec<(String, i64)> = ok_protocols
-                .iter()
-                .map(|(p, port, _)| (p.clone(), *port as i64))
-                .collect();
-            let attaches =
-                crate::relay::attach_deployed_nodes(&conn, &server, &deployed, &state.creds)
-                    .unwrap_or_else(|e| {
-                        // 补挂失败不该让整次部署失败：节点已在库，链路问题照实报出来
-                        vec![crate::relay::AttachOutcome {
-                            node: server.name.clone(),
-                            attached: false,
-                            detail: format!("自动补挂中转时出错：{e}"),
-                        }]
-                    });
-            let ports_map: serde_json::Map<String, serde_json::Value> = ok_protocols
-                .iter()
-                .map(|(p, port, _)| (p.clone(), serde_json::Value::from(*port)))
-                .collect();
-            let mut summary = serde_json::json!({
-                "protocols": ok_protocols.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(),
-                "ports": serde_json::Value::Object(ports_map),
-                "relay": attaches.iter().map(|a| serde_json::json!({
-                    "node": a.node, "attached": a.attached, "detail": a.detail
-                })).collect::<Vec<_>>()
-            });
-            // BBR 结果（有才写）：摘要只作部署历史记录，协议列表以节点行为准，
-            // 因此附加字段不会影响 UI 的已部署协议展示
-            if let Some(note) = &bbr_note {
-                summary["bbr"] = serde_json::Value::from(note.clone());
-            }
-            let summary = summary.to_string();
-            repos::deploys::insert(&conn, req.server_id, "deploy", &summary, "ok")
-                .map_err(|e| e.to_string())?;
-        }
+        super::deploy_nodes::writeback(state, &server, &ok_protocols, bbr_note.as_deref())?;
         state
             .subs
             .rebuild_config()
@@ -1618,10 +1554,12 @@ impl ProdRunner {
             let msg = format!("部分协议失败: {}", failed_protocols.join(", "));
             emit(JobProgress {
                 job_id: req.job_id,
-                kind: "deploy".into(),
+                kind: job_progress.kind.into(),
                 step: "写回".into(),
                 message: msg.clone(),
-                progress: 100,
+                // 部分失败也是本阶段的终态；用区间终点而不是硬编码 100，否则上游 job
+                // 会在旧专用实例还没处理完时就被前端判成终态。
+                progress: job_progress.to,
                 error: Some(msg.clone()),
             });
             // 把失败协议名带回任务错误里：以前只回一句「部分协议部署失败」，

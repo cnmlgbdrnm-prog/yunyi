@@ -19,13 +19,16 @@ pub const INTERNAL_PORT_END: u16 = 18799;
 
 /// 16 位小写十六进制：内部 id，也是旧分享的 token。
 pub fn is_valid_id(s: &str) -> bool {
-    s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    s.len() == 16
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// 16 位（旧）或 32 位（新）小写十六进制。
 pub fn is_valid_token(s: &str) -> bool {
     (s.len() == 16 || s.len() == 32)
-        && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 pub fn new_id() -> String {

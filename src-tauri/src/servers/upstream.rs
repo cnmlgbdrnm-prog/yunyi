@@ -14,16 +14,20 @@
 //! 不进任何远端命令行（出口 IP 探测因此走本地 mihomo，不走中转机 curl）。
 
 use crate::db::repos;
-use crate::domain::{JobProgress, Node, Upstream};
-use crate::jobs::{EmitFn, UpstreamReq};
+use crate::domain::{JobProgress, Node, Upstream, UpstreamEntryOption, UpstreamEntryOptions};
+use crate::jobs::{DeployRequest, EmitFn, UpstreamReq};
 use crate::servers::deploy::{
     parse_capability, parse_x25519_keys, run_cmd, run_cmd_ok, wait_service_active,
-    write_remote_file, CAPABILITY_PROBE_SCRIPT, CONFIG_TIMEOUT, INSTALL_TIMEOUT,
+    write_remote_file, DeployProgress, ProdRunner, CAPABILITY_PROBE_SCRIPT, CONFIG_TIMEOUT,
+    INSTALL_TIMEOUT,
 };
+use crate::servers::deploy_spec::{describe_deployed_protocol, protocol_order, UpstreamRoute};
 use crate::servers::{clean_text, load_auth, ServersError, CONNECT_TIMEOUT, PROBE_TIMEOUT};
 use crate::ssh::SshSession;
 use crate::state::AppState;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// 专用实例的远端路径（白名单常量）。
@@ -34,6 +38,10 @@ pub const UPSTREAM_UNIT_PATH: &str = "/etc/systemd/system/xray-upstream.service"
 pub const UPSTREAM_SERVICE: &str = "xray-upstream";
 /// 上游协议白名单（与前端选项同步）。
 pub const PROTOS: &[&str] = &["socks5", "http"];
+/// 可以复用主入口的协议。SS 故意不在内：它由独立的 ssserver 承载，
+/// shadowsocks-rust 没有「按用户分流到不同出站」的能力，复用 SS 入口
+/// 无法把该用户的流量送进住宅代理（会静默走直连，比不支持更糟）。
+pub const REUSABLE_PROTOS: &[&str] = &["vless", "trojan", "vmess", "hysteria2", "tuic"];
 /// 默认 REALITY 伪装域名（与前端 src/utils/realityDest.ts 的 DEFAULT_REALITY_DEST 同值，
 /// 两条链路不得各写一份——漂移了就是「界面显示 A、服务器写 B」）。
 /// 已知代价：本值 www.microsoft.com 在本项目实测中 REALITY 握手必失败（服务端报
@@ -65,6 +73,21 @@ pub struct Material {
     pub private_key: String,
     pub public_key: String,
     pub short_id: String,
+    /// 复用入口时的独立口令（Trojan/Hysteria2 直接用 uuid；TUIC 需要 uuid+口令）。
+    /// 旧行没有这个键（serde default 空串），使用时按 uuid 兜底并补写。
+    #[serde(default)]
+    pub password: String,
+}
+
+impl Material {
+    /// 复用入口的认证口令：老材料可能只有 uuid（或整份 `{}`），这里统一兜底。
+    pub fn entry_password(&self) -> String {
+        if self.password.is_empty() {
+            self.uuid.clone()
+        } else {
+            self.password.clone()
+        }
+    }
 }
 
 /// 添加/编辑输入（IPC 扁平参数形态）。
@@ -77,8 +100,13 @@ pub struct UpstreamInput {
     pub port: i64,
     pub username: String,
     pub password: String,
+    /// 旧专用实例的监听端口；复用入口时由命令层置 0。
     pub listen_port: i64,
     pub reality_dest: String,
+    /// 复用入口：选中的已部署主节点 id（优先于 `entry_proto`）。
+    pub entry_node_id: Option<String>,
+    /// 复用入口协议；与服务端解析出的节点协议二选一。
+    pub entry_proto: String,
 }
 
 /// 编辑既有出口：改的都在这，改完**必须重新部署**才在远端生效。
@@ -98,6 +126,8 @@ pub struct UpstreamEdit {
     pub password: Option<String>,
     pub listen_port: i64,
     pub reality_dest: String,
+    pub entry_node_id: Option<String>,
+    pub entry_proto: String,
 }
 
 /// 出口在专用实例内的入站 tag（`up-{id}`）。
@@ -163,13 +193,28 @@ pub fn pick_listen_port(preferred: i64, taken: &[i64]) -> i64 {
     preferred
 }
 
+/// 解析后的入口选择。`None` = 旧专用实例（保持存量语义）；
+/// `Some` = 复用主配置里的同协议入站。`node_id=None` 表示该协议尚未部署，
+/// 部署 job 会先补部署再回写端口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryTarget {
+    pub node_id: Option<String>,
+    pub proto: String,
+    /// 已部署节点的端口；尚未部署时为 0。
+    pub port: i64,
+}
+
 /// 校验输入；`existing` 为同一中转机上已有的出口（用于监听端口唯一性），
 /// `reserved` 为本机**非上游**已占用的端口（见 [`ports_in_use_elsewhere`]）。
 /// 编辑场景由调用方把被编辑行从 `existing` 中排除。
+///
+/// `entry=Some` 时走复用入口校验：不再校验/占用监听端口与伪装域名——这两项
+/// 只属于旧专用实例，复用入口的端口由主协议决定（见 `entry_port`）。
 pub fn validate(
     input: &UpstreamInput,
     existing: &[Upstream],
     reserved: &[i64],
+    entry: Option<&EntryTarget>,
 ) -> Result<(), ServersError> {
     let name = clean_text(&input.name);
     if name.is_empty() {
@@ -196,6 +241,16 @@ pub fn validate(
             "上游端口必须在 1-65535 之间".into(),
         ));
     }
+    if let Some(entry) = entry {
+        if !REUSABLE_PROTOS.contains(&entry.proto.as_str()) {
+            return Err(ServersError::Validation(format!(
+                "入口协议 {} 不支持复用（可选 {}）",
+                entry.proto,
+                REUSABLE_PROTOS.join("/")
+            )));
+        }
+        return Ok(());
+    }
     if !(1..=65535).contains(&input.listen_port) {
         return Err(ServersError::Validation(
             "监听端口必须在 1-65535 之间".into(),
@@ -218,6 +273,272 @@ pub fn validate(
         return Err(ServersError::Validation("伪装域名不能为空".into()));
     }
     Ok(())
+}
+
+/// 把「选中的入口节点 / 入口协议」解析成可落库的 `EntryTarget`。
+///
+/// 优先用节点 id：节点必须属于这台服务器、是 deploy 写回的主节点，且不是另一条
+/// 上游出口自己写回的节点（同协议同名，选错了会把上游节点当作主入口）。只给协议名
+/// （尚未部署）时返回 `port=0`，由下一次部署补端口。
+pub fn resolve_entry(
+    state: &AppState,
+    server_id: i64,
+    entry_node_id: Option<&str>,
+    entry_proto: &str,
+) -> Result<Option<EntryTarget>, String> {
+    let node_id = entry_node_id.map(str::trim).filter(|s| !s.is_empty());
+    let proto = clean_text(entry_proto);
+    if node_id.is_none() && proto.is_empty() {
+        return Ok(None);
+    }
+    if proto == "ss" {
+        return Err(
+            "SS 使用独立的 ssserver，无法按用户把流量送进住宅代理，不能作为复用入口".into(),
+        );
+    }
+    let conn = state.db.lock();
+    let server = repos::servers::get(&conn, server_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "服务器不存在".to_string())?;
+    let upstream_node_ids: HashSet<String> = repos::upstreams::list_by_server(&conn, server_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|u| u.node_id)
+        .collect();
+    if let Some(id) = node_id {
+        let node = repos::nodes::get(&conn, id, &state.creds)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "选择的入口节点不存在（可能已被重新部署替换）".to_string())?;
+        if node.source != "self-built"
+            || upstream_node_ids.contains(&node.id)
+            || !crate::domain::server_owns_addr(&server, &crate::domain::direct_addr(&node))
+        {
+            return Err("选择的入口节点不属于这台服务器的主协议部署".into());
+        }
+        if node.protocol == "ss" {
+            return Err(
+                "SS 使用独立的 ssserver，无法按用户把流量送进住宅代理，不能作为复用入口".into(),
+            );
+        }
+        if !REUSABLE_PROTOS.contains(&node.protocol.as_str()) {
+            return Err(format!(
+                "入口协议 {} 不支持复用（可选 {}）",
+                node.protocol,
+                REUSABLE_PROTOS.join("/")
+            ));
+        }
+        return Ok(Some(EntryTarget {
+            node_id: Some(node.id),
+            proto: node.protocol,
+            port: node.port,
+        }));
+    }
+    if !REUSABLE_PROTOS.contains(&proto.as_str()) {
+        return Err(format!(
+            "入口协议 {proto} 不支持复用（可选 {}）",
+            REUSABLE_PROTOS.join("/")
+        ));
+    }
+    Ok(Some(EntryTarget {
+        node_id: None,
+        proto,
+        port: 0,
+    }))
+}
+
+/// 「入口协议」下拉的数据源：已部署、可复用的主节点 + 支持复用的协议白名单。
+///
+/// 与 `deployed_protocol_details` 用同一套归属判据（self-built、服务器地址、
+/// 排除上游出口节点），保证「已部署协议」页签里能看到的，这里就能选到。
+pub fn entry_options(state: &AppState, server_id: i64) -> Result<UpstreamEntryOptions, String> {
+    let conn = state.db.lock();
+    let server = repos::servers::get(&conn, server_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "服务器不存在".to_string())?;
+    let upstream_node_ids: HashSet<String> = repos::upstreams::list_by_server(&conn, server_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|u| u.node_id)
+        .collect();
+    let nodes = repos::nodes::list(&conn, &state.creds).map_err(|e| e.to_string())?;
+    let mut deployed: Vec<UpstreamEntryOption> = nodes
+        .into_iter()
+        .filter(|n| n.source == "self-built")
+        .filter(|n| REUSABLE_PROTOS.contains(&n.protocol.as_str()))
+        .filter(|n| !upstream_node_ids.contains(&n.id))
+        .filter(|n| crate::domain::server_owns_addr(&server, &crate::domain::direct_addr(n)))
+        .filter_map(|n| {
+            let port = u16::try_from(n.port).ok()?;
+            let detail = describe_deployed_protocol(&n.protocol, port, &n.params_json);
+            Some(UpstreamEntryOption {
+                node_id: n.id,
+                protocol: n.protocol,
+                port,
+                label: format!("{} · {}", detail.label, port),
+            })
+        })
+        .collect();
+    deployed.sort_by(|a, b| {
+        protocol_order(&a.protocol)
+            .cmp(&protocol_order(&b.protocol))
+            .then(a.port.cmp(&b.port))
+    });
+    // 主配置每协议只有一个入站；同协议的历史残留节点只保留端口最小的一条。
+    deployed.dedup_by(|a, b| a.protocol == b.protocol);
+    Ok(UpstreamEntryOptions {
+        deployed,
+        supported: REUSABLE_PROTOS.iter().map(|p| p.to_string()).collect(),
+    })
+}
+
+/// 补齐复用入口需要的身份材料（uuid + 独立口令），不依赖 SSH。
+///
+/// 旧专用实例的材料含 x25519 私钥/公钥，复用入口一个都用不上；反过来，复用入口
+/// 新建的材料没有私钥，切回专用实例时由 [`ensure_material`] 识别并重新生成。
+pub(crate) fn material_for_reuse(
+    conn: &rusqlite::Connection,
+    id: i64,
+    material_json: &str,
+) -> Result<Material, String> {
+    if let Ok(mut m) = serde_json::from_str::<Material>(material_json) {
+        if !m.uuid.trim().is_empty() {
+            if m.password.is_empty() {
+                m.password = Uuid::new_v4().to_string();
+                repos::upstreams::set_material(
+                    conn,
+                    id,
+                    &serde_json::to_string(&m).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            return Ok(m);
+        }
+    }
+    let m = Material {
+        uuid: Uuid::new_v4().to_string(),
+        private_key: String::new(),
+        public_key: String::new(),
+        short_id: String::new(),
+        password: Uuid::new_v4().to_string(),
+    };
+    repos::upstreams::set_material(
+        conn,
+        id,
+        &serde_json::to_string(&m).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(m)
+}
+
+/// 读取这台服务器上所有「复用主入口」的出口，供主配置渲染注入。
+///
+/// 返回的住宅代理口令是**明文**，只在本次渲染/部署的内存里存活。旧专用实例
+/// （`entry_proto` 空）不在此列——它们仍由 `run_upstream_job` 的独立配置处理。
+pub fn load_routes(state: &AppState, server_id: i64) -> Result<Vec<UpstreamRoute>, String> {
+    let conn = state.db.lock();
+    let rows = repos::upstreams::list_by_server(&conn, server_id).map_err(|e| e.to_string())?;
+    let mut routes = Vec::new();
+    for u in rows {
+        if u.entry_proto.is_empty() || !REUSABLE_PROTOS.contains(&u.entry_proto.as_str()) {
+            continue;
+        }
+        let (sealed_pw, material_json) = repos::upstreams::secrets(&conn, u.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "出口不存在".to_string())?;
+        let material = material_for_reuse(&conn, u.id, &material_json)?;
+        let outbound_port = u16::try_from(u.port)
+            .map_err(|_| format!("出口 {} 的上游端口非法: {}", u.name, u.port))?;
+        routes.push(UpstreamRoute {
+            id: u.id,
+            entry_proto: u.entry_proto.clone(),
+            entry_port: u16::try_from(u.entry_port).unwrap_or(0),
+            credential: material.uuid.clone(),
+            credential_password: material.entry_password(),
+            outbound_proto: u.proto.clone(),
+            outbound_host: u.host.clone(),
+            outbound_port,
+            outbound_username: u.username.clone(),
+            outbound_password: crate::crypto::open_param(&state.creds, &sealed_pw),
+        });
+    }
+    Ok(routes)
+}
+
+/// 用主入口节点的参数 + 出口自己的身份材料，生成写回客户端的节点参数。
+///
+/// 关键点：**凭据必须是出口自己的**（`material.uuid`/口令），不能抄主入口那条
+/// 节点的 uuid——否则所有复用同一入口的出口会在服务端变成同一个用户，路由规则
+/// `user=up-N` 无法区分，出口 IP 会互相串。
+pub fn reused_node_params(
+    entry_proto: &str,
+    main_params: &str,
+    material: &Material,
+) -> Result<String, String> {
+    let main: serde_json::Value =
+        serde_json::from_str(main_params).unwrap_or_else(|_| serde_json::json!({}));
+    let s = |key: &str| -> String {
+        main.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let value = |key: &str, fallback: &str| -> serde_json::Value {
+        main.get(key)
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(fallback.to_string()))
+    };
+    let params = match entry_proto {
+        "vless" => serde_json::json!({
+            "uuid": material.uuid,
+            "security": value("security", "reality"),
+            "type": value("type", "tcp"),
+            "flow": value("flow", "xtls-rprx-vision"),
+            "sni": s("sni"),
+            "public-key": s("public-key"),
+            "short-id": s("short-id"),
+            "fingerprint": value("fingerprint", "chrome"),
+        }),
+        "trojan" => serde_json::json!({
+            "password": material.uuid,
+            "security": value("security", "reality"),
+            "type": value("type", "tcp"),
+            "sni": s("sni"),
+            "public-key": s("public-key"),
+            "short-id": s("short-id"),
+            "fingerprint": value("fingerprint", "chrome"),
+        }),
+        "vmess" => {
+            let mut p = serde_json::json!({
+                "uuid": material.uuid,
+                "alterId": "0",
+                "cipher": "auto",
+                "network": value("network", "ws"),
+                "path": value("path", "/ray"),
+            });
+            if let Some(sni) = main.get("sni") {
+                p["sni"] = sni.clone();
+            }
+            p
+        }
+        "hysteria2" => serde_json::json!({
+            "password": material.uuid,
+            "obfs": value("obfs", "salamander"),
+            "obfs-password": s("obfs-password"),
+            "skip-cert-verify": "1",
+        }),
+        "tuic" => serde_json::json!({
+            "uuid": material.uuid,
+            "password": material.entry_password(),
+            "skip-cert-verify": "1",
+        }),
+        other => {
+            return Err(format!(
+                "入口协议 {other} 不支持复用（可选 {}）",
+                REUSABLE_PROTOS.join("/")
+            ))
+        }
+    };
+    Ok(params.to_string())
 }
 
 /// 一条出口渲染所需的全量信息（`password` 为**明文**，仅供本次渲染，不得落库或外传）。
@@ -309,6 +630,12 @@ pub fn render_config(entries: &[RenderEntry]) -> String {
     serde_json::json!({
         "inbounds": inbounds,
         "outbounds": outbounds,
+        // 显式给内部解析器配上游：REALITY 的 dest 是域名，解析不该依赖本机
+        // resolver 的实现。2026-10-28 圣克拉拉 2096 的 503 根因是 Xray 26.10.21
+        // 与内置 mihomo 1.19.10 的 REALITY 不兼容，不是空 DNS；这里只是把解析路径
+        // 钉死。不写 queryStrategy：专用实例的出口族没有传进来，默认 UseIP 对
+        // v4-only 与 v6-only 服务器都能解析出可用的 dest。
+        "dns": { "servers": ["8.8.8.8", "1.1.1.1"] },
         // AsIs：域名保持未解析交给上游代理**远端解析**——既避开 GFW 的 DNS 污染，
         // 也避免 DNS 泄漏到本机。
         "routing": { "domainStrategy": "AsIs", "rules": rules }
@@ -384,8 +711,12 @@ async fn ensure_material(
             .ok_or_else(|| "出口不存在".to_string())?
             .1
     };
+    // 复用入口的材料没有 REALITY 私钥/公钥（只有 uuid/口令）；切回专用实例时
+    // 必须重新生成，否则会写出一个公钥为空的 REALITY 入站，所有客户端握手失败。
     if let Ok(m) = serde_json::from_str::<Material>(&existing_json) {
-        return Ok(m);
+        if !m.private_key.trim().is_empty() && !m.public_key.trim().is_empty() {
+            return Ok(m);
+        }
     }
     let stdout = run_cmd_ok(sess, cancel, "配置", "xray x25519", CONFIG_TIMEOUT)
         .await?
@@ -399,6 +730,7 @@ async fn ensure_material(
         private_key,
         public_key,
         short_id,
+        password: Uuid::new_v4().to_string(),
     };
     let json = serde_json::to_string(&m).map_err(|e| e.to_string())?;
     {
@@ -408,23 +740,113 @@ async fn ensure_material(
     Ok(m)
 }
 
-/// 部署/拆除执行体：**该中转机的出口集合是唯一事实源**，整份重渲染 + 服务动作 + 节点写回。
-/// 幂等——新增/删除/重建都跑同一条路径，重复执行结果一致。
-pub async fn run_upstream_job(
+/// 上游出口 job 的总入口。
+///
+/// 两条路径：
+/// - **复用主入口**（`entry_proto` 非空）：调用主部署主线把 `up-<id>` 用户/出站/路由
+///   渲染进主配置，并写回客户端节点；若出口选的是尚未部署的协议，主部署顺手创建它。
+/// - **旧专用实例**（`entry_proto` 空）：仍走 `xray-upstream` 独立配置（存量兼容）。
+///
+/// 删除复用出口后行已不在 DB，`req.cleanup_protocols` 让主部署把残留用户摘掉；
+/// 即使一条复用出口都不剩，也会跑一次主部署清理，然后停掉旧专用实例。
+pub(crate) async fn run_upstream_job(
+    state: &Arc<AppState>,
+    req: &UpstreamReq,
+    cancel: &Arc<AtomicBool>,
+    emit: &EmitFn,
+    // None 只在单测里出现（旧专用实例路径不碰主部署）；生产 dispatch 必为 Some。
+    deploy_runner: Option<&ProdRunner>,
+) -> Result<(), String> {
+    // 1 该机全部出口：按入口模式分组。主部署只负责复用行，旧实例只负责 legacy 行。
+    emit(JobProgress {
+        job_id: req.job_id,
+        kind: "upstream".into(),
+        step: "探测".into(),
+        message: "读取中转机与出口配置".into(),
+        progress: 2,
+        error: None,
+    });
+    let (reused, deployed, has_legacy) = {
+        let conn = state.db.lock();
+        let rows = repos::upstreams::list_by_server(&conn, req.server_id)
+            .map_err(|e| format!("读取出口失败: {e}"))?;
+        let has_legacy = rows.iter().any(|u| u.entry_proto.is_empty());
+        let reused: Vec<Upstream> = rows
+            .into_iter()
+            .filter(|u| !u.entry_proto.is_empty())
+            .collect();
+        drop(conn);
+        let deployed =
+            crate::servers::deploy::deployed_protocols(state, req.server_id).unwrap_or_default();
+        (reused, deployed, has_legacy)
+    };
+    // 主部署要保留的协议：已部署的主协议 ∪ 复用出口的入口协议。后者保证「选了尚未
+    // 部署的协议」时会被创建；前者保证其它已部署协议不会在整文件重渲染时被删掉。
+    let mut protocols = deployed.clone();
+    for u in &reused {
+        if !protocols.contains(&u.entry_proto) {
+            protocols.push(u.entry_proto.clone());
+        }
+    }
+    // 删除复用出口：行已不在 DB，但它的入口协议仍是主协议；只要它还部署着，
+    // 就必须重渲染一次才能摘掉 up-<id> 用户与住宅出站。
+    let cleanup_needed = req
+        .cleanup_protocols
+        .iter()
+        .any(|p| deployed.iter().any(|d| d == p));
+    let progress_base = if !reused.is_empty() || cleanup_needed {
+        // 旧专用实例还要在 75 之后处理；没有 legacy 行时主部署可以一直走到 95，
+        // 最后 95→100 留给「停用旧实例（如有）」。
+        let to = if has_legacy { 75 } else { 95 };
+        let runner =
+            deploy_runner.ok_or_else(|| "内部错误：复用入口需要主部署执行器".to_string())?;
+        runner
+            .run_deploy_with(
+                state,
+                DeployRequest {
+                    job_id: req.job_id,
+                    server_id: req.server_id,
+                    protocols,
+                    // None = 复用既有节点里的自定义伪装域名，不回落默认值。
+                    reality_dest: None,
+                    enable_bbr: false,
+                },
+                cancel,
+                emit,
+                DeployProgress {
+                    kind: "upstream",
+                    from: 5,
+                    to,
+                },
+            )
+            .await?;
+        to
+    } else {
+        0
+    };
+    // 2 旧专用实例（存量）。rows 为空时它只做停用/清理，不装 Xray、不碰主配置。
+    run_legacy_upstream_job(state.as_ref(), req, cancel.as_ref(), emit, progress_base).await
+}
+
+/// 旧专用实例（`xray-upstream`）的部署/拆除执行体。
+/// `progress_base` 把本阶段的 5→100 映射到总进度的后半段（主部署已占用前半段）。
+async fn run_legacy_upstream_job(
     state: &AppState,
     req: &UpstreamReq,
     cancel: &AtomicBool,
     emit_raw: &EmitFn,
+    progress_base: i64,
 ) -> Result<(), String> {
     // EmitFn 吃的是 JobProgress（jobs/mod.rs），这里包一层三元组签名，与 deploy 的
     // emit_progress 同款；闭包直接叫 emit，函数体里的调用点无需再区分。
     let emit = |step: &str, message: &str, progress: i64| {
+        let mapped = progress_base + progress * (100 - progress_base) / 100;
         emit_raw(JobProgress {
             job_id: req.job_id,
             kind: "upstream".into(),
             step: step.to_string(),
             message: message.to_string(),
-            progress,
+            progress: mapped,
             error: None,
         });
     };
@@ -442,8 +864,12 @@ pub async fn run_upstream_job(
         let (auth, server) =
             load_auth(state, req.server_id).map_err(|e| format!("读取服务器失败: {e}"))?;
         let conn = state.db.lock();
-        let rows = repos::upstreams::list_by_server(&conn, req.server_id)
-            .map_err(|e| format!("读取出口失败: {e}"))?;
+        let rows: Vec<Upstream> = repos::upstreams::list_by_server(&conn, req.server_id)
+            .map_err(|e| format!("读取出口失败: {e}"))?
+            .into_iter()
+            // 复用主入口的行由主部署负责，绝不进专用实例渲染。
+            .filter(|u| u.entry_proto.is_empty())
+            .collect();
         (auth, server, rows)
     };
 
@@ -456,6 +882,32 @@ pub async fn run_upstream_job(
     )
     .await
     .map_err(|e| e.to_string())?;
+
+    // 没有 legacy 出口：专用实例若存在就停掉并清理，然后结束。不装 Xray、
+    // 不探测 systemd——这台机器现在可能只跑复用主入口的出口。
+    if rows.is_empty() {
+        emit("清理", "停用旧的专用上游实例（如有）", 80);
+        let _ = run_cmd(
+            &mut sess,
+            cancel,
+            "清理",
+            &format!("systemctl disable --now {UPSTREAM_SERVICE}"),
+            CONFIG_TIMEOUT,
+        )
+        .await;
+        let _ = run_cmd(
+            &mut sess,
+            cancel,
+            "清理",
+            &format!(
+                "rm -f {UPSTREAM_CONFIG_PATH} {UPSTREAM_UNIT_PATH} && systemctl daemon-reload"
+            ),
+            CONFIG_TIMEOUT,
+        )
+        .await;
+        emit("完成", "上游出口已就绪", 100);
+        return Ok(());
+    }
 
     // 2 探测：OS 与 systemd
     let caps = run_cmd(
@@ -473,10 +925,17 @@ pub async fn run_upstream_job(
     }
     check_cancel()?;
 
-    // 3 安装（缺才装）
-    let xray_installed = run_cmd(&mut sess, cancel, "探测", "command -v xray", PROBE_TIMEOUT)
-        .await?
-        .exit_code
+    // 3 安装（缺或版本不符才装）。与主部署同一条版本探测：Xray 26.10.21 的
+    // REALITY 与内置 mihomo 不兼容，已装新版的机器也要降级到钉住的 26.3.27。
+    let xray_installed = run_cmd(
+        &mut sess,
+        cancel,
+        "探测",
+        &crate::servers::deploy_spec::xray_installed_probe_cmd(),
+        PROBE_TIMEOUT,
+    )
+    .await?
+    .exit_code
         == 0;
     if !xray_installed {
         emit("安装", "安装 Xray（可能耗时数分钟）", 30);
@@ -564,7 +1023,8 @@ pub async fn run_upstream_job(
                 .collect();
             let allow_cmd = crate::servers::deploy_spec::firewall_allow_cmd(&ports);
             if !allow_cmd.is_empty() {
-                if let Err(e) = run_cmd_ok(&mut sess, cancel, "放行", &allow_cmd, CONFIG_TIMEOUT).await
+                if let Err(e) =
+                    run_cmd_ok(&mut sess, cancel, "放行", &allow_cmd, CONFIG_TIMEOUT).await
                 {
                     // 这里不判失败：可能没装 iptables，也可能本就由别处（云侧镜像/ufw）放行。
                     // 真正的判据是最后那次「从本机连它」——那才是客户端要走的路径。

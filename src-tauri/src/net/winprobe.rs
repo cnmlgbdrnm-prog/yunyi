@@ -441,22 +441,25 @@ impl Family {
     }
 }
 
-/// TCP 连接状态。**只区分「是不是已建立」**——掐既有连接（`net::takeover`）只认
+/// TCP 连接状态。掐既有连接（`net::takeover`）只认
 /// `Established`：`TIME_WAIT` 之类的残行不该被当成活的连接下手。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
     /// `MIB_TCP_STATE_ESTAB`(5)
     Established,
-    /// 其余 TCP 状态（CLOSED/LISTEN/SYN_SENT/FIN_WAIT/…）。不必细分：判定只认 5
+    /// CLOSED / TIME_WAIT / DELETE_TCB：无正在进行的数据连接，不进入当前泄漏分类。
+    Closed,
+    /// 其余 TCP 状态（LISTEN/SYN_SENT/FIN_WAIT/…）；保留正在尝试建立的连接。
     Other,
     /// 没有状态字段的表（UDP 行）
     Unknown,
 }
 
-/// `MIB_TCP_STATE` → [`TcpState`]。只认 5，其余一律 `Other`。
+/// 保留 SYN_SENT 等尝试连接；仅将明确关闭的状态标成 Closed。
 fn tcp_state(raw: u32) -> TcpState {
     match raw {
         5 => TcpState::Established,
+        1 | 11 | 12 => TcpState::Closed,
         _ => TcpState::Other,
     }
 }

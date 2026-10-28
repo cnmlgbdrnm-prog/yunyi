@@ -1,4 +1,4 @@
-//! 服务器测速域服务：阶段1（本机 TCP 延迟 + SSH curl 带宽）批量编排与阶段2
+//! 服务器测速域服务：阶段1（单次 SSH 端响应 + SSH curl 带宽）批量编排与阶段2
 //! （服务器间 iperf3 吞吐 + 安装，iperf）。编排职责：按并发窗口分块并发测速
 //! （JoinSet）、每台写库 + 事件（step='server'）、终态事件（step='完成'）、
 //! 块间取消检查；单台失败不判任务失败，仅取消/前置失败才 Err。
@@ -15,8 +15,8 @@ use std::time::Duration;
 pub mod iperf;
 pub mod phase1;
 
-/// 阶段1 延迟采样数（3 采样取最小）。
-pub const LATENCY_SAMPLES: u8 = 3;
+/// 服务器页只做一次端响应检测；精确链路延迟由节点测速提供。
+pub const LATENCY_SAMPLES: u8 = 1;
 /// 阶段1 带宽下载整体超时（curl --max-time 30 + 余量）。
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45);
 /// SSH 连接超时（连接+认证两阶段）。
@@ -167,7 +167,7 @@ async fn test_server(
     let mut latency: Option<i64> = None;
     let mut bandwidth: Option<i64> = None;
     let mut errors: Vec<String> = Vec::new();
-    match phase1::tcp_latency_ms(
+    match phase1::ssh_response_latency_ms(
         crate::domain::effective_host(&srv),
         srv.port as u16,
         LATENCY_SAMPLES,

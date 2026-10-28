@@ -224,7 +224,9 @@ export default function Dashboard({
       }).catch(() => {})
       getSystemProxy().then((proxy) => {
         if (active) setSystemProxy(proxy)
-      }).catch(() => {})
+      }).catch(() => {
+        if (active) setSystemProxy(undefined)
+      })
     }, 2000)
     return () => {
       active = false
@@ -333,6 +335,7 @@ export default function Dashboard({
         netSelectBusy={netSelectBusy}
         netTunBusy={netTunBusy}
         proxyRepairBusy={proxyRepairBusy}
+        proxyUnknown={systemProxy === undefined}
         exitMode={exitMode}
         selectedNode={selectedNode}
         clientNodes={clientNodes}

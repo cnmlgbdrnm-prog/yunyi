@@ -148,7 +148,9 @@ export default function ServerRow({
                   </span>
                 </p>
                 <p className="text-xs text-neutral-500">
-                  {s.latency != null ? `延迟 ${s.latency}ms` : '延迟 —'} ·{' '}
+                  <span title="单次拨号到收到远端 SSH 首响应的总耗时，包含建连及服务器响应开销；链路延迟请看节点测速。旧记录需重新测速。">
+                    {s.latency != null ? `端响应 ${s.latency}ms` : '端响应 —'}
+                  </span> ·{' '}
                   {s.bandwidth != null ? `下载 ${formatBandwidth(s.bandwidth)}` : '下载 —'} · 上次测速 {formatCheckedAt(s.last_checked_at)}
                 </p>
                 <div className="space-y-0.5">

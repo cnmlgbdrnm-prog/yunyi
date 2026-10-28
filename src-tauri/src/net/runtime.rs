@@ -9,6 +9,7 @@ use crate::domain::{Node, RelayRule, Server};
 use crate::net::connlog::parse_connections;
 use crate::net::firewall::{self, BlockReply, FirewallState};
 use crate::net::{geodata, local_proxy, sysproxy_set, NetStatus, StartOptions};
+mod proxy_guard;
 use crate::service::client as svc;
 use crate::service::protocol::{Request as SvcRequest, Response as SvcResponse};
 use crate::speed::sidecar;
@@ -448,6 +449,9 @@ pub async fn start(state: &AppState, opts: StartOptions) -> Result<NetStatus, St
             // 幂等重入可能发生在 TUN 已经开着的时候，这里必须问服务要真实状态，
             // 不能想当然填 false——那会让界面把开着的 TUN 显示成关着
             let tun = via_service && service_state().is_some_and(|(_, t)| t);
+            if !tun {
+                proxy_guard::ensure(n, true).await?;
+            }
             return Ok(NetStatus {
                 running: true,
                 port: Some(n.mixed_port),
@@ -665,7 +669,19 @@ pub async fn start(state: &AppState, opts: StartOptions) -> Result<NetStatus, St
     .await
     {
         Ok(()) => {
-            let snapshot = sysproxy_set::apply_net_proxy(mixed_port)?;
+            let snapshot = match sysproxy_set::apply_net_proxy(mixed_port) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // 配置失败不能让已启动的 mihomo 成为占端口的孤儿。
+                    if let Some(mut process) = child {
+                        let _ = process.kill();
+                        let _ = process.wait();
+                    } else {
+                        let _ = svc::call(&SvcRequest::StopNet);
+                    }
+                    return Err(error);
+                }
+            };
             // 登记本地代理：此后进程内所有出站裸 TCP（SSH/部署/服务器测速控制
             // 通道）经 mixed-port 拨号，白拿 mihomo 的规则路由。放在系统代理写
             // 成功之后，与 RunningNet 入槽同步——启动失败就不登记，行为同以前。
@@ -722,6 +738,7 @@ pub async fn start(state: &AppState, opts: StartOptions) -> Result<NetStatus, St
             *guard = Some(running);
             // 先放锁再挑出口：`select` 内部要拿同一把 `state.net`，握着不放就是死锁。
             drop(guard);
+            proxy_guard::spawn(state, token.clone());
             // 开网络就按已有读数把出口落到实测最快。不这么做的话，开着「自动选择」
             // 起来的这段会先由 url-test 按延迟挑一个——正是那个选项要避免的事——
             // 直到用户下次测速才纠正。读数为空/过期时它自己会放弃，停在 url-test。
@@ -897,21 +914,7 @@ pub async fn repair_system_proxy(state: &AppState) -> Result<(), String> {
     // 一直持锁到注册表写完：否则 stop 可在就绪探测后停掉进程，留下死端口代理。
     let guard = state.net.lock().await;
     let n = guard.as_ref().ok_or("客户端未运行")?;
-    let (mixed, ctrl, token) = (n.mixed_port, n.ctrl_port, n.token.clone());
-    sidecar::wait_ready(
-        None::<&mut std::process::Child>,
-        ctrl,
-        &token,
-        std::time::Duration::from_secs(5),
-    )
-    .await
-    .map_err(|e| format!("代理进程未就绪，未修改系统代理: {e}"))?;
-    let _ = sysproxy_set::apply_net_proxy(mixed)?;
-    let expected = format!("http://127.0.0.1:{mixed}");
-    if crate::sysproxy::system_proxy_url().as_deref() != Some(expected.as_str()) {
-        return Err("已写入系统代理，但回读未确认生效".into());
-    }
-    Ok(())
+    proxy_guard::ensure(n, true).await
 }
 
 pub async fn status(state: &AppState) -> Result<NetStatus, String> {
@@ -1006,6 +1009,10 @@ pub async fn set_tun(state: &AppState, enable: bool) -> Result<(), String> {
         return Err("当前 mihomo 是主程序直接启动的（无提权通道），开不了 TUN。\
                     请先安装网络服务后重新开启网络"
             .to_string());
+    }
+    // 在撤 TUN 前先补齐并确认系统代理；失败保留隧道，避免切回后只剩环境变量。
+    if !enable {
+        proxy_guard::ensure(guard.as_ref().ok_or("客户端未运行")?, true).await?;
     }
     // **开 TUN 之前**先取一次表：TUN 是在 IP 层接管**新**流量，开关那一刻已经建立的
     // 连接会留在隧道外继续直连——2026-09-22 实测：WpnService 的两条（4.145.79.81/82）

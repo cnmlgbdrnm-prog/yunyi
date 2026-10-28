@@ -39,6 +39,9 @@ pub struct DeployRequest {
 pub struct UpstreamReq {
     pub job_id: i64,
     pub server_id: i64,
+    /// 删除复用出口后要重渲染的主协议（行已不在 DB，需调用方显式带入以清理
+    /// 主配置里残留的 `up-<id>` 用户/出站/路由）。
+    pub cleanup_protocols: Vec<String>,
 }
 
 /// 隐私入口（Tor Onion）部署/重建请求。

@@ -100,6 +100,7 @@ export type ConnVerdict =
   | 'direct'
   | 'direct_cn'
   | 'proxy_egress'
+  | 'known_server'
   | 'leak'
   | 'suspect'
 
@@ -242,15 +243,26 @@ export interface ShareInfo {
   legacy: boolean
   status: ShareStatus
   status_detail: string | null
-  /** 旧口径合计配额；新分享为上下行配额之和 */
+  /** 旧口径合计配额；新分享写 0（判停只看总额度） */
   quota_bytes: number
+  quota_total_bytes?: number | null
+  total_usage?: {
+    state: 'ready' | 'blocked_quota' | 'error'
+    total_used_bytes?: number | null
+    history_charge_bytes: number
+    public_rx_bytes: number
+    public_tx_bytes: number
+    started_at?: string | null
+    updated_at?: string | null
+    detail?: string | null
+  } | null
   used_bytes: number
-  /** 上下行各自独立配额；0 = 该方向不限 */
+  /** 方向配额；新分享恒为 0（不限，仅保留方向用量统计） */
   quota_up_bytes: number
   quota_down_bytes: number
   used_up_bytes: number
   used_down_bytes: number
-  /** true = 上下行分别判停；false = 旧分享的合计口径 */
+  /** true = 带方向用量统计；判停只用总额度 */
   split_quota: boolean
   rate_up_mbps: number
   rate_down_mbps: number
@@ -515,6 +527,20 @@ export interface Privacy {
 
 /** 上游出口：中转机上指向静态住宅 IP 代理的一个出口。
  *  注意**不含密码**——凭据只在后端，经 IPC 拿不到。 */
+/** 上游出口「入口协议」下拉里的一项（服务器上已部署、可复用的主入站） */
+export interface UpstreamEntryOption {
+  node_id: string
+  protocol: string
+  port: number
+  label: string
+}
+
+/** 入口协议选项：deployed = 可直接复用；supported = 支持复用但尚未部署 */
+export interface UpstreamEntryOptions {
+  deployed: UpstreamEntryOption[]
+  supported: string[]
+}
+
 export interface Upstream {
   id: number
   server_id: number
@@ -524,9 +550,16 @@ export interface Upstream {
   host: string
   port: number
   username: string
-  /** 中转机上本实例的入站端口（客户端节点连的就是它） */
+  /** 旧专用实例的入站端口；复用主入口时恒为 0 */
   listen_port: number
+  /** 旧专用实例的 REALITY 伪装域名；复用主入口时为空 */
   reality_dest: string
+  /** 复用入口的主节点 id；null = 旧专用实例或该协议尚未部署 */
+  entry_node_id: string | null
+  /** 复用入口协议（vless/trojan/vmess/hysteria2/tuic）；空串 = 旧专用实例 */
+  entry_proto: string
+  /** 复用入口当前端口；0 = 该协议尚未部署（下次部署会补上） */
+  entry_port: number
   node_id: string | null
   /** 最近一次探测到的出口 IP */
   egress_ip: string | null

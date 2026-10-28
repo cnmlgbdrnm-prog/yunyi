@@ -42,21 +42,21 @@ pub fn parse_proxy_server(raw: &str) -> Option<String> {
     }
 }
 
-/// 读取系统代理 URL。Windows：WinINET HKCU（ProxyEnable + ProxyServer），
+/// 读取系统代理 URL。Windows：WinINET 连接级 API（与写入和浏览器采用同一口径），
 /// 未启用/读取失败/无可解析段返回 None；非 Windows 平台返回 None。
 #[cfg(windows)]
 pub fn system_proxy_url() -> Option<String> {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let settings = crate::net::sysproxy_windows::read().ok()?;
+    let native = parse_proxy_server(settings.manual_server()?)?;
     let key = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
         .ok()?;
-    let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
-    if enabled == 0 {
+    if key.get_value::<u32, _>("ProxyEnable").ok()? == 0 {
         return None;
     }
-    let server: String = key.get_value("ProxyServer").ok()?;
-    parse_proxy_server(&server)
+    let registry = parse_proxy_server(&key.get_value::<String, _>("ProxyServer").ok()?)?;
+    (native == registry).then_some(native)
 }
 
 #[cfg(not(windows))]

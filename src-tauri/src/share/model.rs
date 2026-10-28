@@ -23,6 +23,10 @@ pub struct ShareInfo {
     /// 旧口径合计配额（仅旧分享使用；新分享的合计值也会写在这里便于展示）。
     pub quota_bytes: u64,
     pub used_bytes: u64,
+    #[serde(default)]
+    pub quota_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_usage: Option<TotalUsage>,
     /// 上行/下行各自独立配额；0 = 该方向不限。
     pub quota_up_bytes: u64,
     pub quota_down_bytes: u64,
@@ -89,22 +93,19 @@ pub struct ShareSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShareOptions {
-    /// 上行配额；0 = 不限。
-    pub quota_up_bytes: u64,
-    /// 下行配额；0 = 不限。
-    pub quota_down_bytes: u64,
+    /// 公网双向总额度；**唯一会停用分享的配额**。0 = 只计量不限流。
+    pub quota_total_bytes: u64,
     pub rate_up_mbps: u32,
     pub rate_down_mbps: u32,
     pub expires_in_days: u32,
 }
 
-/// 1 GB = 1024³（与 UI 文案一致）。
+/// Traffic quotas use decimal GB: 100 GB = 100,000,000,000 bytes.
 pub fn quota_gb_to_bytes(gb: u64) -> u64 {
-    gb.saturating_mul(1024 * 1024 * 1024)
+    gb.saturating_mul(1_000_000_000)
 }
 
 pub fn validate_options(o: &ShareOptions) -> Result<(), String> {
-    // 每个方向 0 = 不限；两个方向都填 0（完全不限）也允许，分享仍受到期时间约束。
     if o.rate_up_mbps > 100_000 || o.rate_down_mbps > 100_000 {
         return Err("速率上限过大".into());
     }
@@ -121,9 +122,12 @@ pub struct ShareManifest {
     pub token: String,
     pub server_id: i64,
     pub created_at: String,
-    /// 旧口径合计配额（旧分享必填；新分享写成上下行之和，仅供参考）。
+    /// 旧口径合计配额（旧分享必填；新分享写 0——判停只看总额度）。
     pub quota_bytes: u64,
-    /// 新口径：上下行各自独立配额。两个字段都缺失 = 旧分享，仍按 quota_bytes 合计判停。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_total_bytes: Option<u64>,
+    /// 旧口径的上下行方向配额。旧分享缺失 = 按 quota_bytes 合计判停；
+    /// 新分享统一写 `Some(0)`：仅保留方向用量统计，不再单独限额。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_up_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,11 +137,14 @@ pub struct ShareManifest {
     pub expires_at_unix: i64,
     pub http_port: u16,
     pub domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn: Option<super::cdn::ShareCdn>,
     pub nodes: Vec<ShareNode>,
 }
 
 impl ShareManifest {
-    /// 是否使用上下行独立配额。任一字段存在即视为新口径；缺失的方向按 0（不限）处理。
+    /// 是否带方向计数（`Some(0)` 也算）。新分享恒为 true，但 0 表示不限流；
+    /// 判定停用只看总额度。
     pub fn uses_split_quota(&self) -> bool {
         self.quota_up_bytes.is_some() || self.quota_down_bytes.is_some()
     }
@@ -163,9 +170,9 @@ pub struct ShareNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GatewayConfig {
-    /// 旧口径合计配额；新口径下仍写上下行之和，仅供旧网关脚本兜底。
+    /// 旧口径合计配额；新分享写 0（网关不限流，总额度由 meter 判停）。
     pub quota_bytes: u64,
-    /// 新口径：任一字段存在即启用上下行独立配额。
+    /// 方向配额。新分享写 `Some(0)`：只统计方向用量，不单独判停。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_up_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,6 +208,25 @@ pub struct UsageState {
     pub blocked_direction: Option<String>,
     #[serde(default)]
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TotalUsage {
+    pub state: String,
+    #[serde(default)]
+    pub total_used_bytes: Option<u64>,
+    #[serde(default)]
+    pub history_charge_bytes: u64,
+    #[serde(default)]
+    pub public_rx_bytes: u64,
+    #[serde(default)]
+    pub public_tx_bytes: u64,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 impl UsageState {

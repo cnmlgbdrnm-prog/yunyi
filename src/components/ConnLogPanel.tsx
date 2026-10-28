@@ -17,6 +17,7 @@ import { useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { netConnLog } from '../api'
 import type { ConnLogSnapshot, ConnRow } from '../api/types'
+import { formatBytes } from '../utils/format'
 
 /** 一屏最多几行（后端已按严重度排序，泄漏不会被截掉） */
 const ROW_LIMIT = 200
@@ -46,6 +47,7 @@ const VERDICT_TEXT: Record<string, string> = {
   suspect: '疑点',
   direct_cn: '国内直连',
   proxy_egress: '隧道出站',
+  known_server: '已知服务器',
   direct: '规则直连',
   proxied: '经代理',
 }
@@ -59,6 +61,7 @@ const VERDICT_CLASS: Record<string, string> = {
   // 隧道出站：比「规则直连」还淡。它是本机代理拨号到自己节点的那条连接，
   // 既不值得看也不该消失——26 条同一目标的记录，抢眼就会把真信号压下去
   proxy_egress: 'bg-neutral-800 text-neutral-400',
+  known_server: 'bg-neutral-800 text-neutral-400',
   direct: 'bg-neutral-700 text-neutral-300',
   proxied: 'bg-emerald-900 text-emerald-100',
 }
@@ -137,12 +140,8 @@ function rowKeys(rows: ConnRow[]): string[] {
 }
 
 function bytesText(n: number): string {
-  if (!n) return '—'
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
-  // 会话总量轻易过 1GB，没有这档就会渲染成 1234.5 MB
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
+  // 0/未采样仍显示「—」；其余与分享页、中转链路共用十进制流量单位。
+  return n ? formatBytes(n) : '—'
 }
 
 export default function ConnLogPanel() {
