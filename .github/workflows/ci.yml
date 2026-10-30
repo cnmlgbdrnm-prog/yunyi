@@ -39,6 +39,11 @@ jobs:
       - name: 校验打包资源
         run: npm run check:package
         working-directory: .
+      # rustfmt 不认 cfg 门控：src 里的 `#[path = "../tests/..."] mod` 在 CI 上
+      # 找不到文件会直接失败。补空占位模块后再 fmt（本地 tests/ 齐全时为空操作）。
+      - name: 补齐未入库测试模块
+        run: node scripts/stub-rust-test-modules.mjs
+        working-directory: .
       - name: cargo fmt
         run: cargo fmt --check
       # 不带 local-tests 特性：测试源码不在仓库里，cfg 门控会把所有测试模块剥离。
