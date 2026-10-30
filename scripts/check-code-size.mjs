@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs'
 const COMPONENT_LIMIT = 1000
 const FILE_LIMIT = 3000
 
-// 计入 1500 行上限的代码扩展名。
+// 计入 3000 行上限的代码扩展名。
 const CODE_EXTS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.rs', '.css', '.html'])
 // 计划/设计文档、锁文件与生成物不属于代码规范范围。
 const EXCLUDED_PATHS = [

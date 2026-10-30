@@ -5,7 +5,7 @@
 ## 检查
 
 - [ ] `npm run check:org`（文档分层/命名/死链、根目录白名单、views 依赖）
-- [ ] `npm run check:size`（UI 组件 ≤500 行、单文件 ≤1500 行）
+- [ ] `npm run check:size`（UI 组件 ≤1000 行、单文件 ≤3000 行）
 - [ ] `npx tsc --noEmit -p tsconfig.json`
 - [ ] `cargo fmt --check`
 - [ ] `cargo clippy --all-targets -- -D warnings`

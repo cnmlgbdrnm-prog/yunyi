@@ -64,7 +64,7 @@ jobs:
       # scripts/sensitive-allowlist.txt）。
       - name: sensitive check
         run: npm run check:sensitive
-      # 代码规模硬规范：UI 组件 ≤500 行、单文件 ≤1500 行（docs/ 与生成物不计）。
+      # 代码规模硬规范：UI 组件 ≤1000 行、单文件 ≤3000 行（docs/ 与生成物不计）。
       - name: code size check
         run: npm run check:size
       # 项目组织规范：文档必须分层进 docs/<分类>/、根目录白名单、文档死链、

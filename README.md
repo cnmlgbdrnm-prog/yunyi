@@ -106,9 +106,9 @@ npm run tauri build  # 生成安装包
 完整规则见 [`docs/engineering/project-conventions.md`](docs/engineering/project-conventions.md)；
 规范只约束代码与文档落位，锁文件与生成物不计。
 
-- **UI 组件 ≤ 500 行**：`src/` 下的 `.tsx` 文件不得超过 500 行。
-- **单文件 ≤ 1500 行**：`.ts` / `.tsx` / `.js` / `.mjs` / `.rs` / `.css` / `.html`
-  等代码文件不得超过 1500 行。
+- **UI 组件 ≤ 1000 行**：`src/` 下的 `.tsx` 文件不得超过 1000 行。
+- **单文件 ≤ 3000 行**：`.ts` / `.tsx` / `.js` / `.mjs` / `.rs` / `.css` / `.html`
+  等代码文件不得超过 3000 行。
 - **公共子组件必须复用**：新增 UI 前先检查 `src/components/` 是否已有可复用实现；
   重复的公共子组件（按钮、开关、列表行、表单等）必须抽成共享组件，不得复制重写。
   该条为评审硬要求，无法完全自动检测。

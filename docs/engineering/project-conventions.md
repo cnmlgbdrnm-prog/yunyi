@@ -10,7 +10,7 @@
 |---|---|---|
 | 根目录 | 仓库级配置、`README.md`、`CHANGELOG.md`、`LICENSE` | 只允许白名单文件/目录（`ROOT_FILES` / `ROOT_DIRS`）；新增必须登记 |
 | `src/` | React 前端 | 顶层只允许 `App.tsx`、`main.tsx`、`styles.css`、`vite-env.d.ts` |
-| `src-tauri/src/` | Rust 后端 | 按领域分模块；IPC 壳与业务分离；单文件 ≤1500 行 |
+| `src-tauri/src/` | Rust 后端 | 按领域分模块；IPC 壳与业务分离；单文件 ≤3000 行 |
 | `scripts/` | 随仓库分发的构建/检查脚本 | 必须可重复执行、失败退出非 0；检查脚本纳入 CI |
 | `tests/` | 本地测试源码（前端 + Rust） | **不随仓库上传**（`.gitignore`）；目录镜像源码结构 |
 | `docs/` | 所有项目文档 | 必须落在 `docs/<分类>/` 下，禁止裸放 |
@@ -79,7 +79,7 @@ CI 会解析 Markdown 的行内链接/图片、引用定义与 HTML 的 `href`�
 
 强制规则：
 
-- 单个 `.rs` 文件不得超过 1500 行（`npm run check:size`）。
+- 单个 `.rs` 文件不得超过 3000 行（`npm run check:size`）。
 - 拆分模块时用 `pub use` 重导出保持原有路径（如
   `crate::servers::deploy::*`），避免测试与调用点跟着改。
 - 纯函数与 I/O 编排分离：解析/生成放 `*_spec`，SSH/文件执行留在编排模块。
@@ -119,7 +119,7 @@ CI 会解析 Markdown 的行内链接/图片、引用定义与 HTML 的 `href`�
 | 命令 | 覆盖内容 | CI |
 |---|---|---|
 | `npm run check:org` | 文档分层/命名/死链、根目录白名单、`src/` 顶层入口、views 互引 | 是 |
-| `npm run check:size` | UI 组件 ≤500 行、单文件 ≤1500 行 | 是 |
+| `npm run check:size` | UI 组件 ≤1000 行、单文件 ≤3000 行 | 是 |
 | `npm run check:sensitive` | 真实 IP / 凭据不入库 | 是 |
 | `npx tsc --noEmit` | 前端类型 | 是 |
 | `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` | Rust 格式与静态检查 | 是 |
