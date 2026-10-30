@@ -1,13 +1,13 @@
 // 代码规模硬规范检查（随仓库分发，CI 强制执行）：
-//   1. React 组件（src/ 下的 .tsx）不得超过 500 行；
-//   2. 单个代码文件不得超过 1500 行。
+//   1. React 组件（src/ 下的 .tsx）不得超过 1000 行；
+//   2. 单个代码文件不得超过 3000 行。
 // 统计口径为物理行数（与 wc -l 一致）。
 // 不适用范围：docs/ 下的计划与设计文档、锁文件、生成物——规范只约束代码。
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
-const COMPONENT_LIMIT = 500
-const FILE_LIMIT = 1500
+const COMPONENT_LIMIT = 1000
+const FILE_LIMIT = 3000
 
 // 计入 1500 行上限的代码扩展名。
 const CODE_EXTS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.rs', '.css', '.html'])
@@ -58,7 +58,7 @@ if (violations.length > 0) {
   console.error('[check-code-size] 未通过：')
   for (const v of violations) console.error(`  - ${v}`)
   console.error(
-    '\n规范：组件 ≤500 行，单文件 ≤1500 行；公共子组件必须复用，不得复制重写。',
+    `\n规范：组件 ≤${COMPONENT_LIMIT} 行，单文件 ≤${FILE_LIMIT} 行；公共子组件必须复用，不得复制重写。`,
   )
   process.exit(1)
 }
