@@ -11,6 +11,7 @@
 
 import { execSync } from 'node:child_process'
 import { readFileSync, existsSync } from 'node:fs'
+import { isIPv4, isIPv6 } from 'node:net'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -45,6 +46,29 @@ function isReserved(ip) {
   return false
 }
 
+// sslip.io 把 IP 编码在主机名里（`203.0.113.13` → `203-0-113-13.sslip.io`），
+// 明文 IP 扫描抓不到。这里把标签解码回地址再套同样的放行规则。
+function reservedV6(ip) {
+  const s = ip.toLowerCase()
+  if (s === '::' || s === '::1') return true
+  if (/^fe[89ab][0-9a-f]?:/.test(s)) return true // 链路本地
+  if (/^f[cd][0-9a-f]{2}:/.test(s)) return true // ULA
+  if (/^2001:db8(?::|$)/.test(s)) return true // 文档示例段
+  return false
+}
+
+function decodeSslipLabel(label) {
+  if (/^(?:\d{1,3}-){3}\d{1,3}$/.test(label)) {
+    const ip = label.replace(/-/g, '.')
+    return isIPv4(ip) || label.split('-').every((n) => Number(n) <= 255) ? ip : null
+  }
+  if (/^[0-9a-f]+(?:-[0-9a-f]*)+$/i.test(label)) {
+    const ip = label.replace(/--/g, '::').replace(/-/g, ':')
+    return isIPv6(ip) ? ip : null
+  }
+  return null
+}
+
 const TOKEN_PATTERNS = [
   [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/, 'GitHub token'],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/, 'GitHub PAT'],
@@ -54,6 +78,9 @@ const TOKEN_PATTERNS = [
 ]
 
 const IP_RE = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g
+const SS_SLIP_RE = /\b([0-9a-f]+(?:-[0-9a-f]*)+)\.sslip\.io\b/gi
+// IPv6 候选：至少三段十六进制并以冒号分隔；是否合法交给 net.isIPv6 判断。
+const V6_RE = /(?<![0-9A-Za-z:])(?:[0-9a-f]{1,4}:){2,}[0-9a-f:]{0,}(?![0-9A-Za-z:])/gi
 const KEY_RE = /-----BEGIN (?:RSA |OPENSSH |EC |DSA |PGP )?PRIVATE KEY-----/
 
 const allowlist = loadAllowlist()
@@ -88,6 +115,20 @@ for (const file of files) {
       const ip = m[0]
       if (isReserved(ip) || allowlist.has(ip)) continue
       report(file, lineNo, `未登记的公网 IP ${ip}（确为测试夹具请加入 scripts/sensitive-allowlist.txt）`)
+    }
+
+    for (const m of line.matchAll(SS_SLIP_RE)) {
+      const ip = decodeSslipLabel(m[1])
+      if (!ip) continue
+      if (isIPv4(ip) ? isReserved(ip) : reservedV6(ip)) continue
+      if (allowlist.has(ip)) continue
+      report(file, lineNo, `sslip 域名 ${m[0]} 编码了未登记的公网地址 ${ip}`)
+    }
+
+    for (const m of line.matchAll(V6_RE)) {
+      const ip = m[0].toLowerCase()
+      if (!isIPv6(ip) || reservedV6(ip) || allowlist.has(ip)) continue
+      report(file, lineNo, `未登记的公网 IPv6 ${ip}（确为示例请加入 scripts/sensitive-allowlist.txt）`)
     }
   })
 }

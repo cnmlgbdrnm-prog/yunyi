@@ -1,0 +1,2 @@
+# 真实主机 IP / 凭据不得进入版本库；与 CI 的 sensitive check 使用同一脚本。
+npm run check:sensitive
