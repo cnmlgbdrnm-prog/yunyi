@@ -55,10 +55,10 @@ struct SidecarEntry {
 /// `probe_egress_ip` 各自 `new` 一个引擎，但热重载的是同一个 mihomo 进程；
 /// 若各持一份表，A 的 `PUT /configs` 会把 B 刚注入的节点整份抹掉。
 type ProxyTable = tokio::sync::Mutex<BTreeMap<String, SidecarEntry>>;
+type SharedProxyTables = std::sync::Mutex<HashMap<(u16, String), Weak<ProxyTable>>>;
 
 fn shared_proxy_table(controller_port: u16, token: &str) -> Arc<ProxyTable> {
-    static TABLES: OnceLock<std::sync::Mutex<HashMap<(u16, String), Weak<ProxyTable>>>> =
-        OnceLock::new();
+    static TABLES: OnceLock<SharedProxyTables> = OnceLock::new();
     let tables = TABLES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = crate::util::lock_ignore_poison(tables);
     // 死引擎的表顺手清掉，避免长进程里按每次 sidecar 重启累积。

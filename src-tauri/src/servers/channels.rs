@@ -262,13 +262,13 @@ fn accept_rule_check(port: i64) -> String {
 /// v6 超时，ip6tables 无对应规则）。有 ip6tables 就同步放行；命令仍以 v4
 /// 成功为前提，v4 失败时不要再用 v6 的 0 退出码把失败吞掉。
 pub fn ensure_open_cmd(port: i64) -> String {
+    let v4 = accept_rule_check(port);
+    let v6 = format!("ip6tables -C INPUT -p tcp --dport {port} -j ACCEPT");
     format!(
         "( {v4} || iptables -I INPUT 1 -p tcp --dport {port} -j ACCEPT ) && \
          if command -v ip6tables >/dev/null 2>&1; then \
              {v6} || ip6tables -I INPUT 1 -p tcp --dport {port} -j ACCEPT; \
-         fi",
-        v4 = accept_rule_check(port),
-        v6 = format!("ip6tables -C INPUT -p tcp --dport {port} -j ACCEPT"),
+         fi"
     )
 }
 

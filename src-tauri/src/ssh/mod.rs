@@ -213,6 +213,7 @@ impl SshSession {
     ///
     /// 参数外提与 `connect_via` 同理：进程级登记表在并行测试里无法安全复位。
     /// `first_proxy`/`fallback_proxy` 分开传，测试才能让首轮真的走直连。
+    #[allow(clippy::too_many_arguments)] // 参数外提供并行测试使用，拆结构体会改变测试接口
     pub(crate) async fn connect_with_fallback(
         host: &str,
         port: u16,

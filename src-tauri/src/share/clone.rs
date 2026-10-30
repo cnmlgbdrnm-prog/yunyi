@@ -35,6 +35,8 @@ pub struct ClonedConfigs {
     pub singbox_json: String,
 }
 
+// 参数对应主配置、上游、sing-box、SS、节点规格与服务端上下文，拆结构体会牵动调用点。
+#[allow(clippy::too_many_arguments)]
 pub fn clone_configs(
     main_xray: Option<&str>,
     upstream_xray: Option<&str>,
@@ -175,11 +177,11 @@ fn clone_xray(
     specs: &[&ShareNodeSpec],
 ) -> Result<String, String> {
     let main_root = main
-        .map(|s| serde_json::from_str::<serde_json::Value>(s))
+        .map(serde_json::from_str::<serde_json::Value>)
         .transpose()
         .map_err(|e| format!("Xray 主配置解析失败: {e}"))?;
     let upstream_root = upstream
-        .map(|s| serde_json::from_str::<serde_json::Value>(s))
+        .map(serde_json::from_str::<serde_json::Value>)
         .transpose()
         .map_err(|e| format!("上游出口配置解析失败: {e}"))?;
     let main_inbounds = main_root

@@ -205,6 +205,8 @@ pub async fn create_share_cmd(
     .map_err(err)
 }
 
+// Tauri 命令参数与前端 invoke 一一对应，拆成结构体会改变 IPC 契约。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn update_share_cmd(
     state: tauri::State<'_, Arc<AppState>>,

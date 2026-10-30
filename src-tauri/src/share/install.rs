@@ -61,6 +61,7 @@ pub async fn create_share(
 /// 创建编排本体。仅测试直接调用以绕过 TLS 外部依赖；生产路径必须经
 /// [`create_share`]（它会先查证书，并把自动检测到的域名传进来）。
 #[cfg(test)]
+#[allow(dead_code)] // 仅测试直接调用；生产路径走 create_share / create_share_inner_with_domain
 pub(crate) async fn create_share_inner(
     state: &Arc<AppState>,
     input: CreateShareInput,
