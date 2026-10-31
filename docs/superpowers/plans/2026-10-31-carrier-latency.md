@@ -66,11 +66,16 @@ server_monitor/probe.rs ⇠── carrier::target_hosts / probe_setup / probe_ta
 
 ## 执行状态（进度指针）
 
-- 当前：T1（pending）
-- 下一动作：写 v22 迁移与三网类型/存储读写
+- 当前：T9（completed）
+- 下一动作：无
 - 阻塞：无
-- 已完成：（空）
+- 已完成：T1–T9（迁移 v22 / carrier 模块 / 配置 / 探针 / 摘要 / IPC / 前端 / 设置抽屉与退役旧趋势 / 文档与真机）
 - 最后更新：2026-10-31
+- 真机证据：迁移 user_version=22；上海三网在 4 台服务器上均写入 `ct/cu/cm ok=1` 与
+  毫秒值；期间发现并修复「curl -w 无换行导致 `##cu/##cm` 标记粘行」的真机缺陷
+  （提交 d57fc51）。全量测试 1129 通过、2 个并发计时 flake 单跑通过；前端
+  Monitor/MonitorSettings 用例通过，DeployWizard 的 `localStorage` 缺失为本地
+  jsdom 环境既有问题。
 
 ---
 
