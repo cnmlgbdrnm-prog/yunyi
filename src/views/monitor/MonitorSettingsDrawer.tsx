@@ -1,6 +1,11 @@
-import { useState, type ChangeEvent } from 'react'
-import { monitorSetConfig } from '../../api'
-import type { MonitorConfig, MonitorThresholds, ServerHealth } from '../../api/types'
+import { useEffect, useState, type ChangeEvent } from 'react'
+import { monitorCarrierRegions, monitorSetConfig } from '../../api'
+import type {
+  CarrierRegion,
+  MonitorConfig,
+  MonitorThresholds,
+  ServerHealth,
+} from '../../api/types'
 
 const RESET: MonitorThresholds = {
   cpu_pct: 90, mem_pct: 90, disk_pct: 85, disk_critical_pct: 95,
@@ -26,8 +31,29 @@ export default function MonitorSettingsDrawer({
       servers.map((s) => [s.server_id, config.servers[String(s.server_id)]?.enabled !== false]),
     ),
   )
+  const [regions, setRegions] = useState<CarrierRegion[]>([])
+  const [regionFor, setRegionFor] = useState<Record<number, string>>(() =>
+    Object.fromEntries(
+      servers.map((s) => [
+        s.server_id,
+        config.servers[String(s.server_id)]?.carrier_region ?? '',
+      ]),
+    ),
+  )
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    monitorCarrierRegions()
+      .then((r) => {
+        if (alive) setRegions(r)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
 
   const num = (key: keyof MonitorThresholds) => ({
     value: t[key],
@@ -65,7 +91,14 @@ export default function MonitorSettingsDrawer({
         servers: Object.fromEntries(
           servers.map((s) => {
             const prev = config.servers[String(s.server_id)] ?? {}
-            return [String(s.server_id), { ...prev, enabled: serverOn[s.server_id] }]
+            return [
+              String(s.server_id),
+              {
+                ...prev,
+                enabled: serverOn[s.server_id],
+                carrier_region: regionFor[s.server_id] || null,
+              },
+            ]
           }),
         ),
       }
@@ -128,16 +161,33 @@ export default function MonitorSettingsDrawer({
         <div>
           <p className="text-xs text-neutral-400">服务器</p>
           {servers.map((s) => (
-            <label key={s.server_id} className="mt-1 flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={serverOn[s.server_id] ?? true}
+            <div key={s.server_id} className="mt-2 space-y-1">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={serverOn[s.server_id] ?? true}
+                  onChange={(e) =>
+                    setServerOn((prev) => ({ ...prev, [s.server_id]: e.target.checked }))
+                  }
+                />
+                {s.name}
+              </label>
+              <select
+                aria-label={`${s.name} 三网地区`}
+                value={regionFor[s.server_id] ?? ''}
                 onChange={(e) =>
-                  setServerOn((prev) => ({ ...prev, [s.server_id]: e.target.checked }))
+                  setRegionFor((prev) => ({ ...prev, [s.server_id]: e.target.value }))
                 }
-              />
-              {s.name}
-            </label>
+                className="w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-sm text-neutral-100"
+              >
+                <option value="">不测试</option>
+                {regions.map((r) => (
+                  <option key={r.code} value={r.code}>
+                    {r.name}
+                  </option>
+                ))}
+              </select>
+            </div>
           ))}
         </div>
         {error && <p className="text-xs text-red-300">{error}</p>}

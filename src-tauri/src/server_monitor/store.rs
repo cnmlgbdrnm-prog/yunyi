@@ -1,16 +1,13 @@
 //! 监控 SQLite 读写：样本、告警、历史降采样与保留期清理。
 //! 所有函数返回 Result<_, String>，命令层用 AppError::Message 统一收口。
 use super::alerts::{AlertTransition, Severity};
-use super::{MonitorAlert, MonitorMetric, MonitorPoint, MonitorSample};
+use super::{MonitorAlert, MonitorSample};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 
 const SAMPLE_COLS: &str = "server_id,ts,reachable,connect_ms,uptime_secs,load1,load5,load15,\
 cpu_pct,cpu_cores,mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb,bbr_algo,services_json,wg_json,error,\
 carrier_region,ct_ok,ct_ms,cu_ok,cu_ms,cm_ok,cm_ms";
-
-/// 趋势图最多返回的点数：闭区间 cutoff 可能多出 1 个桶，超出时丢弃最早的桶。
-const MAX_HISTORY_POINTS: usize = 360;
 
 fn row_to_sample(r: &rusqlite::Row<'_>) -> rusqlite::Result<MonitorSample> {
     let services_json: Option<String> = r.get(15)?;
@@ -209,78 +206,6 @@ pub fn max_ts(conn: &Connection) -> Result<Option<String>, String> {
         r.get::<_, Option<String>>(0)
     })
     .map_err(|e| e.to_string())
-}
-
-pub fn history(
-    conn: &Connection,
-    server_id: i64,
-    metric: MonitorMetric,
-    cutoff: &str,
-    bucket_secs: i64,
-) -> Result<Vec<MonitorPoint>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT ts,cpu_pct,mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb,load1,connect_ms
-             FROM server_metric_samples
-             WHERE server_id=?1 AND ts>=?2 AND reachable=1
-             ORDER BY ts",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![server_id, cutoff], |r| {
-            let ts: String = r.get(0)?;
-            let value = match metric {
-                MonitorMetric::CpuPct => r.get::<_, Option<f64>>(1)?,
-                MonitorMetric::MemPct => {
-                    let used: Option<i64> = r.get(2)?;
-                    let total: Option<i64> = r.get(3)?;
-                    match (used, total) {
-                        (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
-                        _ => None,
-                    }
-                }
-                MonitorMetric::DiskPct => {
-                    let used: Option<i64> = r.get(4)?;
-                    let total: Option<i64> = r.get(5)?;
-                    match (used, total) {
-                        (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
-                        _ => None,
-                    }
-                }
-                MonitorMetric::Load1 => r.get::<_, Option<f64>>(6)?,
-                MonitorMetric::ConnectMs => r.get::<_, Option<i64>>(7)?.map(|v| v as f64),
-            };
-            Ok((ts, value))
-        })
-        .map_err(|e| e.to_string())?;
-
-    let bucket = bucket_secs.max(1);
-    let mut buckets: std::collections::BTreeMap<i64, (String, f64, usize)> =
-        std::collections::BTreeMap::new();
-    for row in rows {
-        let (ts, value) = row.map_err(|e| e.to_string())?;
-        let Some(value) = value else { continue };
-        let epoch = chrono::DateTime::parse_from_rfc3339(&ts)
-            .map(|d| d.timestamp())
-            .unwrap_or(0);
-        let entry = buckets
-            .entry(epoch / bucket)
-            .or_insert_with(|| (ts.clone(), 0.0, 0));
-        entry.1 += value;
-        entry.2 += 1;
-    }
-    let mut points: Vec<MonitorPoint> = buckets
-        .into_values()
-        .map(|(ts, sum, n)| MonitorPoint {
-            ts,
-            value: sum / n as f64,
-        })
-        .collect();
-    if points.len() > MAX_HISTORY_POINTS {
-        // BTreeMap 按时间升序，split_off 保留较新的点。
-        points = points.split_off(points.len() - MAX_HISTORY_POINTS);
-    }
-    Ok(points)
 }
 
 /// 一次查询返回 CPU/内存/磁盘三条序列（按时间桶求平均，最多 max_points 点）。

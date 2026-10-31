@@ -726,9 +726,3 @@ export interface MonitorPoint {
   value: number
 }
 
-export type MonitorMetric =
-  | 'cpu_pct'
-  | 'mem_pct'
-  | 'disk_pct'
-  | 'load1'
-  | 'connect_ms'

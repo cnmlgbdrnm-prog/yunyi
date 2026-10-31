@@ -19,8 +19,6 @@ import type {
   MonitorAlert,
   CarrierRegion,
   MonitorConfig,
-  MonitorMetric,
-  MonitorPoint,
   MonitorSummary,
   ServerResources,
   NetStatus,
@@ -684,14 +682,6 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
 
 export function monitorSummary(): Promise<MonitorSummary> {
   return invoke('server_monitor_summary_cmd')
-}
-
-export function monitorHistory(
-  serverId: number,
-  metric: MonitorMetric,
-  rangeSecs: number,
-): Promise<MonitorPoint[]> {
-  return invoke('server_monitor_history_cmd', { serverId, metric, rangeSecs })
 }
 
 export function monitorCarrierRegions(): Promise<CarrierRegion[]> {

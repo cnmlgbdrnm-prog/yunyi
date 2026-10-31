@@ -188,15 +188,17 @@
 | 命令 | UI 封装 | 参数 | 返回 |
 | --- | --- | --- | --- |
 | `server_monitor_summary_cmd` | `monitorSummary()` | — | `MonitorSummary` |
-| `server_monitor_history_cmd` | `monitorHistory(serverId, metric, rangeSecs)` | `{ serverId, metric, rangeSecs }` | `MonitorPoint[]` |
+| `server_monitor_carrier_regions_cmd` | `monitorCarrierRegions()` | — | `CarrierRegion[]` |
+| `server_monitor_resources_cmd` | `monitorResources(serverId, rangeSecs)` | `{ serverId, rangeSecs }` | `ServerResources` |
 | `server_monitor_alerts_cmd` | `monitorAlerts(includeResolved, limit)` | `{ includeResolved, limit }` | `MonitorAlert[]` |
 | `server_monitor_collect_cmd` | `monitorCollect()` | — | `MonitorSummary` |
 | `server_monitor_config_cmd` | `monitorConfig()` | — | `MonitorConfig` |
 | `server_monitor_set_config_cmd` | `monitorSetConfig(config)` | `{ config }` | `MonitorConfig` |
 | `server_monitor_ack_cmd` | `monitorAck(alertId)` | `{ alertId }` | `void` |
 
-`metric` 取值：`cpu_pct`、`mem_pct`、`disk_pct`、`load1`、`connect_ms`；
-`rangeSecs` 只接受 `3600`、`86400`、`604800`；`limit` 范围 1–500。
+`rangeSecs` 只接受 `3600`、`86400`、`604800`（资源序列按范围下采样到 ≤60 点/指标）；
+`limit` 范围 1–500。三网数字与 20 格由 `MonitorSummary.servers[].carrier` 直接给出，
+前端不再单独查询三网历史。
 
 | 事件 | 载荷 | 说明 |
 | --- | --- | --- |

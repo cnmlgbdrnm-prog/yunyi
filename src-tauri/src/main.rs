@@ -387,7 +387,6 @@ fn main() {
             commands::check_bbr_cmd,
             commands::enable_bbr_cmd,
             commands::server_monitor_summary_cmd,
-            commands::server_monitor_history_cmd,
             commands::server_monitor_carrier_regions_cmd,
             commands::server_monitor_resources_cmd,
             commands::server_monitor_alerts_cmd,

@@ -12,7 +12,7 @@ pub mod summary;
 
 pub use scheduler::{collect_now, start, stop, MonitorEmit};
 
-pub use config::{CarrierConfig, MonitorConfig, Thresholds};
+pub use config::{MonitorConfig, Thresholds};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -161,28 +161,6 @@ pub struct MonitorSummary {
 pub struct MonitorPoint {
     pub ts: String,
     pub value: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MonitorMetric {
-    CpuPct,
-    MemPct,
-    DiskPct,
-    Load1,
-    ConnectMs,
-}
-
-impl MonitorMetric {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "cpu_pct" => Ok(Self::CpuPct),
-            "mem_pct" => Ok(Self::MemPct),
-            "disk_pct" => Ok(Self::DiskPct),
-            "load1" => Ok(Self::Load1),
-            "connect_ms" => Ok(Self::ConnectMs),
-            other => Err(format!("未知的监控指标: {other}")),
-        }
-    }
 }
 
 /// 远端文本只用于展示与排查：去控制字符、压空白、截断 200 字符。
