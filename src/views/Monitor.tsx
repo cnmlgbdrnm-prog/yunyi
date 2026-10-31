@@ -20,7 +20,6 @@ function relative(ts: string | null): string {
 
 export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => void }) {
   const { summary, collecting, error } = useMonitorSummary()
-  const [expanded, setExpanded] = useState<number | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [historyKey, setHistoryKey] = useState(0)
@@ -58,7 +57,9 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
     )
   }
 
-  const unacked = summary.active_alerts.filter((a) => a.acked_at == null).length
+  // 顶部红条只列未确认告警：确认是「我已看到」，不是「问题已解决」；已确认但
+  // 仍未恢复的告警继续留在下方「告警历史」和服务器卡片里，不再占顶部横幅。
+  const unackedAlerts = summary.active_alerts.filter((a) => a.acked_at == null)
 
   return (
     <div className="space-y-4">
@@ -108,28 +109,24 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
           本轮采集失败：{summary.last_round_error}
         </p>
       )}
-      {summary.active_alerts.length > 0 && (
+      {unackedAlerts.length > 0 && (
         <section className="rounded border border-red-900 bg-red-950/40 p-3">
           <h3 className="text-sm font-medium text-red-200">
-            活动告警 {summary.active_alerts.length} 条（未确认 {unacked} 条）
+            未确认告警 {unackedAlerts.length} 条
           </h3>
           <ul className="mt-2 space-y-1">
-            {summary.active_alerts.map((a) => (
+            {unackedAlerts.map((a) => (
               <li key={a.id} className="flex items-start justify-between gap-2 text-xs">
-                <span className={a.acked_at ? 'text-neutral-400' : 'text-red-200'}>
+                <span className="text-red-200">
                   [{a.severity === 'critical' ? '严重' : '警告'}] {a.server_name}：{a.message}
                 </span>
-                {a.acked_at ? (
-                  <span className="shrink-0 text-neutral-500">已确认</span>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => void ack(a.id)}
-                    className="shrink-0 rounded border border-red-700 px-2 py-0.5 text-red-200"
-                  >
-                    确认
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => void ack(a.id)}
+                  className="shrink-0 rounded border border-red-700 px-2 py-0.5 text-red-200"
+                >
+                  确认
+                </button>
               </li>
             ))}
           </ul>
@@ -158,10 +155,7 @@ export default function Monitor({ onNavigate }: { onNavigate: (v: ViewKey) => vo
               key={h.server_id}
               health={h}
               config={summary.config}
-              expanded={expanded === h.server_id}
-              onToggle={() =>
-                setExpanded((cur) => (cur === h.server_id ? null : h.server_id))
-              }
+              onOpenSettings={() => setSettingsOpen(true)}
             />
           ))}
         </div>

@@ -17,10 +17,12 @@ import type {
   Job,
   LinkStatus,
   MonitorAlert,
+  CarrierRegion,
   MonitorConfig,
   MonitorMetric,
   MonitorPoint,
   MonitorSummary,
+  ServerResources,
   NetStatus,
   Node,
   Privacy,
@@ -690,6 +692,17 @@ export function monitorHistory(
   rangeSecs: number,
 ): Promise<MonitorPoint[]> {
   return invoke('server_monitor_history_cmd', { serverId, metric, rangeSecs })
+}
+
+export function monitorCarrierRegions(): Promise<CarrierRegion[]> {
+  return invoke('server_monitor_carrier_regions_cmd')
+}
+
+export function monitorResources(
+  serverId: number,
+  rangeSecs: number,
+): Promise<ServerResources> {
+  return invoke('server_monitor_resources_cmd', { serverId, rangeSecs })
 }
 
 export function monitorAlerts(

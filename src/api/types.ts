@@ -580,9 +580,17 @@ export interface MonitorThresholds {
 
 export type PartialMonitorThresholds = Partial<MonitorThresholds>
 
+export interface MonitorCarrierConfig {
+  window_secs: number
+  bars: number
+  latency_levels_ms: [number, number, number, number]
+  loss_levels_pct: [number, number, number, number]
+}
+
 export interface MonitorServerOverride {
   enabled?: boolean | null
   thresholds?: PartialMonitorThresholds | null
+  carrier_region?: string | null
 }
 
 export interface MonitorConfig {
@@ -590,7 +598,54 @@ export interface MonitorConfig {
   interval_secs: number
   concurrency: number
   defaults: MonitorThresholds
+  carrier: MonitorCarrierConfig
   servers: Record<string, MonitorServerOverride>
+}
+
+export interface CarrierProbe {
+  ok: boolean
+  ms: number | null
+}
+
+export interface CarrierSample {
+  region: string
+  ct: CarrierProbe | null
+  cu: CarrierProbe | null
+  cm: CarrierProbe | null
+}
+
+export interface CarrierBar {
+  ts: string
+  ok: boolean
+  latency_level: number | null
+}
+
+export interface CarrierStats {
+  key: string
+  avg_ms: number | null
+  avg_level: number | null
+  loss_pct: number | null
+  loss_level: number | null
+  samples: number
+  bars: CarrierBar[]
+}
+
+export interface CarrierHealth {
+  region: string
+  region_name: string
+  bar_count: number
+  carriers: CarrierStats[]
+}
+
+export interface CarrierRegion {
+  code: string
+  name: string
+}
+
+export interface ServerResources {
+  cpu_pct: MonitorPoint[]
+  mem_pct: MonitorPoint[]
+  disk_pct: MonitorPoint[]
 }
 
 export interface MonitorSample {
@@ -612,6 +667,7 @@ export interface MonitorSample {
   services: Record<string, string> | null
   wg_interfaces: string[] | null
   error: string | null
+  carrier: CarrierSample | null
 }
 
 export interface ServerHealth {
@@ -629,6 +685,7 @@ export interface ServerHealth {
   local_error: string | null
   active_alerts: number
   unacked_alerts: number
+  carrier: CarrierHealth | null
 }
 
 export type MonitorAlertKind =
