@@ -18,6 +18,8 @@ pub struct MonitorConfig {
     #[serde(default)]
     pub defaults: Thresholds,
     #[serde(default)]
+    pub carrier: CarrierConfig,
+    #[serde(default)]
     pub servers: HashMap<String, ServerMonitorOverride>,
 }
 
@@ -28,9 +30,48 @@ impl Default for MonitorConfig {
             interval_secs: DEFAULT_INTERVAL,
             concurrency: DEFAULT_CONCURRENCY,
             defaults: Thresholds::default(),
+            carrier: CarrierConfig::default(),
             servers: HashMap::new(),
         }
     }
+}
+
+/// 三网面板的统计窗口、格数与分级阈值。阈值不用 Komari 原值（60/100/160/200ms）：
+/// 那是国内探国内的量级；境外服务器到国内实测 230–310ms，原值会整片最高级。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CarrierConfig {
+    #[serde(default = "d_carrier_window")]
+    pub window_secs: u64,
+    #[serde(default = "d_carrier_bars")]
+    pub bars: usize,
+    #[serde(default = "d_carrier_latency_levels")]
+    pub latency_levels_ms: [f64; 4],
+    #[serde(default = "d_carrier_loss_levels")]
+    pub loss_levels_pct: [f64; 4],
+}
+
+impl Default for CarrierConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: 3600,
+            bars: 20,
+            latency_levels_ms: [120.0, 200.0, 300.0, 400.0],
+            loss_levels_pct: [1.0, 3.0, 6.0, 9.0],
+        }
+    }
+}
+
+fn d_carrier_window() -> u64 {
+    3600
+}
+fn d_carrier_bars() -> usize {
+    20
+}
+fn d_carrier_latency_levels() -> [f64; 4] {
+    [120.0, 200.0, 300.0, 400.0]
+}
+fn d_carrier_loss_levels() -> [f64; 4] {
+    [1.0, 3.0, 6.0, 9.0]
 }
 
 fn default_enabled() -> bool {
@@ -134,6 +175,8 @@ impl PartialThresholds {
 pub struct ServerMonitorOverride {
     pub enabled: Option<bool>,
     pub thresholds: Option<PartialThresholds>,
+    #[serde(default)]
+    pub carrier_region: Option<String>,
 }
 
 pub fn load(settings: &SettingsService) -> (MonitorConfig, Option<String>) {
@@ -180,9 +223,32 @@ pub fn validate(cfg: &MonitorConfig) -> Result<(), String> {
         return Err("并发数必须在 1–4 之间".into());
     }
     validate_thresholds(&cfg.defaults)?;
-    for key in cfg.servers.keys() {
+    if !(600..=86400).contains(&cfg.carrier.window_secs) {
+        return Err("三网统计窗口必须在 600–86400 秒之间".into());
+    }
+    if !(10..=60).contains(&cfg.carrier.bars) {
+        return Err("三网格子数必须在 10–60 之间".into());
+    }
+    validate_levels(&cfg.carrier.latency_levels_ms, "三网延迟分级", 10_000.0)?;
+    validate_levels(&cfg.carrier.loss_levels_pct, "三网失败率分级", 100.0)?;
+    for (key, ov) in &cfg.servers {
         let id: i64 = key.parse().map_err(|_| format!("服务器 id 非法: {key}"))?;
         validate_thresholds(&effective_thresholds(cfg, id))?;
+        if let Some(region) = &ov.carrier_region {
+            if super::carrier::region_name(region).is_none() {
+                return Err(format!("服务器 {key} 的三网地区无效: {region}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_levels(v: &[f64; 4], name: &str, max: f64) -> Result<(), String> {
+    if v.iter().any(|x| !x.is_finite() || *x < 0.0 || *x > max) {
+        return Err(format!("{name}必须是 0–{max} 之间的数"));
+    }
+    if !(v[0] < v[1] && v[1] < v[2] && v[2] < v[3]) {
+        return Err(format!("{name}必须严格递增"));
     }
     Ok(())
 }
@@ -233,10 +299,18 @@ pub fn server_enabled(cfg: &MonitorConfig, server_id: i64) -> bool {
         .unwrap_or(true)
 }
 
+/// 该台服务器配置的三网地区 code；None = 不测试。
+pub fn carrier_region(cfg: &MonitorConfig, server_id: i64) -> Option<String> {
+    cfg.servers
+        .get(&server_id.to_string())
+        .and_then(|o| o.carrier_region.clone())
+}
+
 /// 只保留有意义的覆盖条目，避免每次保存都把默认值写进 JSON。
 fn normalize(mut cfg: MonitorConfig) -> MonitorConfig {
-    cfg.servers
-        .retain(|_, ov| ov.enabled == Some(false) || ov.thresholds.is_some());
+    cfg.servers.retain(|_, ov| {
+        ov.enabled == Some(false) || ov.thresholds.is_some() || ov.carrier_region.is_some()
+    });
     cfg
 }
 

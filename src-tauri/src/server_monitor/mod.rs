@@ -12,7 +12,7 @@ pub mod summary;
 
 pub use scheduler::{collect_now, start, stop, MonitorEmit};
 
-pub use config::{MonitorConfig, Thresholds};
+pub use config::{CarrierConfig, MonitorConfig, Thresholds};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
