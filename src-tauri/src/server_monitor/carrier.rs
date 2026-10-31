@@ -12,37 +12,130 @@ pub struct Region {
 
 /// 31 个省级行政区，顺序按行政区划编码。台湾/香港/澳门没有三网目标，不收录。
 pub const REGIONS: &[Region] = &[
-    Region { code: "bj", name: "北京" },
-    Region { code: "tj", name: "天津" },
-    Region { code: "he", name: "河北" },
-    Region { code: "sx", name: "山西" },
-    Region { code: "nm", name: "内蒙古" },
-    Region { code: "ln", name: "辽宁" },
-    Region { code: "jl", name: "吉林" },
-    Region { code: "hl", name: "黑龙江" },
-    Region { code: "sh", name: "上海" },
-    Region { code: "js", name: "江苏" },
-    Region { code: "zj", name: "浙江" },
-    Region { code: "ah", name: "安徽" },
-    Region { code: "fj", name: "福建" },
-    Region { code: "jx", name: "江西" },
-    Region { code: "sd", name: "山东" },
-    Region { code: "ha", name: "河南" },
-    Region { code: "hb", name: "湖北" },
-    Region { code: "hn", name: "湖南" },
-    Region { code: "gd", name: "广东" },
-    Region { code: "gx", name: "广西" },
-    Region { code: "hi", name: "海南" },
-    Region { code: "cq", name: "重庆" },
-    Region { code: "sc", name: "四川" },
-    Region { code: "gz", name: "贵州" },
-    Region { code: "yn", name: "云南" },
-    Region { code: "xz", name: "西藏" },
-    Region { code: "sn", name: "陕西" },
-    Region { code: "gs", name: "甘肃" },
-    Region { code: "qh", name: "青海" },
-    Region { code: "nx", name: "宁夏" },
-    Region { code: "xj", name: "新疆" },
+    Region {
+        code: "bj",
+        name: "北京",
+    },
+    Region {
+        code: "tj",
+        name: "天津",
+    },
+    Region {
+        code: "he",
+        name: "河北",
+    },
+    Region {
+        code: "sx",
+        name: "山西",
+    },
+    Region {
+        code: "nm",
+        name: "内蒙古",
+    },
+    Region {
+        code: "ln",
+        name: "辽宁",
+    },
+    Region {
+        code: "jl",
+        name: "吉林",
+    },
+    Region {
+        code: "hl",
+        name: "黑龙江",
+    },
+    Region {
+        code: "sh",
+        name: "上海",
+    },
+    Region {
+        code: "js",
+        name: "江苏",
+    },
+    Region {
+        code: "zj",
+        name: "浙江",
+    },
+    Region {
+        code: "ah",
+        name: "安徽",
+    },
+    Region {
+        code: "fj",
+        name: "福建",
+    },
+    Region {
+        code: "jx",
+        name: "江西",
+    },
+    Region {
+        code: "sd",
+        name: "山东",
+    },
+    Region {
+        code: "ha",
+        name: "河南",
+    },
+    Region {
+        code: "hb",
+        name: "湖北",
+    },
+    Region {
+        code: "hn",
+        name: "湖南",
+    },
+    Region {
+        code: "gd",
+        name: "广东",
+    },
+    Region {
+        code: "gx",
+        name: "广西",
+    },
+    Region {
+        code: "hi",
+        name: "海南",
+    },
+    Region {
+        code: "cq",
+        name: "重庆",
+    },
+    Region {
+        code: "sc",
+        name: "四川",
+    },
+    Region {
+        code: "gz",
+        name: "贵州",
+    },
+    Region {
+        code: "yn",
+        name: "云南",
+    },
+    Region {
+        code: "xz",
+        name: "西藏",
+    },
+    Region {
+        code: "sn",
+        name: "陕西",
+    },
+    Region {
+        code: "gs",
+        name: "甘肃",
+    },
+    Region {
+        code: "qh",
+        name: "青海",
+    },
+    Region {
+        code: "nx",
+        name: "宁夏",
+    },
+    Region {
+        code: "xj",
+        name: "新疆",
+    },
 ];
 
 pub fn regions() -> Vec<CarrierRegion> {
@@ -106,7 +199,10 @@ fn section_probe(section: Option<&String>) -> Option<CarrierProbe> {
             ok: true,
             ms: Some((secs * 10_000.0).round() / 10.0),
         },
-        None => CarrierProbe { ok: false, ms: None },
+        None => CarrierProbe {
+            ok: false,
+            ms: None,
+        },
     })
 }
 

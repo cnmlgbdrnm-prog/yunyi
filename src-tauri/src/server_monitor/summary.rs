@@ -89,10 +89,7 @@ pub fn build_summary(
             .map(|t| now.signed_duration_since(t.with_timezone(&Utc)) > stale_after)
             .unwrap_or(true);
         let carrier = config::carrier_region(&config, s.id).map(|region| {
-            let samples = carrier_samples
-                .get(&s.id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            let samples = carrier_samples.get(&s.id).map(Vec::as_slice).unwrap_or(&[]);
             super::carrier::summarise(&region, samples, &config.carrier)
         });
         health.push(ServerHealth {
