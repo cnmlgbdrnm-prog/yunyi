@@ -113,7 +113,7 @@ pub fn parse_probe_output(out: &str) -> ParsedProbe {
     p
 }
 
-fn split_sections(out: &str) -> HashMap<&str, String> {
+pub(crate) fn split_sections(out: &str) -> HashMap<&str, String> {
     let mut map: HashMap<&str, String> = HashMap::new();
     let mut current: Option<&str> = None;
     for line in out.lines() {
