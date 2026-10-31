@@ -260,12 +260,16 @@ _c <code>-cu-v4.ip.zstaticcdn.com > "$d/cu" 2>/dev/null &
 _c <code>-cm-v4.ip.zstaticcdn.com > "$d/cm" 2>/dev/null &
 # …既有资源采集段（含 sleep 1）…
 wait
-echo '##ct'; cat "$d/ct" 2>/dev/null
-echo '##cu'; cat "$d/cu" 2>/dev/null
-echo '##cm'; cat "$d/cm" 2>/dev/null
+echo '##ct'; cat "$d/ct" 2>/dev/null; echo
+echo '##cu'; cat "$d/cu" 2>/dev/null; echo
+echo '##cm'; cat "$d/cm" 2>/dev/null; echo
 rm -rf "$d"
 echo '##done'
 ```
+
+- `curl -w '%{time_connect}'` **不输出换行**；`cat` 后必须补 `echo`，否则
+  `0.310546##cu` 会粘成一行，解析器只认行首的 `##` 标记，cu/cm 整段丢失
+  （2026-10-31 真机验收发现并修复）。
 
 - 3 条 curl 后台并发，和 CPU 采样的 `sleep 1` 重叠；最坏等待 `--max-time 4`，
   现有命令超时 10 秒仍够用。
