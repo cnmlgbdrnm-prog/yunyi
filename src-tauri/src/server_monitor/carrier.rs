@@ -1,5 +1,9 @@
 //! 三网延迟：地区表、目标、脚本片段、解析与分级。纯函数，无 IO。
-use super::{CarrierProbe, CarrierRegion, CarrierSample};
+use super::config::CarrierConfig;
+use super::{
+    CarrierBar, CarrierHealth, CarrierProbe, CarrierRegion, CarrierSample, CarrierStats,
+    MonitorSample,
+};
 
 pub struct Region {
     pub code: &'static str,
@@ -118,6 +122,79 @@ pub fn loss_level(pct: f64, levels: &[f64; 4]) -> u8 {
     match levels.iter().position(|t| pct <= *t) {
         Some(i) => i as u8 + 1,
         None => 5,
+    }
+}
+
+fn probe_of<'a>(c: &'a CarrierSample, key: &str) -> Option<&'a CarrierProbe> {
+    match key {
+        "ct" => c.ct.as_ref(),
+        "cu" => c.cu.as_ref(),
+        "cm" => c.cm.as_ref(),
+        _ => None,
+    }
+}
+
+/// 窗口聚合：只统计当前地区、真正探过的样本；SSH 失败留下的 NULL 不计入分母。
+pub fn summarise(region: &str, samples: &[MonitorSample], cfg: &CarrierConfig) -> CarrierHealth {
+    CarrierHealth {
+        region: region.into(),
+        region_name: region_name(region).unwrap_or(region).into(),
+        bar_count: cfg.bars,
+        carriers: ["ct", "cu", "cm"]
+            .iter()
+            .map(|key| summarise_one(key, region, samples, cfg))
+            .collect(),
+    }
+}
+
+fn summarise_one(
+    key: &str,
+    region: &str,
+    samples: &[MonitorSample],
+    cfg: &CarrierConfig,
+) -> CarrierStats {
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut sum = 0.0f64;
+    let mut bars: Vec<CarrierBar> = Vec::new();
+    for s in samples {
+        let Some(c) = &s.carrier else { continue };
+        if c.region != region {
+            continue;
+        }
+        let Some(p) = probe_of(c, key) else { continue };
+        if p.ok {
+            let ms = p.ms.unwrap_or(0.0);
+            ok_count += 1;
+            sum += ms;
+            bars.push(CarrierBar {
+                ts: s.ts.clone(),
+                ok: true,
+                latency_level: Some(latency_level(ms, &cfg.latency_levels_ms)),
+            });
+        } else {
+            fail_count += 1;
+            bars.push(CarrierBar {
+                ts: s.ts.clone(),
+                ok: false,
+                latency_level: None,
+            });
+        }
+    }
+    let total = ok_count + fail_count;
+    let avg_ms = (ok_count > 0).then(|| sum / ok_count as f64);
+    let loss_pct = (total > 0).then(|| fail_count as f64 / total as f64 * 100.0);
+    if bars.len() > cfg.bars {
+        bars = bars.split_off(bars.len() - cfg.bars);
+    }
+    CarrierStats {
+        key: key.into(),
+        avg_ms,
+        avg_level: avg_ms.map(|v| latency_level(v, &cfg.latency_levels_ms)),
+        loss_pct,
+        loss_level: loss_pct.map(|v| loss_level(v, &cfg.loss_levels_pct)),
+        samples: total as u32,
+        bars,
     }
 }
 

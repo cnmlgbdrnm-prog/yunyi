@@ -152,6 +152,25 @@ pub fn recent_samples(
     Ok(out)
 }
 
+/// 取 cutoff 之后的所有样本（按 ts 升序），用于三网窗口聚合。
+pub fn samples_since(
+    conn: &Connection,
+    server_id: i64,
+    cutoff: &str,
+) -> Result<Vec<MonitorSample>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SAMPLE_COLS} FROM server_metric_samples
+             WHERE server_id=?1 AND ts>=?2 ORDER BY ts"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![server_id, cutoff], row_to_sample)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())
+}
+
 pub fn last_reachable_sample(
     conn: &Connection,
     server_id: i64,

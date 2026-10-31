@@ -33,7 +33,8 @@ pub fn build_summary(
     status: Option<&MonitorStatus>,
 ) -> Result<MonitorSummary, String> {
     let (config, config_error) = config::load(&state.settings);
-    let (servers, active_alerts, mut latest, max_ts, wg_ids) = {
+    let now = Utc::now();
+    let (servers, active_alerts, mut latest, max_ts, wg_ids, carrier_samples) = {
         let conn = state.db.lock();
         let servers = repos::servers::list(&conn).map_err(|e| e.to_string())?;
         let active = store::active_alerts(&conn)?;
@@ -43,7 +44,15 @@ pub fn build_summary(
         }
         let max_ts = store::max_ts(&conn)?;
         let wg_ids = store::wg_expected_server_ids(&conn)?;
-        (servers, active, latest, max_ts, wg_ids)
+        let carrier_cutoff = (now - Duration::seconds(config.carrier.window_secs as i64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut carrier_samples = HashMap::new();
+        for s in &servers {
+            if config::carrier_region(&config, s.id).is_some() {
+                carrier_samples.insert(s.id, store::samples_since(&conn, s.id, &carrier_cutoff)?);
+            }
+        }
+        (servers, active, latest, max_ts, wg_ids, carrier_samples)
     };
 
     let mut counts: HashMap<i64, (usize, usize)> = HashMap::new();
@@ -55,7 +64,6 @@ pub fn build_summary(
         }
     }
 
-    let now = Utc::now();
     let stale_after = Duration::seconds((config.interval_secs.saturating_mul(2) + 30) as i64);
     let local_errors = status
         .map(|s| {
@@ -80,6 +88,13 @@ pub fn build_summary(
             .and_then(|x| chrono::DateTime::parse_from_rfc3339(&x.ts).ok())
             .map(|t| now.signed_duration_since(t.with_timezone(&Utc)) > stale_after)
             .unwrap_or(true);
+        let carrier = config::carrier_region(&config, s.id).map(|region| {
+            let samples = carrier_samples
+                .get(&s.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            super::carrier::summarise(&region, samples, &config.carrier)
+        });
         health.push(ServerHealth {
             server_id: s.id,
             name: s.name,
@@ -95,6 +110,7 @@ pub fn build_summary(
             local_error: local_errors.get(&s.id).cloned(),
             active_alerts: active_count,
             unacked_alerts: unacked_count,
+            carrier,
         });
     }
 
