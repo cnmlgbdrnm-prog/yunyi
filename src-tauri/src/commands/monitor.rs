@@ -1,7 +1,9 @@
 //! 服务器监控命令层：参数校验 + 领域调用，Tauri 壳在 ipc.rs。
 use super::{err, AppError, R};
-use crate::server_monitor::{config, store, summary, MonitorMetric};
-pub use crate::server_monitor::{MonitorAlert, MonitorConfig, MonitorPoint, MonitorSummary};
+use crate::server_monitor::{carrier, config, store, summary, MonitorMetric};
+pub use crate::server_monitor::{
+    CarrierRegion, MonitorAlert, MonitorConfig, MonitorPoint, MonitorSummary, ServerResources,
+};
 use crate::state::AppState;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -39,6 +41,27 @@ pub fn monitor_history(
     let bucket = (range_secs / 360).max(1);
     let conn = state.db.lock();
     store::history(&conn, server_id, metric, &cutoff, bucket).map_err(AppError::Message)
+}
+
+pub fn monitor_carrier_regions() -> R<Vec<CarrierRegion>> {
+    Ok(carrier::regions())
+}
+
+pub fn monitor_resources(
+    state: Arc<AppState>,
+    server_id: i64,
+    range_secs: i64,
+) -> R<ServerResources> {
+    if !matches!(range_secs, 3600 | 86400 | 604800) {
+        return Err(AppError::Validation(
+            "时间范围必须是 1 小时、24 小时或 7 天".into(),
+        ));
+    }
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(range_secs))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let bucket = (range_secs / 60).max(1);
+    store::resource_history(&state.db.lock(), server_id, &cutoff, bucket, 60)
+        .map_err(AppError::Message)
 }
 
 pub fn monitor_alerts(

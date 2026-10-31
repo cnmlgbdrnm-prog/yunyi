@@ -1082,6 +1082,20 @@ pub async fn server_monitor_history_cmd(
 }
 
 #[tauri::command]
+pub async fn server_monitor_carrier_regions_cmd() -> R<Vec<CarrierRegion>> {
+    monitor_carrier_regions()
+}
+
+#[tauri::command]
+pub async fn server_monitor_resources_cmd(
+    state: tauri::State<'_, Arc<AppState>>,
+    server_id: i64,
+    range_secs: i64,
+) -> R<ServerResources> {
+    monitor_resources(state.inner().clone(), server_id, range_secs)
+}
+
+#[tauri::command]
 pub async fn server_monitor_alerts_cmd(
     state: tauri::State<'_, Arc<AppState>>,
     include_resolved: bool,

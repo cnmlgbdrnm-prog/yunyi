@@ -283,6 +283,83 @@ pub fn history(
     Ok(points)
 }
 
+/// 一次查询返回 CPU/内存/磁盘三条序列（按时间桶求平均，最多 max_points 点）。
+pub fn resource_history(
+    conn: &Connection,
+    server_id: i64,
+    cutoff: &str,
+    bucket_secs: i64,
+    max_points: usize,
+) -> Result<super::ServerResources, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ts,cpu_pct,mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb
+             FROM server_metric_samples
+             WHERE server_id=?1 AND ts>=?2 AND reachable=1
+             ORDER BY ts",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![server_id, cutoff], |r| {
+            let ts: String = r.get(0)?;
+            let cpu: Option<f64> = r.get(1)?;
+            let mu: Option<i64> = r.get(2)?;
+            let mt: Option<i64> = r.get(3)?;
+            let du: Option<i64> = r.get(4)?;
+            let dt: Option<i64> = r.get(5)?;
+            let mem = match (mu, mt) {
+                (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
+                _ => None,
+            };
+            let disk = match (du, dt) {
+                (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
+                _ => None,
+            };
+            Ok((ts, cpu, mem, disk))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let bucket = bucket_secs.max(1);
+    let mut maps: [std::collections::BTreeMap<i64, (String, f64, usize)>; 3] =
+        std::array::from_fn(|_| std::collections::BTreeMap::new());
+    for row in rows {
+        let (ts, cpu, mem, disk) = row.map_err(|e| e.to_string())?;
+        let epoch = chrono::DateTime::parse_from_rfc3339(&ts)
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        for (i, value) in [cpu, mem, disk].into_iter().enumerate() {
+            let Some(value) = value else { continue };
+            let entry = maps[i]
+                .entry(epoch / bucket)
+                .or_insert_with(|| (ts.clone(), 0.0, 0));
+            entry.1 += value;
+            entry.2 += 1;
+        }
+    }
+    let series = |map: std::collections::BTreeMap<i64, (String, f64, usize)>| {
+        let mut points: Vec<super::MonitorPoint> = map
+            .into_values()
+            .map(|(ts, sum, n)| super::MonitorPoint {
+                ts,
+                value: sum / n as f64,
+            })
+            .collect();
+        if points.len() > max_points {
+            points = points.split_off(points.len() - max_points);
+        }
+        points
+    };
+    let mut iter = maps.into_iter();
+    let cpu_pct = series(iter.next().unwrap_or_default());
+    let mem_pct = series(iter.next().unwrap_or_default());
+    let disk_pct = series(iter.next().unwrap_or_default());
+    Ok(super::ServerResources {
+        cpu_pct,
+        mem_pct,
+        disk_pct,
+    })
+}
+
 pub fn prune(conn: &Connection, sample_cutoff: &str, alert_cutoff: &str) -> Result<(), String> {
     conn.execute(
         "DELETE FROM server_metric_samples WHERE ts < ?1",
