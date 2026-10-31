@@ -272,6 +272,10 @@ async fn run_round_inner(
                 command_error,
             } => {
                 let parsed = parse_probe_output(&stdout);
+                let carrier = target
+                    .carrier_region
+                    .as_deref()
+                    .map(|region| super::carrier::parse(&stdout, region));
                 let error = command_error
                     .map(|e| sanitize_text(&e))
                     .or(parsed.warning.clone());
@@ -294,6 +298,7 @@ async fn run_round_inner(
                     services: parsed.services,
                     wg_interfaces: parsed.wg_interfaces,
                     error,
+                    carrier,
                 });
             }
         }
@@ -361,6 +366,7 @@ fn collect_targets(
             wg_expected: wg_ids.contains(&server.id),
             deployment_known,
             expected_services,
+            carrier_region: config::carrier_region(cfg, server.id),
             server,
         });
     }

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub const PROBE_SCRIPT: &str = r#"echo '##uptime'; cat /proc/uptime 2>/dev/null
+const PROBE_BODY: &str = r#"echo '##uptime'; cat /proc/uptime 2>/dev/null
 echo '##load'; cat /proc/loadavg 2>/dev/null
 echo '##cpu1'; grep '^cpu ' /proc/stat 2>/dev/null
 sleep 1
@@ -23,8 +23,23 @@ echo '##svc'; systemctl is-active xray ssserver singbox 2>/dev/null
 echo '##wg'; wg show interfaces 2>/dev/null
 rc=$?
 echo '##wg_rc'; echo "$rc"
-echo '##done'
 "#;
+
+/// 没有配置三网地区时返回与旧版逐字一致的脚本；配置后在资源采集段前插入三条并发
+/// curl，在 `##done` 前插入 `##ct/##cu/##cm` 输出。curl 与 `sleep 1` 重叠。
+pub fn probe_script(region: Option<&str>) -> String {
+    let hosts = region.and_then(|r| super::carrier::target_hosts(r).ok());
+    let mut out = String::new();
+    if let Some(hosts) = &hosts {
+        out.push_str(&super::carrier::probe_setup(hosts));
+    }
+    out.push_str(PROBE_BODY);
+    if hosts.is_some() {
+        out.push_str(super::carrier::probe_tail());
+    }
+    out.push_str("echo '##done'\n");
+    out
+}
 
 #[derive(Debug, Clone)]
 pub struct MonitorTarget {
@@ -32,6 +47,8 @@ pub struct MonitorTarget {
     pub expected_services: Vec<String>,
     pub deployment_known: bool,
     pub wg_expected: bool,
+    /// 该台服务器配置的三网地区 code；None = 不测试。
+    pub carrier_region: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,8 +106,9 @@ impl MonitorProbe for RealProbe {
             }
         };
         let connect_ms = started.elapsed().as_millis() as u64;
+        let script = probe_script(target.carrier_region.as_deref());
         match session
-            .run("服务器健康采集", PROBE_SCRIPT, COMMAND_TIMEOUT)
+            .run("服务器健康采集", &script, COMMAND_TIMEOUT)
             .await
         {
             Ok(out) => ProbeOutcome::Connected {
