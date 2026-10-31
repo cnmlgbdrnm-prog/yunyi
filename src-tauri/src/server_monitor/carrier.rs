@@ -174,9 +174,11 @@ pub fn probe_setup(hosts: &[String; 3]) -> String {
 
 /// 等三网探测结束并按 `##ct/##cu/##cm` 输出，最后清理临时目录。
 pub fn probe_tail() -> &'static str {
-    "wait\necho '##ct'; cat \"$d/ct\" 2>/dev/null\n\
-     echo '##cu'; cat \"$d/cu\" 2>/dev/null\n\
-     echo '##cm'; cat \"$d/cm\" 2>/dev/null\n\
+    // curl -w 不输出换行；`cat file; echo '##cu'` 会把 "0.31##cu" 粘成一行，
+    // 解析器只认行首的 ## 标记，cu/cm 整段会丢失。每个值后面补 `echo`。
+    "wait\necho '##ct'; cat \"$d/ct\" 2>/dev/null; echo\n\
+     echo '##cu'; cat \"$d/cu\" 2>/dev/null; echo\n\
+     echo '##cm'; cat \"$d/cm\" 2>/dev/null; echo\n\
      rm -rf \"$d\"\n"
 }
 
