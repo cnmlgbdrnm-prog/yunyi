@@ -324,6 +324,44 @@ ALTER TABLE upstreams ADD COLUMN entry_node_id TEXT;
 ALTER TABLE upstreams ADD COLUMN entry_proto TEXT NOT NULL DEFAULT '';
 ALTER TABLE upstreams ADD COLUMN entry_port INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- v20：跨服务器汇总的 SSH 爆破封禁名单。fail2ban 在每台部署过的机器上永久
+-- 封禁攻击 IP；这里保存所有服务器上报过的 IP 并集，部署新服务器时直接预封禁，
+-- 不用等它再被同一批 IP 扫一遍。只增不删：在单台服务器手工 unban 只影响那台，
+-- 不能把 IP 从全局名单里抹掉（其它服务器可能仍封着它）。
+CREATE TABLE banned_ips (
+  ip TEXT PRIMARY KEY,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  last_server_id INTEGER
+);
+CREATE INDEX idx_banned_ips_last_seen ON banned_ips(last_seen_at);
+"#,
+    r#"
+-- v21：每台服务器已处理到的封禁名单游标（banned_ips.rowid）。轮询时只把游标
+-- 之后、该服务器还没有的 IP 增量下发——不重发全量；手工 unban 过的 IP 因为
+-- 游标已越过它，不会被下一轮重新封回。首次见到某台服务器时把游标基线化成当前
+-- 最大 rowid：历史名单只在新机器部署时全量上传，不在轮询里补推。
+CREATE TABLE server_ban_sync (
+  server_id INTEGER PRIMARY KEY,
+  last_rowid INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"#,
+    r#"
+-- v22：三网延迟（服务器 → 国内三网 TCP 建连）。
+-- 每轮每网一次探测。carrier_region 记录该样本探测的省份 code：
+-- NULL = 未配置地区或本轮未探测；切换地区后旧地区样本不能混进统计。
+-- ct/cu/cm 三组列：ok NULL = 本轮没探到（SSH/脚本失败），ok=0 = 探了但建连失败；
+-- ms 仅在 ok=1 时非空。
+ALTER TABLE server_metric_samples ADD COLUMN carrier_region TEXT;
+ALTER TABLE server_metric_samples ADD COLUMN ct_ok INTEGER;
+ALTER TABLE server_metric_samples ADD COLUMN ct_ms REAL;
+ALTER TABLE server_metric_samples ADD COLUMN cu_ok INTEGER;
+ALTER TABLE server_metric_samples ADD COLUMN cu_ms REAL;
+ALTER TABLE server_metric_samples ADD COLUMN cm_ok INTEGER;
+ALTER TABLE server_metric_samples ADD COLUMN cm_ms REAL;
+"#,
 ];
 
 /// 当前 schema 版本（= 已应用迁移条数）。测试断言用，避免把版本号写死在断言里——

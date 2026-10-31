@@ -31,6 +31,59 @@ pub const ALERT_RETENTION_DAYS: i64 = 90;
 /// 服务与 WireGuard 是状态迁移，不跟 CPU/内存的连续次数配置走。
 pub const TRANSITION_SAMPLES: u32 = 2;
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierProbe {
+    pub ok: bool,
+    pub ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierSample {
+    pub region: String,
+    pub ct: Option<CarrierProbe>,
+    pub cu: Option<CarrierProbe>,
+    pub cm: Option<CarrierProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierBar {
+    pub ts: String,
+    pub ok: bool,
+    pub latency_level: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierStats {
+    pub key: String,
+    pub avg_ms: Option<f64>,
+    pub avg_level: Option<u8>,
+    pub loss_pct: Option<f64>,
+    pub loss_level: Option<u8>,
+    pub samples: u32,
+    pub bars: Vec<CarrierBar>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierHealth {
+    pub region: String,
+    pub region_name: String,
+    pub bar_count: usize,
+    pub carriers: Vec<CarrierStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CarrierRegion {
+    pub code: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerResources {
+    pub cpu_pct: Vec<MonitorPoint>,
+    pub mem_pct: Vec<MonitorPoint>,
+    pub disk_pct: Vec<MonitorPoint>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MonitorSample {
     pub server_id: i64,
@@ -53,6 +106,8 @@ pub struct MonitorSample {
     /// None = 无法得知；Some([]) = 确认没有接口。
     pub wg_interfaces: Option<Vec<String>>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub carrier: Option<CarrierSample>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -71,6 +126,8 @@ pub struct ServerHealth {
     pub local_error: Option<String>,
     pub active_alerts: usize,
     pub unacked_alerts: usize,
+    #[serde(default)]
+    pub carrier: Option<CarrierHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

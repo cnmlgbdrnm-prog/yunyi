@@ -6,7 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 
 const SAMPLE_COLS: &str = "server_id,ts,reachable,connect_ms,uptime_secs,load1,load5,load15,\
-cpu_pct,cpu_cores,mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb,bbr_algo,services_json,wg_json,error";
+cpu_pct,cpu_cores,mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb,bbr_algo,services_json,wg_json,error,\
+carrier_region,ct_ok,ct_ms,cu_ok,cu_ms,cm_ok,cm_ms";
 
 /// 趋势图最多返回的点数：闭区间 cutoff 可能多出 1 个桶，超出时丢弃最早的桶。
 const MAX_HISTORY_POINTS: usize = 360;
@@ -14,10 +15,24 @@ const MAX_HISTORY_POINTS: usize = 360;
 fn row_to_sample(r: &rusqlite::Row<'_>) -> rusqlite::Result<MonitorSample> {
     let services_json: Option<String> = r.get(15)?;
     let wg_json: Option<String> = r.get(16)?;
+    let region: Option<String> = r.get(18)?;
+    let ct_ok: Option<i64> = r.get(19)?;
+    let ct_ms: Option<f64> = r.get(20)?;
+    let cu_ok: Option<i64> = r.get(21)?;
+    let cu_ms: Option<f64> = r.get(22)?;
+    let cm_ok: Option<i64> = r.get(23)?;
+    let cm_ms: Option<f64> = r.get(24)?;
+    let carrier = region.map(|region| super::CarrierSample {
+        region,
+        ct: probe_from(ct_ok, ct_ms),
+        cu: probe_from(cu_ok, cu_ms),
+        cm: probe_from(cm_ok, cm_ms),
+    });
     Ok(MonitorSample {
         server_id: r.get(0)?,
         ts: r.get(1)?,
         reachable: r.get::<_, i64>(2)? != 0,
+        carrier,
         connect_ms: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
         uptime_secs: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
         load1: r.get(5)?,
@@ -36,6 +51,13 @@ fn row_to_sample(r: &rusqlite::Row<'_>) -> rusqlite::Result<MonitorSample> {
     })
 }
 
+fn probe_from(ok: Option<i64>, ms: Option<f64>) -> Option<super::CarrierProbe> {
+    ok.map(|v| super::CarrierProbe {
+        ok: v != 0,
+        ms: if v != 0 { ms } else { None },
+    })
+}
+
 pub fn insert_sample(conn: &Connection, s: &MonitorSample) -> Result<(), String> {
     let services_json = match &s.services {
         Some(m) => Some(serde_json::to_string(m).map_err(|e| e.to_string())?),
@@ -45,11 +67,25 @@ pub fn insert_sample(conn: &Connection, s: &MonitorSample) -> Result<(), String>
         Some(v) => Some(serde_json::to_string(v).map_err(|e| e.to_string())?),
         None => None,
     };
+    let (carrier_region, ct_ok, ct_ms, cu_ok, cu_ms, cm_ok, cm_ms) = match &s.carrier {
+        Some(c) => (
+            Some(c.region.clone()),
+            c.ct.as_ref().map(|p| p.ok as i64),
+            c.ct.as_ref().and_then(|p| p.ms),
+            c.cu.as_ref().map(|p| p.ok as i64),
+            c.cu.as_ref().and_then(|p| p.ms),
+            c.cm.as_ref().map(|p| p.ok as i64),
+            c.cm.as_ref().and_then(|p| p.ms),
+        ),
+        None => (None, None, None, None, None, None, None),
+    };
     conn.execute(
         "INSERT INTO server_metric_samples
          (server_id,ts,reachable,connect_ms,uptime_secs,load1,load5,load15,cpu_pct,cpu_cores,
-          mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb,bbr_algo,services_json,wg_json,error)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+          mem_used_kb,mem_total_kb,disk_used_kb,disk_total_kb,bbr_algo,services_json,wg_json,error,
+          carrier_region,ct_ok,ct_ms,cu_ok,cu_ms,cm_ok,cm_ms)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
+                 ?19,?20,?21,?22,?23,?24,?25)",
         params![
             s.server_id,
             s.ts,
@@ -69,6 +105,13 @@ pub fn insert_sample(conn: &Connection, s: &MonitorSample) -> Result<(), String>
             services_json,
             wg_json,
             s.error,
+            carrier_region,
+            ct_ok,
+            ct_ms,
+            cu_ok,
+            cu_ms,
+            cm_ok,
+            cm_ms,
         ],
     )
     .map_err(|e| e.to_string())?;
