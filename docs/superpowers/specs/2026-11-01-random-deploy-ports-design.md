@@ -113,9 +113,13 @@
 
 `allocate_share_ports` 拆成：
 
-- `allocate_share_ports_with_rng(sess, cancel, transports, rng)`：可注入 RNG，
-  供测试使用；
-- `allocate_share_ports(...)`：生产入口，内部传 `rand::thread_rng()`。
+- `random_share_starts(transports) -> SharePortStarts`：同步生成三段随机起点
+  （`SharePortStarts { http, pairs }`）。RNG 不跨 `await` 传递（`ThreadRng` 非
+  `Send`），起点算完即丢弃；测试可直接构造 `SharePortStarts`；
+- `allocate_share_ports_with_starts(sess, cancel, transports, &starts)`：按给定起点
+  分配，供测试使用；
+- `allocate_share_ports(...)`：生产入口，内部调用 `random_share_starts` 生成起点后
+  转调 `allocate_share_ports_with_starts`。
 
 编辑分享时新增节点走同一函数，既有节点仍沿用原端口（调用方传入的 `pairs` 不经过
 分配）。
@@ -160,7 +164,7 @@
 - `pool_candidates`：起点 65500 时回绕到 10000；候选不重复、不越界、长度不超过 64。
 - `range_candidates`：分享三段各自的回绕与不重复。
 
-分享分配（FakeSshServer + `StdRng::seed_from_u64`）：
+分享分配（FakeSshServer + 直接构造 `SharePortStarts` 起点）：
 
 - 随机起点空闲时，探测命令落在该起点上；
 - 起点被占时顺延；段尾回绕；

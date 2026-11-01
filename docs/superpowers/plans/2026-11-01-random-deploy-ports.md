@@ -63,10 +63,10 @@ install   ⇠── share/naming.rs 的三段范围常量
 
 ## 执行状态（进度指针）
 
-- 当前：T1（pending）
-- 下一动作：T1 Step 1 创建 `src-tauri/src/servers/port_pool.rs` 并写失败测试
+- 当前：T6（pending）
+- 下一动作：派发 T6 实施者（BASE = 935fece），按 task-6-brief.md 做全量验证与 CHANGELOG
 - 阻塞：无
-- 已完成：（空）
+- 已完成：T1（c9fccc8..46ffbdf）、T2（5e6c1e3）、T3（4094cba）、T4（2756977）、T5（2756977..935fece），均 review clean
 - 最后更新：2026-11-01
 
 ---
@@ -93,7 +93,7 @@ install   ⇠── share/naming.rs 的三段范围常量
 
 - **验收:** `cargo test --features local-tests port_pool -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；输出含 5 个 `servers::port_pool::tests::*` 用例。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commits `c9fccc8` + `46ffbdf`；`cargo test --features local-tests port_pool ...` → 6 passed（含 5 个 port_pool 用例）；`cargo fmt --check` exit 0；`cargo clippy --all-targets -- -D warnings` exit 0。审查：spec ✅ / quality Approved（6 条 Minor 已记入 ledger 延后处理，其中 `#[allow(dead_code)]` 由 T2 移除）。
 
 - [ ] **Step 1: 写失败测试与函数桩**
 
@@ -293,7 +293,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - **验收:** `cargo test --features local-tests servers::deploy -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；`grep -rn "default_port" src-tauri/src` 无输出；`cargo clippy --all-targets -- -D warnings` 通过。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `5e6c1e3`；`cargo test ... servers::deploy` → 118 passed, 0 failed；`grep -rn default_port src` 无输出（exit 1）；`cargo fmt --check` exit 0；`cargo clippy --all-targets -- -D warnings` exit 0。审查：spec ✅ / quality Approved（2 条 Minor 已记入 ledger 延后）。
 
 - [ ] **Step 1: 先改本地测试，制造 RED**
 
@@ -641,7 +641,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - **验收:** `cargo test --features local-tests share::ports -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；输出含 3 个 `share::ports::tests::*` 用例。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commits `1e08dc5` + `4094cba`；`cargo test ... share::ports` → 3 passed；`cargo fmt --check` exit 0；`cargo clippy --all-targets -- -D warnings` exit 0。审查：spec ✅ / quality Approved（5 条 Minor 已记入 ledger；`#[allow(dead_code)]` 由 T4 移除）。
 
 - [ ] **Step 1: 写失败测试与函数桩**
 
@@ -771,7 +771,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - **验收:** `cargo test --features local-tests share::install -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；新增用例 `allocate_ports_skips_ports_allocated_in_same_call` 绿；既有 `allocate_ports_skips_busy_and_probes_both_families`、`allocate_ports_skips_ports_owned_by_stopped_shares` 仍绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** commit `2756977`；`cargo test ... share::install` → 16 passed（新增去重用例经三轮 RED 验证：去掉任一 insert 都会拿到重复端口；另补整段耗尽用例）；`cargo fmt --check` / clippy exit 0。审查：spec ✅，修复 I1 后复审「All findings addressed」；M1/M3 等 Minor 记入 ledger。
 
 - [ ] **Step 1: 先写失败测试**
 
@@ -1029,7 +1029,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - **验收:** `cargo test --features local-tests auto_candidates -- --skip net::runtime_tests --skip net::runtime_service_tests` 与 `cargo test --features local-tests cdn -- --skip net::runtime_tests --skip net::runtime_service_tests` 通过；`occupied_cdn_port_is_not_overwritten_and_auto_uses_next` 仍绿。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** 提交 2756977..935fece（`feat(share): CDN 自动端口随机尝试顺序`）；`cargo test --features local-tests cdn` → 6 passed, 1 ignored（含 `auto_candidates_rotate_without_duplicates` 与本地 `auto_cdn_mode_probes_from_varying_start_ports`）；fmt/clippy 通过；review clean
 
 - [ ] **Step 1: 写失败测试**
 
