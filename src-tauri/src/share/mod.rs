@@ -20,6 +20,8 @@ pub mod meter;
 pub mod model;
 pub mod naming;
 pub mod plan;
+#[allow(dead_code)] // 仅单元测试使用；T4 分享分配接入后移除
+pub(crate) mod ports;
 pub mod scripts;
 pub mod spec;
 pub mod status_poll;
