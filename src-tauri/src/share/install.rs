@@ -821,7 +821,8 @@ pub(crate) async fn allocate_cdn_port(
 ) -> Result<u16, String> {
     let reserved = reserved_share_ports(sess, cancel).await?;
     let ports = if requested == 0 {
-        super::cdn::HTTPS_PORTS.to_vec()
+        let n = super::cdn::HTTPS_PORTS.len();
+        super::cdn::auto_candidates(rand::random::<usize>() % n)
     } else {
         vec![requested]
     };

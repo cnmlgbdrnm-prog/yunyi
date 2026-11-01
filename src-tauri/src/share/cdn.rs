@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 pub const HTTPS_PORTS: &[u16] = &[2083, 2053, 2087, 2096, 8443, 443];
 
+/// 自动模式的候选顺序：从 `start` 起回绕整个 HTTPS 端口表。
+///
+/// 端口仍只能落在 Cloudflare 支持的固定集合里，随机只改变尝试顺序——
+/// 这里**不能**扩大端口范围，Cloudflare 只代理这几个 HTTPS 端口。
+pub(crate) fn auto_candidates(start: usize) -> Vec<u16> {
+    let n = HTTPS_PORTS.len();
+    (0..n).map(|i| HTTPS_PORTS[(start + i) % n]).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShareCdn {
     pub domain: String,
@@ -154,3 +163,22 @@ for f in glob.glob('/srv/vpnshare/*/share.json'):
 #[cfg(all(test, feature = "local-tests"))]
 #[path = "../../../tests/rust/share/cdn_tests.rs"]
 mod tests;
+
+// 外部测试模块（tests/rust/share/cdn_tests.rs）已占用 `tests` 名字，
+// 内联用例改用独立模块名，避免 `--features local-tests` 下重名。
+#[cfg(test)]
+mod auto_candidates_tests {
+    use super::*;
+
+    #[test]
+    fn auto_candidates_rotate_without_duplicates() {
+        let v = auto_candidates(4);
+        assert_eq!(v.len(), HTTPS_PORTS.len());
+        assert_eq!(v[0], HTTPS_PORTS[4]);
+        assert_eq!(v[1], HTTPS_PORTS[5]);
+        assert_eq!(v[2], HTTPS_PORTS[0], "表尾必须回绕");
+        let set: std::collections::HashSet<u16> = v.iter().copied().collect();
+        assert_eq!(set.len(), HTTPS_PORTS.len(), "候选不得重复");
+        assert!(v.iter().all(|p| HTTPS_PORTS.contains(p)));
+    }
+}
