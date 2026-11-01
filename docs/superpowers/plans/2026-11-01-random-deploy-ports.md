@@ -63,10 +63,10 @@ install   ⇠── share/naming.rs 的三段范围常量
 
 ## 执行状态（进度指针）
 
-- 当前：T6（pending）
-- 下一动作：派发 T6 实施者（BASE = 935fece），按 task-6-brief.md 做全量验证与 CHANGELOG
+- 当前：整分支终审（T6 已完成，六个任务全部完成）
+- 下一动作：生成 a4dac8e..HEAD 的整分支 diff 并派发最终代码评审（最强模型）
 - 阻塞：无
-- 已完成：T1（c9fccc8..46ffbdf）、T2（5e6c1e3）、T3（4094cba）、T4（2756977）、T5（2756977..935fece），均 review clean
+- 已完成：T1（c9fccc8..46ffbdf）、T2（5e6c1e3）、T3（1e08dc5..4094cba）、T4（2756977）、T5（2756977..935fece）、T6（a3efa96），均 review clean
 - 最后更新：2026-11-01
 
 ---
@@ -1132,7 +1132,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - **验收:** `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、完整本地测试命令全部退出 0；`CHANGELOG.md` 新增节存在；`grep -rn "default_port" src-tauri/src` 无输出。
 
-- **状态:** pending ｜ **证据:**（完成时填）
+- **状态:** completed ｜ **证据:** 提交 a3efa96（`docs: 记录部署端口随机化`，3 文件 +27/-12）；`cargo fmt --check` exit 0；`cargo clippy --all-targets -- -D warnings` exit 0；完整本地测试 1143 passed / 0 failed / 12 ignored（37.05s，一次通过）；`grep default_port` 无输出（exit 1）；`tests/` 无文件入库；review clean（Approved，2 Minor 已收尾）
 
 - [ ] **Step 1: 写 CHANGELOG**
 
