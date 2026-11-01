@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 pub type EmitFn = Arc<dyn Fn(JobProgress) + Send + Sync>;
 
 /// 部署任务请求（jobs 行已由 start_deploy 建立）。protocols 为白名单内协议,
-/// 每协议端口由部署流水线按 default_port + 占用偏移自动分配。
+/// 每协议端口由部署流水线在主协议端口池（10000–65535，排除分享段）内随机分配。
 #[derive(Debug, Clone)]
 pub struct DeployRequest {
     pub job_id: i64,

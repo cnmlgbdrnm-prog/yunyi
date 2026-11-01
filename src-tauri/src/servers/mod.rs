@@ -8,7 +8,6 @@ pub mod deploy;
 mod deploy_nodes;
 pub mod deploy_spec;
 pub mod ipv6_detect;
-#[allow(dead_code)] // 仅单元测试使用；部署流程接入后移除
 pub mod port_pool;
 pub mod privacy;
 pub mod reality_dest;

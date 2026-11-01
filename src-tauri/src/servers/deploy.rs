@@ -17,6 +17,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use uuid::Uuid;
 
+use super::port_pool::{
+    pool_candidates, random_pool_start, skip_taken, MAIN_PORT_MAX, MAIN_PORT_MIN, MAX_PROBES,
+};
+
 pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 pub const CONFIG_TIMEOUT: Duration = Duration::from_secs(60);
 /// 启动后的状态验证（is-active / 端口监听）：失败重试等场景下 30s 足够，
@@ -210,20 +214,27 @@ pub(crate) fn matches_deployed_name(candidate: &str, base: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// 从 base 起探测空闲端口(逐 +1),最多 20 个连续候选;全占报错。
+/// 从主协议随机池挑一个空闲端口；`taken` 是本次部署已占用/已分配的端口。
+///
+/// 随机起点 + 池内回绕，最多探测 [`MAX_PROBES`] 个候选。跳过 `taken` 是必须的：
+/// 多协议在一次会话里**先全部分配、再统一写配置**，后分配的协议探测时前一个
+/// 还没开始监听，远端 `ss` 看不到它。
 async fn allocate_port(
     sess: &mut SshSession,
     cancel: &AtomicBool,
     protocol: &str,
-    base: u16,
+    taken: &mut HashSet<u16>,
 ) -> Result<u16, String> {
-    for n in 0..21u16 {
-        let cand = base.saturating_add(n);
+    let start = random_pool_start(&mut rand::thread_rng());
+    for cand in skip_taken(pool_candidates(start, MAX_PROBES), taken) {
         if !probe_port(sess, cancel, protocol, cand).await? {
+            taken.insert(cand);
             return Ok(cand);
         }
     }
-    Err(format!("端口 {base} 起 20 个连续端口全被占用"))
+    Err(format!(
+        "端口池 {MAIN_PORT_MIN}–{MAIN_PORT_MAX} 中连续 {MAX_PROBES} 个候选均被占用"
+    ))
 }
 
 /// 读取远端已部署配置中的端口表（重部署复用：云侧安全组/防火墙通常只放行首次部署
@@ -1125,18 +1136,20 @@ impl ProdRunner {
             true
         };
         // 端口分配：已部署协议复用远端既有端口（不重新探测——防漂移撞防火墙/安全组）；
-        // 新协议才探测分配（占用偏移逐 +1）。任一失败即中止（不落配置）。
+        // 新协议才在随机池里探测分配。任一失败即中止（不落配置）。
         let existing =
             read_existing_ports(&mut sess, cancel, need_xray, need_ss, need_singbox).await?;
+        // 初值含远端**所有**协议端口（不只本次请求的）：某个已部署协议本次未勾选、
+        // 服务恰好停机时，`ss` 探测看不到它，新协议不能抢它的端口。
+        let mut taken: HashSet<u16> = existing.ports.values().copied().collect();
         let mut ports: std::collections::HashMap<&str, u16> = std::collections::HashMap::new();
         for proto in &req.protocols {
-            let base = default_port(proto);
-            if base == 0 {
+            if !is_supported_protocol(proto) {
                 return Err(format!("未知协议: {proto}"));
             }
             let assigned = match existing.ports.get(proto.as_str()) {
                 Some(p) => *p,
-                None => allocate_port(&mut sess, cancel, proto, base).await?,
+                None => allocate_port(&mut sess, cancel, proto, &mut taken).await?,
             };
             ports.insert(proto.as_str(), assigned);
         }

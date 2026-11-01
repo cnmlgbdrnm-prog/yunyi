@@ -437,19 +437,6 @@ pub fn is_supported_protocol(proto: &str) -> bool {
     PROTOCOLS.contains(&proto)
 }
 
-/// 协议默认端口表(被占时 allocate_port 逐 +1 偏移)。
-pub fn default_port(proto: &str) -> u16 {
-    match proto {
-        "vless" => 443,
-        "trojan" => 4443,
-        "vmess" => 8443,
-        "ss" => 8388,
-        "hysteria2" => 2097,
-        "tuic" => 2053,
-        _ => 0,
-    }
-}
-
 /// 补装合并：现有协议在前（部署顺序稳定），新勾选协议只补不在列表中的项。
 pub fn merge_deploy_protocols(existing: &[String], chosen: &[String]) -> Vec<String> {
     let mut merged: Vec<String> = existing.to_vec();
