@@ -63,10 +63,10 @@ install   ⇠── share/naming.rs 的三段范围常量
 
 ## 执行状态（进度指针）
 
-- 当前：整分支终审（T6 已完成，六个任务全部完成）
-- 下一动作：生成 a4dac8e..HEAD 的整分支 diff 并派发最终代码评审（最强模型）
+- 当前：已完成（最终验收通过，待移交 finishing-a-development-branch）
+- 下一动作：删除 SDD 工作区并收束分支
 - 阻塞：无
-- 已完成：T1（c9fccc8..46ffbdf）、T2（5e6c1e3）、T3（1e08dc5..4094cba）、T4（2756977）、T5（2756977..935fece）、T6（a3efa96），均 review clean
+- 已完成：T1（c9fccc8..46ffbdf）、T2（5e6c1e3）、T3（1e08dc5..4094cba）、T4（2756977）、T5（2756977..935fece）、T6（a3efa96），均 review clean；整分支终审 → 修复轮（413798e）→ 定向复审全 ADDRESSED；A1–A6 验收通过
 - 最后更新：2026-11-01
 
 ---
@@ -552,7 +552,7 @@ async fn allocate_port(
         }
     }
     Err(format!(
-        "端口池 {MAIN_PORT_MIN}–{MAIN_PORT_MAX} 中连续 {MAX_PROBES} 个候选均被占用"
+        "端口池 {MAIN_PORT_MIN}–{MAIN_PORT_MAX} 中连续 {MAX_PROBES} 个候选均不可用（被占用或已分配）"
     ))
 }
 ```
@@ -1196,3 +1196,79 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - **Goal Contract：** 原话、硬约束、编号 AC 齐全；每条 AC 对应到具体 Task 与命令。
 - **模块地图：** 层级 / 调用 / 依赖三块分开，节点带中文功能名。
 - **Task 卡：** T1–T6 均有稳定 ID、Depends on、验收、状态；依赖无悬空引用。
+
+---
+
+## 最终验收
+
+- 分支：`random-deploy-ports`；范围：`a4dac8e..413798e`（10 个功能/测试/文档/修复提交）
+  + 本次验收回写提交
+- 终审：整分支评审（最强模型）→ 2 Important + 若干 Minor；修复提交 `413798e`；
+  定向复审结论「All findings addressed, no new Critical/Important breakage」。
+- 验收时间：2026-11-01
+
+### A1 主协议端口落在池内且避开分享段 — ✅
+
+- `port_pool.rs` 内联单测（池长 54816、起点 10,000 次抽样全部在 10000–65535 且不落入
+  18080–18799、65535 回绕到 10000、边界 18079/18800）在全量套件中通过。
+- `cargo test --features local-tests servers::deploy` → **120 passed / 0 failed**。
+- 证据：`src-tauri/src/servers/port_pool.rs:28-58` 的逻辑索引映射；
+  `tests/rust/servers/deploy_tests.rs` 已改为对池范围断言，不再断言固定端口。
+
+### A2 同次部署多协议端口互不重复 — ✅
+
+- 确定性用例 `servers::deploy_tests::allocate_port_with_start_skips_port_taken_in_same_call`
+  → **1 passed**：同一起点 40000 连调两次，第二次必须返回 40001。
+- 库内端口并集用例 `servers::deploy_tests::taken_ports_unions_database_node_ports`
+  → **1 passed**：`existing` 只有 vless:41000 时，库里 ss:43000 仍在 `taken`。
+- RED 证据（修复报告）：删 `taken.insert` → 红；让 `skip_taken` 失效 → 红；
+  删并集 → 红；恢复后全绿。
+
+### A3 重部署复用既有协议端口 — ✅
+
+- `cargo test --features local-tests servers::deploy` → **120 passed / 0 failed**，
+  其中包含 `deployed_node_is_auto_attached_to_a_matching_relay_link`（第二次部署复用
+  首次随机端口并按实际端口补链路）与旧端口 443/4443/8443 复用写回用例。
+- 实现：`read_existing_ports` 读到的端口优先，只有远端没有的协议才随机分配。
+
+### A4 分享端口落在各自区间且互不重复 — ✅
+
+- `cargo test --features local-tests share::install` → **16 passed / 0 failed**，
+  包含 `allocate_ports_skips_ports_allocated_in_same_call`（同次分配去重，夹具推两条
+  空闲脚本使缺失 `excluded.insert` 必然变红）与 `allocate_ports_reports_exhausted_range`。
+- `share/ports.rs` 内联单测（区间随机起点、回绕、区间外起点钳制）全绿。
+
+### A5 CDN 自动口只从 Cloudflare 的 6 个端口选择 — ✅
+
+- `cargo test --features local-tests cdn` → **6 passed / 1 ignored**（ignored 为需要真实
+  主机的用例），包含 `auto_candidates_rotate_without_duplicates` 与本地
+  `auto_cdn_mode_probes_from_varying_start_ports`（固定顺序回归时必红）。
+- 实现仍只遍历 `HTTPS_PORTS = [2083, 2053, 2087, 2096, 8443, 443]`，随机只改变顺序。
+
+### A6 fmt / clippy / 完整本地测试 — ✅
+
+- `cargo fmt --check` → exit 0。
+- `cargo clippy --all-targets -- -D warnings`（不带 `--features local-tests`）→ exit 0。
+- 完整套件（`--features local-tests`，跳过 `net::runtime_tests` /
+  `net::runtime_service_tests`）：
+  - 默认并行度两轮：**1144 passed / 1 failed / 12 ignored**，唯一失败均为既有的
+    时序抖动 `server_speed::tests::connect_failure_isolates_and_job_succeeds`
+    （本地回环 8ms 超 5ms 断言；单跑通过，模块未被本分支触碰）；
+  - `--test-threads=4` 全量：**1145 passed / 0 failed / 12 ignored**（64.74s）→ 全绿。
+- `grep -rn "default_port" src-tauri/src` → 无输出。
+- 说明：`tests/` 是 gitignored 本地源码，CI 只跑 fmt/clippy，本分支的测试证据依赖
+  本地完整套件（已在 `progress.md` 与修复报告中留存）。
+
+### 已知遗留（不阻塞验收）
+
+- `deployed_node_ports` 在数据库读取失败时 `unwrap_or_default()`（既有约定），此时
+  并集退化为空；数据库正常时不影响 A2。
+- `allocate_share_ports_with_starts` 在 `.get(i)` 前仍有 `debug_assert_eq!`，debug
+  构建下长度不匹配会先 panic；生产调用方构造的起点数量恒等于 transports 数量。
+- 中转建链向导接入口默认 443 未改代码，已在 CHANGELOG 边界说明「按节点实际端口填写」。
+- 完整套件可能残留 mihomo 子进程并继承 stdout（既有测试清理问题），验收期间出现过
+  一次管道等待；已清理本次泄漏进程，与本分支改动无关。
+
+### 结论
+
+A1–A6 全部满足；终审 Important 已修复并定向复审通过。**接受本分支。**
