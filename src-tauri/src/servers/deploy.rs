@@ -214,6 +214,27 @@ pub(crate) fn matches_deployed_name(candidate: &str, base: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// 端口去重集合：远端既有配置读到的端口 ∪ 库里该服务器已部署节点的端口。
+///
+/// `existing` 只覆盖本次请求涉及的组件（[`read_existing_ports`] 按
+/// `need_xray`/`need_ss`/`need_singbox` 读文件）。某个已部署协议本次未勾选、
+/// 服务又恰好停机时，远端探测看不到它；[`deployed_node_ports`] 从节点行补上
+/// 这些「未勾选/停机」的协议端口，其中 [`firewall_ports`] 还会补上旧专用上游
+/// 实例的 `listen_port`；复用主入口的实例不在此列（其端口已由主协议节点覆盖）。
+pub(crate) fn taken_ports(
+    state: &Arc<AppState>,
+    server: &crate::domain::Server,
+    existing: &HashMap<String, u16>,
+) -> HashSet<u16> {
+    let mut taken: HashSet<u16> = existing.values().copied().collect();
+    taken.extend(
+        deployed_node_ports(state, server)
+            .into_iter()
+            .map(|(_, p)| p),
+    );
+    taken
+}
+
 /// 从主协议随机池挑一个空闲端口；`taken` 是本次部署已占用/已分配的端口。
 ///
 /// 随机起点 + 池内回绕，最多探测 [`MAX_PROBES`] 个候选。跳过 `taken` 是必须的：
@@ -226,6 +247,18 @@ async fn allocate_port(
     taken: &mut HashSet<u16>,
 ) -> Result<u16, String> {
     let start = random_pool_start(&mut rand::thread_rng());
+    allocate_port_with_start(sess, cancel, protocol, taken, start).await
+}
+
+/// [`allocate_port`] 的确定性入口：起点由调用方给定，供测试钉死「跳过 taken」
+/// 的行为（随机起点下删掉 `taken.insert` 几乎必然仍能通过）。
+pub(crate) async fn allocate_port_with_start(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    protocol: &str,
+    taken: &mut HashSet<u16>,
+    start: u16,
+) -> Result<u16, String> {
     for cand in skip_taken(pool_candidates(start, MAX_PROBES), taken) {
         if !probe_port(sess, cancel, protocol, cand).await? {
             taken.insert(cand);
@@ -233,7 +266,7 @@ async fn allocate_port(
         }
     }
     Err(format!(
-        "端口池 {MAIN_PORT_MIN}–{MAIN_PORT_MAX} 中连续 {MAX_PROBES} 个候选均被占用"
+        "端口池 {MAIN_PORT_MIN}–{MAIN_PORT_MAX} 中连续 {MAX_PROBES} 个候选均不可用（被占用或已分配）"
     ))
 }
 
@@ -1139,9 +1172,11 @@ impl ProdRunner {
         // 新协议才在随机池里探测分配。任一失败即中止（不落配置）。
         let existing =
             read_existing_ports(&mut sess, cancel, need_xray, need_ss, need_singbox).await?;
-        // 初值含远端**所有**协议端口（不只本次请求的）：某个已部署协议本次未勾选、
-        // 服务恰好停机时，`ss` 探测看不到它，新协议不能抢它的端口。
-        let mut taken: HashSet<u16> = existing.ports.values().copied().collect();
+        // 初值 = 远端配置读到的端口 ∪ 库里该服务器已部署的节点端口。
+        // 远端配置只覆盖本次请求的组件：某个已部署协议本次未勾选、服务恰好停机时，
+        // `ss` 探测看不到它，用户也不会在本次请求里读到它的远端配置文件；
+        // 库里节点端口补上这些「未勾选/停机」的协议，新协议不能抢它们的端口。
+        let mut taken = taken_ports(state, &server, &existing.ports);
         let mut ports: std::collections::HashMap<&str, u16> = std::collections::HashMap::new();
         for proto in &req.protocols {
             if !is_supported_protocol(proto) {

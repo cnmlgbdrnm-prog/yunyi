@@ -12,7 +12,8 @@ pub const HTTPS_PORTS: &[u16] = &[2083, 2053, 2087, 2096, 8443, 443];
 /// 这里**不能**扩大端口范围，Cloudflare 只代理这几个 HTTPS 端口。
 pub(crate) fn auto_candidates(start: usize) -> Vec<u16> {
     let n = HTTPS_PORTS.len();
-    (0..n).map(|i| HTTPS_PORTS[(start + i) % n]).collect()
+    // 先对 n 取模再加 i：`start + i` 在 start 接近 usize::MAX 时会溢出。
+    (0..n).map(|i| HTTPS_PORTS[(start % n + i) % n]).collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

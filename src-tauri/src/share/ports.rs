@@ -17,6 +17,7 @@ pub(crate) fn random_start_in(range: PortRange, rng: &mut impl Rng) -> u16 {
 /// 从 `start` 起、回绕、覆盖整个区间；不重复。
 pub(crate) fn range_candidates(range: PortRange, start: u16) -> impl Iterator<Item = u16> {
     let (lo, hi) = range;
+    assert!(lo <= hi, "端口区间上界小于下界: {lo}–{hi}");
     let len = u32::from(hi) - u32::from(lo) + 1;
     let offset = u32::from(start.saturating_sub(lo)) % len;
     (0..len).map(move |n| (u32::from(lo) + (offset + n) % len) as u16)

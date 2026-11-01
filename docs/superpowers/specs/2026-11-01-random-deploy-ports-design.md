@@ -1,10 +1,13 @@
 # 部署端口随机化设计
 
 - 日期：2026-11-01
-- 状态：设计已确认，待评审后实施
+- 状态：已实施（2026-11-01）
 - 涉及：[`src-tauri/src/servers/deploy.rs`](../../../src-tauri/src/servers/deploy.rs)、
   [`deploy_spec.rs`](../../../src-tauri/src/servers/deploy_spec.rs)、
+  [`src-tauri/src/servers/port_pool.rs`](../../../src-tauri/src/servers/port_pool.rs)、
   [`src-tauri/src/share/install.rs`](../../../src-tauri/src/share/install.rs)、
+  [`src-tauri/src/share/ports.rs`](../../../src-tauri/src/share/ports.rs)、
+  [`src-tauri/src/share/cdn.rs`](../../../src-tauri/src/share/cdn.rs)、
   [`naming.rs`](../../../src-tauri/src/share/naming.rs)
 
 **目标：** 新部署的服务器协议端口与分享端口不再使用固定默认值，改为在限定池内随机
@@ -55,7 +58,9 @@
   - `index < 8080` → `10000 + index`
   - 否则 → `18800 + (index - 8080)`
 - 候选：从起点沿逻辑索引 `+1` 前进，**回绕**，最多 `MAX_PROBES = 64` 个。
-- 分布：起点在池内均匀；顺序扫描只在遇到占用时前进，不改变均匀性。
+- 分布：起点在池内均匀；但遇到占用会顺延，因此某端口被占时，其后紧邻的空闲端口
+  被选中的概率略高——这是本设计指定的「随机起点 + 顺序探测」语义，不是完全独立
+  均匀抽样。
 
 新增模块 `src-tauri/src/servers/port_pool.rs`，只放纯函数与常量：
 
@@ -67,16 +72,18 @@
 
 1. `read_existing_ports` 不变，先读远端已有端口与凭据。
 2. 维护 `taken: HashSet<u16>`：
-   - 初始化时放入 `existing.ports` 的**全部**端口（不只本次请求的协议）。
-     这样即使某个已部署协议本次未请求、服务恰好停机，新协议也不会抢它的端口。
+   - 初值 = `existing.ports` ∪ 库里该服务器已部署的节点端口
+     （`deployed_node_ports`，含旧专用上游实例的 `listen_port`）。前者只覆盖
+     本次请求的组件，后者补上未勾选/停机的协议——远端配置读不到、服务又停着时，
+     新协议也不能抢它们的端口。
    - 每分配一个端口立即插入。
 3. 每个请求协议：
    - 远端已有该协议 → 复用，不探测、不随机。
    - 否则 → `allocate_port(sess, cancel, protocol, &mut taken)`：
      生成随机起点 → 依次检查候选：`taken` 中的跳过；其余用
      `listen_probe_cmd(protocol, port)` 探测；第一个空闲即返回并插入 `taken`。
-4. 64 个候选全被占用 → 报错：
-   `端口池 10000–65535 中连续 64 个候选均被占用`。
+4. 64 个候选全不可用 → 报错：
+   `端口池 10000–65535 中连续 64 个候选均不可用（被占用或已分配）`。
 
 `default_port()` 删除；`jobs/mod.rs` 中「按 default_port + 占用偏移」的注释同步
 改为随机池描述。
@@ -148,7 +155,7 @@
 
 ## 5. 错误处理
 
-- 主协议池耗尽：`端口池 10000–65535 中连续 64 个候选均被占用`。
+- 主协议池耗尽：`端口池 10000–65535 中连续 64 个候选均不可用（被占用或已分配）`。
 - 分享某段耗尽：`端口段 <start>–<end> 已耗尽`（回绕扫完整段才判定耗尽）。
 - SSH 探测失败：沿用 `run_cmd` 的错误向上传递，不降级为「端口空闲」。
 - 随机数生成不可用属于进程级故障，不单独处理。
@@ -191,7 +198,9 @@ CDN：
   本机 UFW/iptables。首次部署后若客户端连不上，先查云安全组。写入 CHANGELOG。
 - **vless 不再默认 443**：REALITY 的伪装收益削弱；用户已确认接受。
 - **中转扩展端口的 DNAT 端口**不产生本地监听，主协议分配感知不到；撞上的概率约为
-  「DNAT 条数 / 54816」，本次不处理。分享分配同理。
+  「DNAT 条数 / 54816」，本次不处理。分享分配同理。旧专用上游实例的 `listen_port`
+  已通过 `deployed_node_ports` 纳入去重；复用主入口的实例没有额外端口，中转 DNAT
+  端口仍不参与。
 - **端口池跨重启不记忆**：随机只在首次分配时发生，端口落库；数据库丢失后重部署
   会得到新端口，与现有行为一致。
 - **分享 CDN 端口**仍受 Cloudflare 支持列表限制，只有 6 个候选，随机收益有限。

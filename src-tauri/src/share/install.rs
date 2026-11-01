@@ -872,7 +872,11 @@ pub(crate) async fn allocate_share_ports_with_starts(
     excluded.insert(http);
     let mut pairs = Vec::with_capacity(transports.len());
     for (i, transport) in transports.iter().enumerate() {
-        let (public_start, internal_start) = starts.pairs[i];
+        let (public_start, internal_start) = starts
+            .pairs
+            .get(i)
+            .copied()
+            .ok_or_else(|| format!("内部错误：缺少第 {} 组分享端口起点", i + 1))?;
         let public = find_free_port(
             sess,
             cancel,

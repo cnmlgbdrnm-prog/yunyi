@@ -41,8 +41,10 @@ pub fn random_pool_start(rng: &mut impl Rng) -> u16 {
 /// 从 `start` 起、回绕、最多 `limit` 个候选；永不返回分享段端口。
 ///
 /// `start` 必须是池内端口（生产只有 [`random_pool_start`] 或池内端口传入）。
+/// 无效起点直接 panic：release 下静默算出错误的 `start_index` 会落到池外端口，
+/// 分配结果看起来正常、实际不可用，比尽早失败更糟。
 pub fn pool_candidates(start: u16, limit: usize) -> Vec<u16> {
-    debug_assert!(
+    assert!(
         (MAIN_PORT_MIN..=MAIN_PORT_MAX).contains(&start)
             && !(SHARE_PORT_MIN..=SHARE_PORT_MAX).contains(&start),
         "起点必须在主协议端口池内: {start}"
@@ -52,7 +54,10 @@ pub fn pool_candidates(start: u16, limit: usize) -> Vec<u16> {
     } else {
         SEG1_LEN + u32::from(start - (SHARE_PORT_MAX + 1))
     };
-    (0..limit as u32)
+    // 先夹到池长再转 u32：`limit as u32` 会截断超大 limit，`start_index + n`
+    // 也可能因此溢出。
+    let n = limit.min(TOTAL as usize);
+    (0..n as u32)
         .map(|n| port_at((start_index + n) % TOTAL))
         .collect()
 }
