@@ -81,11 +81,19 @@ mod tests {
     #[test]
     fn random_start_never_lands_in_share_range() {
         let mut rng = StdRng::seed_from_u64(42);
+        let mut distinct: HashSet<u16> = HashSet::new();
         for _ in 0..10_000 {
             let p = random_pool_start(&mut rng);
             assert!((MAIN_PORT_MIN..=MAIN_PORT_MAX).contains(&p), "{p}");
             assert!(!(SHARE_PORT_MIN..=SHARE_PORT_MAX).contains(&p), "{p}");
+            distinct.insert(p);
         }
+        // 常量桩（恒返回 10000）只有 1 个不同值；真实实现约 9000 个。
+        assert!(
+            distinct.len() > 1000,
+            "随机起点差异过少: {}",
+            distinct.len()
+        );
     }
 
     #[test]
