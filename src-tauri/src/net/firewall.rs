@@ -72,8 +72,8 @@ pub fn is_unsupported(msg: &str) -> bool {
 /// 只说「部分失败」用户没法判断到底漏了谁在直连。
 pub fn unresolved_note(unresolved: &[String]) -> String {
     format!(
-        "这些程序当前没在运行，拿不到绝对路径、没能挡住：{}。\
-         需要挡住它们的话，先把程序开起来再重开一次网络",
+        "未检测到以下程序的运行进程，无法解析可执行文件路径，因而未安装阻断规则：{}。\
+         如需覆盖，请先启动这些程序，然后重新开启网络",
         unresolved.join("、")
     )
 }
@@ -85,7 +85,7 @@ pub enum FirewallState {
     Off,
     /// 按名单装齐了
     Applied,
-    /// 只装上了一部分（有程序没在跑、拿不到绝对路径；或服务报了别的失败）
+    /// 部分生效（有程序未解析到可执行文件路径、未安装规则；或回读条数不足）
     Partial,
     /// 防火墙拒写（组策略/安全软件）——网络照常开，界面给说明
     Denied,
@@ -321,7 +321,7 @@ pub fn block_state(
                     FirewallState::Partial,
                     join_note(
                         &unresolved_note,
-                        format!("阻断规则只装上 {rules} 条，预期 {expected} 条"),
+                        format!("阻断规则实际生效 {rules} 条，预期 {expected} 条"),
                     ),
                 );
             }

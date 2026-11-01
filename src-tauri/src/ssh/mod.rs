@@ -232,8 +232,10 @@ impl SshSession {
         let Some(proxy) = fallback_proxy else {
             return Err(first);
         };
-        // 非超时错误（认证失败、指纹不符、拒绝连接）换路也一样，不白试。
-        if !matches!(first, SshError::Timeout { .. }) {
+        // 认证/指纹/密钥格式换路也不会变，不白试。**传输层失败要换路**：112 的直连
+        // 丢包常表现为握手阶段 EOF/RST（russh 报 Disconnected），不是 timeout——
+        // 只认 Timeout 会把这类「拨得通、握手被掐」的机器判死，而经代理一直是通的。
+        if !matches!(first, SshError::Timeout { .. } | SshError::Connect { .. }) {
             return Err(first);
         }
         match Self::connect_via_proxy_only(host, port, user, auth, conn_timeout, proxy).await {

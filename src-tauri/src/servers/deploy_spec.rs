@@ -235,6 +235,203 @@ pub fn firewall_allow_cmd(protocols: &[(&str, u16)]) -> String {
 /// 部署协议白名单。字符串标识同时作 nodes.protocol 与 params 来源。
 pub const PROTOCOLS: [&str; 6] = ["vless", "trojan", "vmess", "ss", "hysteria2", "tuic"];
 
+// ---------- fail2ban（SSH 爆破防护） ----------
+
+/// fail2ban 的 drop-in 配置路径。
+///
+/// 用 `jail.d/` 下的独立文件而不是改 `jail.local`：fail2ban 的加载顺序是
+/// `jail.conf → jail.d/*.conf → jail.local → jail.d/*.local`，这个文件最后生效，
+/// 不会覆盖机器上已有的其它 jail，同时保证每次部署都收敛到同一份 sshd 策略。
+pub const FAIL2BAN_JAIL_PATH: &str = "/etc/fail2ban/jail.d/vpn-ctl.local";
+
+/// 部署管理的 fail2ban 规范（2026-10-29 定）：
+///
+/// - **只管 sshd**：部署不知道其它服务的日志格式，乱配 jail 只会误封；
+/// - `backend = systemd`：Ubuntu 22.04+/Debian 12 默认没有 `/var/log/auth.log`，
+///   auto 后端会找不到日志；systemd 后端只看 journal。sshd 过滤器自带
+///   `_COMM=sshd` 的 journalmatch，Debian 的单元名是 `ssh.service` 也能命中；
+/// - 1 分钟内 5 次失败**永久封禁**（`bantime = -1`）：封禁记录持久化在
+///   fail2ban 自己的库/规则里，服务重启、机器重启都不解除，只能人工 unban；
+/// - 只封管理 SSH 端口（应用连哪个端口就用哪个），不封业务端口——代理端口被
+///   滥用的形态与 SSH 爆破不同，没有通用过滤器；
+/// - `ignoreip` 只放行回环：管理 IP 是动态的，硬编码白名单等于没有保护。
+///
+/// **不覆盖 `banaction`**：沿用系统 fail2ban 的配置。不同发行版/版本的后端不同
+/// （Ubuntu 26.04 的 fail2ban 1.1 默认 `nftables`，Debian 12 是
+/// `iptables-multiport`，管理员也可能已经选了 `ufw`）。中途切换动作会让
+/// fail2ban 用新动作恢复旧封禁、旧动作的规则没人清理；让系统自己决定最稳。
+///
+/// 永久封禁令的代价：管理 IP 连续失败 5 次就再也连不上，必须从服务商控制台
+/// 解封（`fail2ban-client set sshd unbanip <IP>`）。这是用户明确选择的策略。
+pub fn fail2ban_jail_config(ssh_port: u16) -> String {
+    format!(
+        "# 由 vpn-ctl 部署生成，每次部署幂等覆盖，不要手改。\n\
+         [sshd]\n\
+         enabled = true\n\
+         backend = systemd\n\
+         port = {ssh_port}\n\
+         ignoreip = 127.0.0.1/8 ::1\n\
+         findtime = 1m\n\
+         maxretry = 5\n\
+         bantime = -1\n"
+    )
+}
+
+/// 幂等安装：已装 fail2ban 且 systemd 后端可导入时直接成功。
+///
+/// `python3-systemd` 是 systemd 后端的依赖，apt 只把它列为 Recommends；
+/// 漏装时 fail2ban 能启动但 sshd jail 起不来，必须显式装上。
+/// 兼容 apt / dnf / yum（RHEL 系 fail2ban 在 EPEL）。
+pub fn fail2ban_install_cmd() -> String {
+    "need=0; \
+     command -v fail2ban-client >/dev/null 2>&1 || need=1; \
+     python3 -c 'import systemd.journal' >/dev/null 2>&1 || need=1; \
+     if [ \"$need\" = 0 ]; then echo FAIL2BAN_ALREADY_INSTALLED; exit 0; fi; \
+     if command -v apt-get >/dev/null 2>&1; then \
+     DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban python3-systemd; \
+     elif command -v dnf >/dev/null 2>&1; then \
+     dnf install -y -q fail2ban python3-systemd || \
+     { dnf install -y -q epel-release && \
+     dnf install -y -q fail2ban python3-systemd; }; \
+     elif command -v yum >/dev/null 2>&1; then \
+     yum install -y -q epel-release && \
+     yum install -y -q fail2ban python3-systemd; \
+     else echo NO_PACKAGE_MANAGER >&2; exit 3; fi"
+        .to_string()
+}
+
+/// 应用配置并验证 sshd jail 真的起来了。
+///
+/// `systemctl restart` 返回 0 只代表服务进程起来了，jail 加载失败（配置语法、
+/// 后端缺模块、日志不存在）不会让它非零；必须 `fail2ban-client status sshd`
+/// 才算验证。重启后 socket 可能还没就绪，重试 10 秒。
+pub fn fail2ban_apply_cmd() -> &'static str {
+    "systemctl enable fail2ban >/dev/null 2>&1 || true; \
+     systemctl restart fail2ban || exit 1; \
+     i=0; \
+     until fail2ban-client status sshd >/dev/null 2>&1; do \
+     i=$((i+1)); \
+     if [ \"$i\" -ge 10 ]; then fail2ban-client status sshd >&2; exit 1; fi; \
+     sleep 1; \
+     done"
+}
+
+/// 读取 sshd jail 当前封禁的 IP；未安装/没有 jail 时输出空串而不是报错。
+pub fn fail2ban_list_bans_cmd() -> &'static str {
+    "if command -v fail2ban-client >/dev/null 2>&1; then \
+     fail2ban-client get sshd banip 2>/dev/null || true; fi"
+}
+
+/// 解析 `fail2ban-client get sshd banip` 的输出。
+///
+/// 输出是空格分隔的 IP 列表（无封禁时为空串）；只接受能解析为 IP 的词，
+/// 防止把错误信息、时间戳或占位符写进本地名单。结果排序去重，保证落库可复现。
+pub fn parse_fail2ban_bans(out: &str) -> Vec<String> {
+    let mut ips: Vec<String> = out
+        .split_whitespace()
+        .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+        .map(|s| s.to_string())
+        .collect();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// 本次 SSH 会话的来源 IP（服务器视角，`SSH_CLIENT` 的第一段）。
+///
+/// 预封禁时必须跳过操作者自己：本地名单是永久累积的，一旦某个历史 IP 恰好是
+/// 现在的管理 IP（例如以前在另一台机器上输错过密码），新机器刚部署完就会把
+/// 自己关在门外。当前会话的 IP 用 sshd 自己注入的变量取，不依赖应用侧探测。
+pub fn ssh_client_ip_cmd() -> &'static str {
+    "echo \"${SSH_CLIENT%% *}\""
+}
+
+/// 单次同步下发/单轮增量下发的数量上限。
+///
+/// 部署时：本地名单里缺的 IP 不超过这个数量就同步批量下发（1000 条约 25 秒）；
+/// 超过则只上传文件、交给服务器后台 worker 慢慢封，部署不再等待（初次部署一万条
+/// 就是这条路径）。
+/// 轮询时：每台服务器每轮最多取这么多条增量，避免一台离线很久的服务器把一轮
+/// 轮询拖成几分钟。
+pub const PREBAN_SYNC_LIMIT: usize = 1000;
+
+/// 预封禁临时文件（一行一个 IP）。用文件而不是把上千个 IP 拼进命令行：
+/// 避免超长命令与引号/转义问题，内容分块 base64 追加写入。
+pub const FAIL2BAN_PREBAN_PATH: &str = "/tmp/vpn-ctl-preban-ips";
+
+/// 轮询增量下发的临时文件（与部署预封禁分开，避免两者同时写同一路径）。
+pub const FAIL2BAN_SYNC_PATH: &str = "/tmp/vpn-ctl-ban-sync-ips";
+
+/// 后台预封禁 worker 的脚本 / pid / 日志路径。
+pub const FAIL2BAN_PREBAN_SCRIPT: &str = "/tmp/vpn-ctl-preban.sh";
+pub const FAIL2BAN_PREBAN_PID: &str = "/tmp/vpn-ctl-preban.pid";
+pub const FAIL2BAN_PREBAN_LOG: &str = "/tmp/vpn-ctl-preban.log";
+
+/// 把指定文件里的 IP 分批交给 `set sshd banip`，完成后删除文件。
+///
+/// fail2ban-client 一次调用可以传多个 IP（ashura 1.1.0 实测一次 1000 个，24.8s
+/// 全部生效）。逐条调用时每条都要起一个 Python 客户端（实测 ~257ms/条，1000 条
+/// 要 4 分多钟，会把部署拖到超时）；每批 200 条时固定开销几乎可以忽略，总耗时
+/// 由 fail2ban 内部逐条执行封禁动作主导（~25s/1000 条）。`|| true` 包在 `sh -c`
+/// 里：已封禁的 IP 可能返回非零，不能让 xargs 因某一批失败提前退出。
+pub fn fail2ban_ban_file_cmd(path: &str) -> String {
+    format!(
+        "if [ -s {p} ]; then \
+         xargs -r -n 200 sh -c 'fail2ban-client set sshd banip \"$@\" >/dev/null 2>&1 || true' sh < {p}; \
+         rm -f {p}; \
+         fi",
+        p = path
+    )
+}
+
+/// 部署里的同步预封禁：读取固定路径 [`FAIL2BAN_PREBAN_PATH`]。
+pub fn fail2ban_preban_cmd() -> String {
+    fail2ban_ban_file_cmd(FAIL2BAN_PREBAN_PATH)
+}
+
+/// 后台预封禁脚本：每批 200 个 IP、批间 sleep 2 秒慢慢封，避免大批量下发在
+/// 服务器上形成 CPU 尖峰。由部署以 setsid 分离启动，SSH 断开/部署结束都不影响
+/// 它；结束时删除 IP 文件与 pid 文件。
+pub fn fail2ban_preban_worker_script() -> String {
+    format!(
+        "#!/bin/sh\n\
+         # 由 vpn-ctl 部署生成，每次部署幂等覆盖。\n\
+         f={preban}\n\
+         log={log}\n\
+         pid={pid}\n\
+         : > \"$log\"\n\
+         echo \"start $(date -Is) total=$(grep -c . \"$f\")\" >> \"$log\"\n\
+         xargs -r -n 200 sh -c 'fail2ban-client set sshd banip \"$@\" >/dev/null 2>&1 || true; echo \"batch $(date -Is) $#\" >> {log}; sleep 2' sh < \"$f\"\n\
+         echo \"done $(date -Is)\" >> \"$log\"\n\
+         rm -f \"$f\" \"$pid\"\n",
+        preban = FAIL2BAN_PREBAN_PATH,
+        log = FAIL2BAN_PREBAN_LOG,
+        pid = FAIL2BAN_PREBAN_PID,
+    )
+}
+
+/// 停掉上一轮的后台 worker（如果还在跑）。用 pid 文件 + `/proc/<pid>/cmdline`
+/// 校验，避免 pid 复用后误杀别的进程。
+pub fn fail2ban_stop_worker_cmd() -> String {
+    format!(
+        "p={pid}; if [ -f \"$p\" ]; then pid=$(cat \"$p\"); \
+         if [ -n \"$pid\" ] && grep -q vpn-ctl-preban.sh \"/proc/$pid/cmdline\" 2>/dev/null; then \
+         kill \"$pid\" 2>/dev/null || true; fi; rm -f \"$p\"; fi",
+        pid = FAIL2BAN_PREBAN_PID
+    )
+}
+
+/// 分离启动后台 worker：setsid + 重定向全部标准流，SSH 通道关闭后继续跑。
+pub fn fail2ban_start_worker_cmd() -> String {
+    format!(
+        "command -v setsid >/dev/null 2>&1 || exit 1; \
+         setsid sh {script} </dev/null >/dev/null 2>&1 & echo $! > {pid}; cat {pid}",
+        script = FAIL2BAN_PREBAN_SCRIPT,
+        pid = FAIL2BAN_PREBAN_PID,
+    )
+}
+
 /// 协议是否在部署白名单内。
 pub fn is_supported_protocol(proto: &str) -> bool {
     PROTOCOLS.contains(&proto)

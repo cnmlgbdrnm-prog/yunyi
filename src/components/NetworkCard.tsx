@@ -44,13 +44,13 @@ export function firewallWarning(state: FirewallState): boolean {
 export function firewallLabel(state: FirewallState): string {
   switch (state) {
     case 'partial':
-      return '部分未挡住'
+      return '部分生效'
     case 'denied':
-      return '被防火墙拒绝'
+      return '未生效（防火墙拒绝）'
     case 'unavailable':
-      return '服务不可用'
+      return '未生效（服务不可用）'
     case 'unsupported':
-      return '系统不支持'
+      return '不支持'
     default:
       return ''
   }
@@ -215,7 +215,7 @@ export default function NetworkCard({
       )}
       {net?.running && !net.tun && (
         <p className="mt-2 text-xs text-amber-300">
-          系统代理模式无法接管所有程序；未被防火墙规则覆盖的程序仍可能直连公网。请开启 TUN 全局模式以接管它们。
+          系统代理模式无法覆盖所有程序。未被阻断规则覆盖的程序仍可能直连公网；如需全局接管，请启用 TUN 模式。
         </p>
       )}
       {/* 会话级阻断没生效时如实说：非 TUN 下关注程序的公网直连

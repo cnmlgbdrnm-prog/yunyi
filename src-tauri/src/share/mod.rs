@@ -12,6 +12,7 @@ use crate::ssh::SshSession;
 use std::sync::atomic::AtomicBool;
 
 pub mod bandwidth;
+pub mod bans;
 pub mod cdn;
 pub mod clone;
 pub mod install;
@@ -20,6 +21,7 @@ pub mod model;
 pub mod naming;
 pub mod plan;
 pub mod scripts;
+pub mod spec;
 pub mod status_poll;
 pub mod tls;
 

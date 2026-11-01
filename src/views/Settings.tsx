@@ -39,12 +39,12 @@ function errorMessage(e: unknown): string {
  * 否则就是把 fail-open 藏起来。设置页有地方，就把话说全。
  */
 const FIREWALL_TEXT: Record<FirewallState, string> = {
-  off: '未启用（当前没开网络，或本次会话没有要挡的程序）',
-  applied: '已生效（关注程序的公网 IPv4 / IPv6 直连已被挡）',
-  partial: '只装上了一部分——没挡住的那部分流量仍会绕过代理直连',
-  denied: '被防火墙拒绝：网络照常可用，但非 TUN 下推不到的流量不会被挡住',
-  unavailable: '没能生效：服务不可用（或服务是旧构建，不认识阻断命令）',
-  unsupported: '当前系统没有这套防火墙语义',
+  off: '未启用（未开启网络，或本次会话没有需要阻断的程序）',
+  applied: '已生效（关注程序的公网 IPv4 / IPv6 直连已阻断）',
+  partial: '部分生效（部分关注程序未安装阻断规则，其公网直连仍可能绕过代理）',
+  denied: '未生效（防火墙拒绝写入规则；网络连接不受影响，但非 TUN 模式下部分程序的直连未被阻断）',
+  unavailable: '未生效（网络服务不可用，或版本过旧）',
+  unsupported: '不支持（当前系统不具备 Windows 防火墙）',
 }
 
 // 检查更新流程状态机：available 持有可下载的更新；failed 区分检查与下载阶段
@@ -400,20 +400,19 @@ export default function Settings() {
                 : '未安装'}
         </p>
         <p className="text-sm text-neutral-400">
-          系统代理模式下，为启动时可定位到的关注程序安装公网 IPv4 / IPv6 出站阻断；它们若不使用本地代理，
-          需要开启 TUN 才能继续联网。关闭网络时撤销阻断。改动服务后需重新安装才生效。
+          {'系统代理模式下，应用会为可定位的关注程序安装 Windows 防火墙出站阻断规则，阻止其公网 IPv4 / IPv6 直连。此类程序若未使用本地代理，需启用 TUN 模式方可联网。关闭网络时自动撤销规则；更新网络服务后需重新安装方可生效。'}
         </p>
         {/* 会话阻断的**完整**状态与原因。仪表盘上已经收成一行小字（用户嫌整段话丑），
             原因就挪到这里：哪些程序没挡住、为什么，必须查得到——删掉不提等于把
             fail-open 藏起来，那正是这个功能要消灭的东西。 */}
         <p className="text-sm">
-          会话阻断：
+          会话阻断（仅本次网络会话生效）：
           {net === null || !net.firewall
             ? '未知'
             : (FIREWALL_TEXT[net.firewall] ?? net.firewall)}
         </p>
         {net?.firewall_detail && (
-          <p className="text-sm text-neutral-400">{net.firewall_detail}</p>
+          <p className="text-sm text-neutral-400">原因：{net.firewall_detail}</p>
         )}
         <div className="flex items-center gap-3">
           <button

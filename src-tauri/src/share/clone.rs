@@ -2,14 +2,17 @@
 //! 保持与主服务一致。分享是快照，克隆完成后主服务再改不会回写这里。
 
 use crate::domain::{Node, Privacy};
+use crate::servers::deploy_spec::upstream_outbound_tag;
 use crate::share::naming::share_dir;
 use std::collections::HashSet;
 
-/// 入站来自哪份服务配置。上游出口在独立的 `xray-upstream` 实例里，不能去主配置找。
+/// 入站来自哪份服务配置。上游出口在独立的 `xray-upstream` 实例里，不能去主配置找；
+/// 复用主入口的出口入站在主配置里，但必须路由到 `out-up-<id>`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareSource {
     Main,
     Upstream,
+    ReusedUpstream(i64),
 }
 
 #[derive(Debug)]
@@ -200,9 +203,10 @@ fn clone_xray(
     let mut inbounds = Vec::new();
     let mut inbound_tags = HashSet::new();
     let mut upstream_tags = Vec::new();
+    let mut reused_routes: Vec<(String, i64)> = Vec::new();
     for s in specs {
         let (source_inbounds, label) = match s.source {
-            ShareSource::Main => (
+            ShareSource::Main | ShareSource::ReusedUpstream(_) => (
                 &main_inbounds,
                 format!("主配置里找不到 {}:{} 入站", s.protocol, s.original_port),
             ),
@@ -218,26 +222,46 @@ fn clone_xray(
                     && ib.get("port").and_then(|v| v.as_u64()) == Some(s.original_port as u64)
             })
             .ok_or(label)?;
-        if s.source == ShareSource::Upstream {
-            let tag = orig.get("tag").and_then(|v| v.as_str()).ok_or_else(|| {
-                format!(
-                    "上游配置里 {}:{} 入站缺 tag，无法配对出站",
-                    s.protocol, s.original_port
-                )
-            })?;
-            if !inbound_tags.insert(tag.to_string()) {
-                return Err(format!("入站 tag 重复: {tag}"));
+        // 复用主入口的出口没有独立 tag：给分享入站生成唯一 tag，路由规则按它匹配。
+        // 主入站的 tag 留给同一次分享里的主节点，两边不会互相抢路由。
+        let reused_tag = match s.source {
+            ShareSource::Upstream => {
+                let tag = orig.get("tag").and_then(|v| v.as_str()).ok_or_else(|| {
+                    format!(
+                        "上游配置里 {}:{} 入站缺 tag，无法配对出站",
+                        s.protocol, s.original_port
+                    )
+                })?;
+                if !inbound_tags.insert(tag.to_string()) {
+                    return Err(format!("入站 tag 重复: {tag}"));
+                }
+                upstream_tags.push(tag.to_string());
+                None
             }
-            upstream_tags.push(tag.to_string());
-        } else if let Some(tag) = orig.get("tag").and_then(|v| v.as_str()) {
-            if !inbound_tags.insert(tag.to_string()) {
-                return Err(format!("入站 tag 重复: {tag}"));
+            ShareSource::ReusedUpstream(id) => {
+                let tag = format!("vpn-share-{}-{}", s.public_port, s.protocol);
+                if !inbound_tags.insert(tag.clone()) {
+                    return Err(format!("入站 tag 重复: {tag}"));
+                }
+                reused_routes.push((tag.clone(), id));
+                Some(tag)
             }
-        }
+            ShareSource::Main => {
+                if let Some(tag) = orig.get("tag").and_then(|v| v.as_str()) {
+                    if !inbound_tags.insert(tag.to_string()) {
+                        return Err(format!("入站 tag 重复: {tag}"));
+                    }
+                }
+                None
+            }
+        };
 
         let mut ib = orig.clone();
         ib["listen"] = serde_json::json!("127.0.0.1");
         ib["port"] = serde_json::json!(s.internal_port);
+        if let Some(tag) = reused_tag {
+            ib["tag"] = serde_json::json!(tag);
+        }
         match s.protocol.as_str() {
             "vless" => {
                 let flow = orig
@@ -262,6 +286,10 @@ fn clone_xray(
         inbounds.push(ib);
     }
 
+    if !reused_routes.is_empty() && main_root.is_none() {
+        return Err("复用主入口的上游出口缺少主 Xray 配置".into());
+    }
+
     // 主配置的出站/分流原样保留；上游只复制**被选中出口**对应的出站与路由，
     // 绝不把同机其它出口的 SOCKS/HTTP 凭据带进分享实例。
     let mut outbounds = Vec::new();
@@ -284,6 +312,24 @@ fn clone_xray(
                 }
                 outbounds.push(ob.clone());
             }
+        }
+        // 复用主入口的出口只带被选中的那一条住宅出站；其它上游出站（以及它们的
+        // SOCKS/HTTP 凭据）仍然不进分享。
+        for (_, id) in &reused_routes {
+            let tag = upstream_outbound_tag(*id);
+            if outbound_tags.contains(&tag) {
+                continue;
+            }
+            let outbound = root
+                .get("outbounds")
+                .and_then(|v| v.as_array())
+                .and_then(|list| {
+                    list.iter()
+                        .find(|o| o.get("tag").and_then(|v| v.as_str()) == Some(tag.as_str()))
+                })
+                .ok_or_else(|| format!("主配置里找不到上游出口出站 {tag}"))?;
+            outbound_tags.insert(tag);
+            outbounds.push(outbound.clone());
         }
         if let Some(routing) = root.get("routing") {
             if domain_strategy.is_none() {
@@ -341,6 +387,16 @@ fn clone_xray(
         if domain_strategy.is_none() {
             domain_strategy = root.pointer("/routing/domainStrategy").cloned();
         }
+    }
+
+    // 复用主入口的出口：分享入站的唯一 tag → 被选中的住宅出站。与旧专用实例
+    // 的规则一样放在主规则之前，避免被主配置的 catch-all 抢走。
+    for (tag, id) in &reused_routes {
+        upstream_rules.push(serde_json::json!({
+            "type": "field",
+            "inboundTag": [tag],
+            "outboundTag": upstream_outbound_tag(*id)
+        }));
     }
 
     // 上游规则放在主配置规则之前：Xray 首条匹配生效，主配置若带 catch-all，

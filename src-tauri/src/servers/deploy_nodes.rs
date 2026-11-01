@@ -15,6 +15,7 @@ pub(super) fn writeback(
     server: &Server,
     ok_protocols: &[&(String, u16, String)],
     bbr_note: Option<&str>,
+    fail2ban_note: Option<&str>,
 ) -> Result<(), String> {
     let mut guard = state.db.lock();
     let conn = guard.transaction().map_err(|e| e.to_string())?;
@@ -210,10 +211,13 @@ pub(super) fn writeback(
             "node": a.node, "attached": a.attached, "detail": a.detail
         })).collect::<Vec<_>>()
     });
-    // BBR 结果（有才写）：摘要只作部署历史记录，协议列表以节点行为准，
+    // BBR / fail2ban 结果（有才写）：摘要只作部署历史记录，协议列表以节点行为准，
     // 因此附加字段不会影响 UI 的已部署协议展示
     if let Some(note) = bbr_note {
         summary["bbr"] = serde_json::Value::from(note);
+    }
+    if let Some(note) = fail2ban_note {
+        summary["fail2ban"] = serde_json::Value::from(note);
     }
     let summary = summary.to_string();
     repos::deploys::insert(&conn, server.id, "deploy", &summary, "ok")

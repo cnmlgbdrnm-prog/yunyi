@@ -7,6 +7,9 @@
 //! 因此写入、启动、验证整体包在同一个 `setup` future 里，失败统一走
 //! [`rollback_created`]——停单元、删单元、删目录、撤端口放行。
 
+use super::spec::firewall_specs;
+pub(crate) use super::spec::instance_unit;
+pub use super::spec::{build_specs, unit_contents};
 use crate::domain::{effective_host, Node, Server};
 use crate::servers::deploy::{
     run_cmd, run_cmd_ok, write_remote_file, CONFIG_TIMEOUT, SINGBOX_CONFIG_PATH, SS_CONFIG_PATH,
@@ -110,9 +113,9 @@ async fn create_share_inner_with_domain(
 
     // 上游出口的入站不在主 Xray 配置里，而在专用的 `xray-upstream` 实例。
     // 先按 node_id 认出哪些选中节点来自上游，克隆时才选对配置来源。
-    // 复用主入口的出口（entry_proto 非空）单独标出：它的入站在主配置里，
-    // 但克隆需要改写用户路由，当前明确拒绝分享。
-    let (upstream_node_ids, reused_upstream_node_ids): (HashSet<String>, HashSet<String>) = {
+    // 复用主入口的出口（entry_proto 非空）记录 upstream id：克隆主入站后只把
+    // 被选中的 out-up-<id> 与对应路由带进分享。
+    let (upstream_node_ids, reused_upstreams): (HashSet<String>, HashMap<String, i64>) = {
         let conn = state.db.lock();
         let rows = crate::db::repos::upstreams::list_by_server(&conn, input.server_id)
             .map_err(|e| e.to_string())?;
@@ -120,7 +123,7 @@ async fn create_share_inner_with_domain(
         let reused = rows
             .iter()
             .filter(|u| !u.entry_proto.is_empty())
-            .filter_map(|u| u.node_id.clone())
+            .filter_map(|u| u.node_id.clone().map(|node_id| (node_id, u.id)))
             .collect();
         (ids, reused)
     };
@@ -191,7 +194,7 @@ async fn create_share_inner_with_domain(
         &chosen,
         &allocated.pairs,
         &upstream_node_ids,
-        &reused_upstream_node_ids,
+        &reused_upstreams,
     )?;
 
     // 4. 读配置。需要哪个协议/来源才读哪个；文件缺失即报错，不静默跳过。
@@ -683,9 +686,9 @@ pub(crate) async fn read_main(
     path: &str,
 ) -> Result<Option<String>, String> {
     let needed = specs.iter().any(|s| match family {
-        "upstream" => s.source == ShareSource::Upstream,
+        "upstream" => matches!(s.source, ShareSource::Upstream),
         "vless" => {
-            s.source == ShareSource::Main
+            matches!(s.source, ShareSource::Main | ShareSource::ReusedUpstream(_))
                 && matches!(s.protocol.as_str(), "vless" | "trojan" | "vmess")
         }
         "hysteria2" => {
@@ -866,154 +869,6 @@ pub async fn allocate_share_ports(
     Ok(AllocatedPorts { http, pairs })
 }
 
-/// 由节点与端口对生成克隆规格；凭据在这里一次性生成。
-///
-/// `upstream_node_ids` 是这台服务器上由上游出口写回的节点 id。它们虽然也表现为
-/// `self-built` 的 VLESS 节点，入站却在专用 `xray-upstream` 配置里，克隆来源不同。
-pub fn build_specs(
-    nodes: &[Node],
-    pairs: &[(u16, u16)],
-    upstream_node_ids: &HashSet<String>,
-    reused_upstream_node_ids: &HashSet<String>,
-) -> Result<Vec<ShareNodeSpec>, String> {
-    if nodes.len() != pairs.len() {
-        return Err("端口数量与节点数量不一致".into());
-    }
-    nodes
-        .iter()
-        .zip(pairs)
-        .map(|(n, (public, internal))| {
-            let transport = match n.protocol.as_str() {
-                "hysteria2" | "tuic" => "udp",
-                "ss" => "tcp_and_udp",
-                "vless" | "trojan" | "vmess" => "tcp",
-                other => return Err(format!("不支持分享的协议: {other}")),
-            };
-            let original_port = u16::try_from(n.port)
-                .map_err(|_| format!("节点 {} 端口非法: {}", n.name, n.port))?;
-            let original_params = serde_json::from_str(&n.params_json)
-                .map_err(|e| format!("节点 {} 参数解析失败: {e}", n.name))?;
-            let (new_credential, new_password) = if n.protocol == "tuic" {
-                (
-                    uuid::Uuid::new_v4().to_string(),
-                    Some(uuid::Uuid::new_v4().to_string()),
-                )
-            } else if n.protocol == "ss" {
-                let key: [u8; 32] = rand::random();
-                (
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key),
-                    None,
-                )
-            } else {
-                (uuid::Uuid::new_v4().to_string(), None)
-            };
-            let source = if upstream_node_ids.contains(&n.id) {
-                // 复用主入口的出口没有独立入站：入站与主协议共用，克隆时必须把
-                // 住宅出站/路由一起改造，当前未实现。显式拒绝，绝不静默降级成
-                // 「分享用户走主出口直连」——那会把住宅线路悄悄换成普通线路。
-                if reused_upstream_node_ids.contains(&n.id) {
-                    return Err(format!(
-                        "上游出口节点 {} 复用主入口，暂不支持分享（避免把住宅出口错接到直连）",
-                        n.name
-                    ));
-                }
-                // 旧专用实例的出口只有 VLESS+REALITY 一种客户端形态；真出现别的协议
-                // 说明节点被别处改过，宁可显式拒绝，也不要拿错来源的配置去猜。
-                if n.protocol != "vless" {
-                    return Err(format!(
-                        "上游出口节点 {} 的协议为 {}，当前只支持分享 VLESS 上游",
-                        n.name, n.protocol
-                    ));
-                }
-                ShareSource::Upstream
-            } else {
-                ShareSource::Main
-            };
-            Ok(ShareNodeSpec {
-                name: n.name.clone(),
-                protocol: n.protocol.clone(),
-                original_port,
-                public_port: *public,
-                internal_port: *internal,
-                transport,
-                original_params,
-                new_credential,
-                new_password,
-                source,
-            })
-        })
-        .collect()
-}
-
-// ---------- 单元与防火墙 ----------
-
-fn firewall_specs(pairs: &[(u16, &str)]) -> String {
-    pairs
-        .iter()
-        .map(|(p, proto)| format!("{p}:{proto}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn hardening(dir: &str) -> String {
-    format!(
-        "User=vpnshare\nGroup=vpnshare\nNoNewPrivileges=yes\nProtectSystem=strict\n\
-         ProtectHome=yes\nPrivateTmp=yes\nReadWritePaths={dir}\n\
-         RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK\n"
-    )
-}
-
-pub struct ShareUnits {
-    pub http: String,
-    pub gateway: String,
-}
-
-pub fn unit_contents(
-    id: &str,
-    port: u16,
-    bind: &str,
-    dir: &str,
-    pairs: &[(u16, &str)],
-) -> ShareUnits {
-    let http_script = share_server_script_path();
-    let gateway_script = share_gateway_script_path();
-    let firewall = firewall_script_path();
-    let tls = tls_dir();
-    let h = hardening(dir);
-    let http = format!(
-        "[Unit]\nDescription=vpn-ctl share {id} subscription\nAfter=network.target\n\n[Service]\n{h}\
-         ExecStart=/usr/bin/env python3 {http_script} {port} {dir} --bind {bind} \
---cert {tls}/fullchain.pem --key {tls}/privkey.pem\n\
-         ExecStartPost=+{firewall} open vpnshare-{id} {port}:tcp\n\
-         ExecStopPost=+{firewall} close vpnshare-{id} {port}:tcp\n\
-         Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
-    );
-    let specs = firewall_specs(pairs);
-    let gateway = format!(
-        "[Unit]\nDescription=vpn-ctl share {id} gateway\nAfter=network.target\n\n[Service]\n{h}\
-         MemoryHigh=256M\nMemoryMax=384M\nLimitNOFILE=2048\n\
-         ExecStart=/usr/bin/env python3 {gateway_script} --config {dir}/gateway.json \
---usage {dir}/usage.json --bind {bind}\n\
-         ExecStartPost=+{firewall} open vpnshare-{id} {specs}\n\
-         ExecStopPost=+{firewall} close vpnshare-{id} {specs}\n\
-         Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
-    );
-    ShareUnits { http, gateway }
-}
-
-fn instance_unit(id: &str, unit: &str, kind: &str, dir: &str, config: &str) -> String {
-    let exec = match kind {
-        "xray" => format!("/usr/local/bin/xray run -config {config}"),
-        "singbox" => format!("/usr/local/bin/sing-box run -c {config}"),
-        _ => format!("/usr/local/bin/ssserver -c {config}"),
-    };
-    let h = hardening(dir);
-    format!(
-        "[Unit]\nDescription=vpn-ctl share {id} {kind} ({unit})\nAfter=network.target\n\n[Service]\n{h}\
-         ExecStart={exec}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
-    )
-}
-
 /// 回滚一次失败的创建。所有步骤幂等：单元/目录/规则不存在也不算错。
 /// 返回无法确认清理干净的项目，调用方把它带进错误信息（A9 的透明度）。
 pub(crate) async fn rollback_created(
@@ -1189,9 +1044,13 @@ pub async fn list_shares(state: &Arc<AppState>) -> Result<ShareList, String> {
 /// - 证书状态与分享摘要**共用同一个 SSH 会话**，不给每台服务器多开一条连接；
 /// - 任何一台失败都不拖垮整轮：分享读失败进 `unreachable`，证书读失败只丢该台
 ///   的 `tls` 条目（向导会回落到按需实时查询）；
+/// - 顺带把各服务器的封禁名单增量同步到彼此：只发游标之后、目标机还没有的
+///   IP，失败留到下一轮重试；
 /// - 返回快照由调用方写缓存并推送，前端切页不再触发这里。
 pub async fn refresh_share_snapshot(state: &Arc<AppState>) -> Result<ShareSnapshot, String> {
     let servers = crate::db::repos::servers::list(&state.db.lock()).map_err(|e| e.to_string())?;
+    // 增量下发要用 Server 建连；闭包会 move 掉 server，这里先留一份按 id 索引。
+    let server_map: HashMap<i64, Server> = servers.iter().map(|s| (s.id, s.clone())).collect();
     let email = tls::acme_email(state);
 
     let mut set = tokio::task::JoinSet::new();
@@ -1204,14 +1063,17 @@ pub async fn refresh_share_snapshot(state: &Arc<AppState>) -> Result<ShareSnapsh
             let id = server.id;
             let mut sess = match connect_server(&state, &server).await {
                 Ok(s) => s,
-                Err(e) => return (idx, id, name, Err(e), None),
+                Err(e) => return (idx, id, name, Err(e), None, Vec::new()),
             };
             let summaries = read_server_summaries_on(&mut sess, &server, &cancel).await;
+            // 顺带同步 fail2ban 封禁名单：这轮本来就为每台服务器建了 SSH 会话，
+            // 再加一条本地命令，成本可以忽略。
+            let bans = crate::share::bans::read_fail2ban_bans_on(&mut sess, &cancel).await;
             let tls = match &email {
                 Ok(email) => Some(tls::read_tls_status(&server, email, &mut sess).await),
                 Err(_) => None,
             };
-            (idx, id, name, summaries, tls)
+            (idx, id, name, summaries, tls, bans)
         });
     }
 
@@ -1224,10 +1086,16 @@ pub async fn refresh_share_snapshot(state: &Arc<AppState>) -> Result<ShareSnapsh
     }
     results.sort_by_key(|(idx, ..)| *idx);
 
+    let polled: Vec<(i64, Vec<String>)> = results
+        .iter()
+        .map(|(_, id, _, _, _, bans)| (*id, bans.clone()))
+        .collect();
+    crate::share::bans::sync_bans(state, &server_map, &polled).await;
+
     let mut shares = Vec::new();
     let mut unreachable = Vec::new();
     let mut tls_map = HashMap::new();
-    for (_, id, name, summaries, tls) in results {
+    for (_, id, name, summaries, tls, _) in results {
         match summaries {
             Ok(mut list) => shares.append(&mut list),
             Err(reason) => unreachable.push(format!("{name}：{reason}")),
@@ -1244,7 +1112,10 @@ pub async fn refresh_share_snapshot(state: &Arc<AppState>) -> Result<ShareSnapsh
     })
 }
 
-async fn connect_server(state: &Arc<AppState>, server: &Server) -> Result<SshSession, String> {
+pub(crate) async fn connect_server(
+    state: &Arc<AppState>,
+    server: &Server,
+) -> Result<SshSession, String> {
     let (auth, _) = crate::servers::load_auth(state, server.id).map_err(|e| e.to_string())?;
     SshSession::connect(
         effective_host(server),
@@ -1809,7 +1680,7 @@ async fn update_share_node_set(
         return Err("Shadowsocks 分享一次只允许一个节点".into());
     }
 
-    let (upstream_node_ids, reused_upstream_node_ids): (HashSet<String>, HashSet<String>) = {
+    let (upstream_node_ids, reused_upstreams): (HashSet<String>, HashMap<String, i64>) = {
         let conn = state.db.lock();
         let rows = crate::db::repos::upstreams::list_by_server(&conn, manifest.server_id)
             .map_err(|e| e.to_string())?;
@@ -1817,7 +1688,7 @@ async fn update_share_node_set(
         let reused = rows
             .iter()
             .filter(|u| !u.entry_proto.is_empty())
-            .filter_map(|u| u.node_id.clone())
+            .filter_map(|u| u.node_id.clone().map(|node_id| (node_id, u.id)))
             .collect();
         (ids, reused)
     };
@@ -1852,12 +1723,7 @@ async fn update_share_node_set(
     }
 
     let chosen_nodes: Vec<Node> = chosen.iter().map(|(n, _)| n.clone()).collect();
-    let mut specs = build_specs(
-        &chosen_nodes,
-        &pairs,
-        &upstream_node_ids,
-        &reused_upstream_node_ids,
-    )?;
+    let mut specs = build_specs(&chosen_nodes, &pairs, &upstream_node_ids, &reused_upstreams)?;
     for (spec, (_, old)) in specs.iter_mut().zip(chosen.iter()) {
         if let Some(old) = old {
             let (credential, password) = existing_share_credential(old)?;

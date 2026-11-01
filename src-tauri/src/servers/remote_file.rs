@@ -85,6 +85,51 @@ pub(crate) async fn read_remote_file(
 ///
 /// 顺带一提：`chmod` 不能省。改成 `> tmp && mv` 之后，tmp 的模式会**替换**掉原文件
 /// 的模式，省掉 chmod 反而会把本来就是 600 的 wg0.conf 降级成 644。
+pub(crate) async fn append_remote_file(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    step: &str,
+    remote_path: &str,
+    content: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        content.as_bytes(),
+    );
+    run_cmd_ok(
+        sess,
+        cancel,
+        step,
+        &format!("echo '{b64}' | base64 -d >> '{remote_path}'"),
+        timeout,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// 分块写入「一行一条」的名单：先原子建空文件，再逐块追加。
+///
+/// 单条 SSH 命令的 exec 请求有大小上限，上千个 IPv6 地址一次 base64 会逼近
+/// 通道包上限；切块后每条命令只有几十 KB，和现有分享脚本的写入量同量级。
+pub(crate) async fn write_line_list(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    step: &str,
+    remote_path: &str,
+    lines: &[String],
+    chunk: usize,
+    timeout: Duration,
+) -> Result<(), String> {
+    write_remote_file(sess, cancel, step, remote_path, "", timeout).await?;
+    for part in lines.chunks(chunk.max(1)) {
+        let mut content = part.join("\n");
+        content.push('\n');
+        append_remote_file(sess, cancel, step, remote_path, &content, timeout).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn write_remote_file(
     sess: &mut SshSession,
     cancel: &AtomicBool,

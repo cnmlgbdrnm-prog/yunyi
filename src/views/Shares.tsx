@@ -71,6 +71,9 @@ function statusView(s: ShareInfo): { label: string; className: string } {
   }
 }
 
+/** 「忽略失联提示」的会话内记忆键：同一组失联服务器不反复占位。 */
+const UNREACHABLE_DISMISS_KEY = 'shares.unreachable.dismissed'
+
 /** 会话级快照已移入后端轮询；这里只格式化「更新于」的时刻。 */
 function formatClock(at: string): string | null {
   const d = new Date(at)
@@ -84,6 +87,18 @@ export default function Shares() {
   const status = useShareStatus()
   const shares = status?.shares ?? []
   const unreachable = status?.unreachable ?? []
+  // 失联提示可以忽略；同一组失联服务器在本次应用会话里不再反复占位。
+  // 用 sessionStorage 而不是组件 state：切页卸载后回来仍应保持「已忽略」。
+  const [dismissedUnreachable, setDismissedUnreachable] = useState(() => {
+    try {
+      return sessionStorage.getItem(UNREACHABLE_DISMISS_KEY) ?? ''
+    } catch {
+      return ''
+    }
+  })
+  const unreachableSig = unreachable.join('、')
+  const showUnreachable =
+    unreachable.length > 0 && unreachableSig !== dismissedUnreachable
   const [servers, setServers] = useState<Server[]>([])
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
@@ -112,6 +127,17 @@ export default function Shares() {
   const loading = status == null || status.checked_at === null
   const updatedAt = status?.checked_at ? formatClock(status.checked_at) : null
 
+  // 所有服务器都恢复后清掉「已忽略」：下次再失联要重新提示，不能永久静音。
+  useEffect(() => {
+    if (unreachable.length > 0) return
+    setDismissedUnreachable('')
+    try {
+      sessionStorage.removeItem(UNREACHABLE_DISMISS_KEY)
+    } catch {
+      /* sessionStorage 不可用时忽略：提示仍按组件内存状态工作 */
+    }
+  }, [unreachable.length])
+
   useEffect(() => {
     // 只读本地库（服务器清单）；分享状态由后端推送。切页可能在返回前发生：
     // 卸载后再 setState 只会在测试里留下 act 警告，对界面毫无意义。
@@ -127,6 +153,15 @@ export default function Shares() {
       alive = false
     }
   }, [])
+
+  const dismissUnreachable = () => {
+    setDismissedUnreachable(unreachableSig)
+    try {
+      sessionStorage.setItem(UNREACHABLE_DISMISS_KEY, unreachableSig)
+    } catch {
+      /* sessionStorage 不可用时忽略：至少组件内存里已经隐藏 */
+    }
+  }
 
   // 复制失败必须说出来：剪贴板 API 的拒绝是静默的，不说用户就只会看到「点了没反应」
   const handleCopy = async (url: string) => {
@@ -175,10 +210,17 @@ export default function Shares() {
         <p>1 GB = 10 亿字节。只按公网双向总额度停用；上行、下行只展示用量明细，不再单独限额。</p>
       </div>
 
-      {unreachable.length > 0 && (
-        <p className="rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-xs text-neutral-400">
-          读不到这些服务器上的分享，列表可能不全：{unreachable.join('、')}
-        </p>
+      {showUnreachable && (
+        <div className="flex items-start justify-between gap-3 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-xs text-neutral-400">
+          <p>读不到这些服务器上的分享，列表可能不全：{unreachableSig}</p>
+          <button
+            type="button"
+            onClick={dismissUnreachable}
+            className="shrink-0 underline decoration-dotted hover:text-neutral-200"
+          >
+            忽略
+          </button>
+        </div>
       )}
 
       <button

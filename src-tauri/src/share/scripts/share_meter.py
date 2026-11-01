@@ -16,6 +16,11 @@ import time
 ROOT = Path('/srv/vpnshare')
 PINS = Path('/sys/fs/bpf/vpnshare')
 STATE_ROOT = Path('/var/lib/vpnshare-meters')
+# Every atomic_json fsyncs the file and its directory. Keep that I/O off the
+# accounting loop: on a slow virtual disk it can outlast a tight watchdog.
+# The heartbeat is sent before these writes, so a blocked fsync cannot starve it.
+STATE_WRITE_INTERVAL = 2.0
+STATUS_WRITE_INTERVAL = 5.0
 
 
 def run(args, timeout=30):
@@ -232,6 +237,8 @@ def serve(identifier):
         atomic_json(state_path, state)
         set_config(config, quota, history, ifindex)
         ready = False
+        last_state_write = 0.0
+        last_status_write = 0.0
         while not stopping:
             manifest = read_manifest(identifier)
             quota = manifest['quota_total_bytes']
@@ -242,20 +249,26 @@ def serve(identifier):
             if rx < int(state['public_rx_bytes']) or tx < int(state['public_tx_bytes']):
                 raise RuntimeError('Meter counters moved backwards')
             state.update(public_rx_bytes=rx, public_tx_bytes=tx, denied_quota=denied, updated_at=timestamp())
-            atomic_json(state_path, state)
             total = history + rx + tx
-            atomic_json(status_path, {
-                'state': 'blocked_quota' if quota and (total >= quota or denied == quota) else 'ready',
-                'total_used_bytes': total, 'quota_total_bytes': quota,
-                'history_charge_bytes': history, 'history_basis': state['history_basis'],
-                'public_rx_bytes': rx, 'public_tx_bytes': tx,
-                'started_at': state['started_at'], 'updated_at': state['updated_at'],
-                'basis': 'public_interface_cgroup_ip_bytes', 'interface': device,
-            })
+            now = time.monotonic()
+            # Heartbeat before any fsync: a slow disk must not starve the watchdog.
             if not ready:
                 notify('READY=1')
                 ready = True
             notify('WATCHDOG=1')
+            if now - last_state_write >= STATE_WRITE_INTERVAL:
+                atomic_json(state_path, state)
+                last_state_write = now
+            if now - last_status_write >= STATUS_WRITE_INTERVAL:
+                atomic_json(status_path, {
+                    'state': 'blocked_quota' if quota and (total >= quota or denied == quota) else 'ready',
+                    'total_used_bytes': total, 'quota_total_bytes': quota,
+                    'history_charge_bytes': history, 'history_basis': state['history_basis'],
+                    'public_rx_bytes': rx, 'public_tx_bytes': tx,
+                    'started_at': state['started_at'], 'updated_at': state['updated_at'],
+                    'basis': 'public_interface_cgroup_ip_bytes', 'interface': device,
+                })
+                last_status_write = now
             time.sleep(0.5)
         # BindsTo/After makes the data units stop before their meter. Persist
         # the final kernel snapshot; restart in the same boot reuses the maps.

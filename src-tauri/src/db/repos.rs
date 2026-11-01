@@ -1204,6 +1204,116 @@ pub mod deploys {
     }
 }
 
+pub mod banned_ips {
+    use super::*;
+
+    /// 合并一批服务器上报的封禁 IP（新的置 first_seen，已有的只更新 last_seen）。
+    /// 单事务写入：一轮可能带回上千个 IP，逐条 autocommit 会把分享轮询拖慢。
+    pub fn upsert_many(conn: &Connection, ips: &[String], server_id: i64) -> rusqlite::Result<()> {
+        if ips.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let tx = conn.unchecked_transaction()?;
+        for ip in ips {
+            tx.execute(
+                "INSERT INTO banned_ips (ip, first_seen_at, last_seen_at, last_server_id) \
+                 VALUES (?1, ?2, ?2, ?3) \
+                 ON CONFLICT(ip) DO UPDATE SET \
+                   last_seen_at = excluded.last_seen_at, \
+                   last_server_id = excluded.last_server_id",
+                params![ip, now, server_id],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// 最近上报的 IP（部署摘要/测试使用；增量下发按 rowid 走）。
+    #[allow(dead_code)] // 部署摘要与本地测试使用；增量路径按 rowid 走。
+    pub fn list_recent(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<String>> {
+        let mut stmt =
+            conn.prepare("SELECT ip FROM banned_ips ORDER BY last_seen_at DESC, ip LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit as i64], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// 全量名单（部署新机器时上传）。按 rowid 升序，保证输出可复现。
+    pub fn all_ips(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT ip FROM banned_ips ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// 当前最大 rowid（banned_ips 是普通 TEXT 主键表，隐含 rowid 单调递增；
+    /// `ON CONFLICT DO UPDATE` 不会改变既有行的 rowid）。
+    pub fn max_rowid(conn: &Connection) -> rusqlite::Result<i64> {
+        conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM banned_ips", [], |r| {
+            r.get(0)
+        })
+    }
+
+    /// 游标之后的一页 IP，按 rowid 升序；返回 (rowid, ip)。
+    pub fn list_after(
+        conn: &Connection,
+        after: i64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(i64, String)>> {
+        let mut stmt = conn
+            .prepare("SELECT rowid, ip FROM banned_ips WHERE rowid > ?1 ORDER BY rowid LIMIT ?2")?;
+        let rows = stmt.query_map(params![after, limit as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    #[allow(dead_code)] // 供统计与本地测试使用；当前增量路径不需要全量计数。
+    pub fn count(conn: &Connection) -> rusqlite::Result<i64> {
+        conn.query_row("SELECT COUNT(*) FROM banned_ips", [], |r| r.get(0))
+    }
+}
+
+/// 每台服务器的封禁名单同步游标（banned_ips.rowid 水位）。
+///
+/// 只用游标、不存每台服务器的完整名单：游标只会单调前进，既能实现「只发新增」，
+/// 也让手工 unban 的 IP 不会被下一轮重新封回。
+pub mod server_ban_sync {
+    use super::*;
+
+    pub fn get(conn: &Connection, server_id: i64) -> rusqlite::Result<Option<i64>> {
+        let mut stmt = conn.prepare("SELECT last_rowid FROM server_ban_sync WHERE server_id=?1")?;
+        let mut rows = stmt.query(params![server_id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(r.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set(conn: &Connection, server_id: i64, last_rowid: i64) -> rusqlite::Result<()> {
+        // 游标只进不退：并发两轮采集可能各自从同一水位取页，较慢的那轮写回
+        // 旧水位时不能把游标退回去（否则会重复下发整页）。
+        conn.execute(
+            "INSERT INTO server_ban_sync (server_id, last_rowid, updated_at) VALUES (?1,?2,?3) \
+             ON CONFLICT(server_id) DO UPDATE SET \
+               last_rowid = MAX(server_ban_sync.last_rowid, excluded.last_rowid), \
+               updated_at = excluded.updated_at",
+            params![server_id, last_rowid, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// 首次见到该服务器：以当前最大 rowid 为基线，不补推历史名单。
+    /// 必须在把本轮新封禁并入 `banned_ips` **之前**调用，否则本轮新增会被基线
+    /// 一起跳过。
+    pub fn ensure_baseline(conn: &Connection, server_id: i64) -> rusqlite::Result<i64> {
+        if let Some(v) = get(conn, server_id)? {
+            return Ok(v);
+        }
+        let v = super::banned_ips::max_rowid(conn)?;
+        set(conn, server_id, v)?;
+        Ok(v)
+    }
+}
+
 pub mod channels {
     use super::*;
 

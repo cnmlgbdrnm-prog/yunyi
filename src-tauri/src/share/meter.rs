@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub fn unit(id: &str) -> String {
-    format!("[Unit]\nDescription=vpn-ctl share {id} public IP meter\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=10\nExecStart=/usr/bin/python3 /srv/vpnshare/share_meter.py serve {id}\nRestart=on-failure\nRestartSec=3\nTimeoutStartSec=30\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n")
+    format!("[Unit]\nDescription=vpn-ctl share {id} public IP meter\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60\nExecStart=/usr/bin/python3 /srv/vpnshare/share_meter.py serve {id}\nRestart=on-failure\nRestartSec=3\nTimeoutStartSec=30\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n")
 }
 
 pub fn slice(id: &str) -> String {

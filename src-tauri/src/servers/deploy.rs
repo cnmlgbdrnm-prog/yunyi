@@ -674,7 +674,9 @@ fn emit_installed_bin_hash(
 
 // 远端文件原语拆到 servers::remote_file（deploy.rs 已顶到单文件 1500 行上限）。
 // 经此重导出，relay/privacy 按旧路径的引用保持不变。
-pub(crate) use crate::servers::remote_file::{read_remote_file, write_remote_file, RemoteFile};
+pub(crate) use crate::servers::remote_file::{
+    read_remote_file, write_line_list, write_remote_file, RemoteFile,
+};
 
 /// 取消感知的单命令执行：取消标志置位即中断（不等命令超时）。
 /// pub(crate)：relay::build/peers 建链拆链与设备下发复用。
@@ -744,6 +746,180 @@ pub(crate) async fn wait_service_active(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+}
+
+/// 部署「加固」步骤：fail2ban（SSH 爆破防护）。
+///
+/// 与 BBR 同一定位——协议已经验证通过，加固失败不能把一次成功部署变成 failed；
+/// 返回的说明写进部署摘要，用户能看到「没装成」而不是无声跳过。
+///
+/// 只封管理 SSH 端口：应用连哪个端口就封哪个，不碰业务端口（见
+/// [`fail2ban_jail_config`] 的规范说明）。
+async fn apply_fail2ban(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    ssh_port: u16,
+) -> Result<(String, Vec<String>), String> {
+    // 安装可能含 apt 索引刷新，按安装超时而非配置超时
+    run_cmd_ok(
+        sess,
+        cancel,
+        "加固",
+        &fail2ban_install_cmd(),
+        INSTALL_TIMEOUT,
+    )
+    .await?;
+    // 不覆盖 banaction：系统 fail2ban 的 DEFAULT 动作各发行版不同（Ubuntu 26.04
+    // 的 1.1 是 nftables、Debian 12 是 iptables-multiport），中途换动作会让旧
+    // 封禁的规则没人清理。这里的 drop-in 只改策略参数。
+    write_remote_file(
+        sess,
+        cancel,
+        "加固",
+        FAIL2BAN_JAIL_PATH,
+        &fail2ban_jail_config(ssh_port),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    run_cmd_ok(sess, cancel, "加固", fail2ban_apply_cmd(), CONFIG_TIMEOUT).await?;
+    // 读取这台机器当前的封禁名单：调用方把它并入本地名单，下次部署新机器时
+    // 用来预封禁。读失败（旧版 fail2ban 输出变化等）按空名单处理，不影响部署。
+    let bans = read_fail2ban_bans(sess, cancel).await;
+    Ok((
+        format!("fail2ban 已启用（sshd 端口 {ssh_port}：1 分钟 5 次失败永久封禁）"),
+        bans,
+    ))
+}
+
+/// fail2ban 是否已经按当前 sshd 端口配置并生效。
+///
+/// 复用主入口的上游增删/重部署会复用主部署主线；主线里的「加固」不能每次都
+/// 重装、重写配置并重启 fail2ban（2026-10-29 用户实测：每加一条复用出口都会
+/// 看到加固步骤）。这里先做只读检查：drop-in 内容与当前规范完全一致、服务
+/// active、sshd jail 可用，三者齐备就视为已部署；调用方跳过安装/写配置/重启，
+/// 只同步封禁名单。缺失、端口变了或 jail 没起来时仍走原来的完整加固。
+async fn fail2ban_is_applied(sess: &mut SshSession, cancel: &AtomicBool, ssh_port: u16) -> bool {
+    let expected = fail2ban_jail_config(ssh_port);
+    let current = match run_cmd(
+        sess,
+        cancel,
+        "加固",
+        &format!("cat {FAIL2BAN_JAIL_PATH} 2>/dev/null"),
+        CONFIG_TIMEOUT,
+    )
+    .await
+    {
+        Ok(out) if out.exit_code == 0 => out.stdout,
+        _ => return false,
+    };
+    if current.trim_end() != expected.trim_end() {
+        return false;
+    }
+    // 配置对不代表 jail 真的在跑：systemctl restart 成功但 jail 加载失败是常态。
+    let status = run_cmd(
+        sess,
+        cancel,
+        "加固",
+        "systemctl is-active --quiet fail2ban && fail2ban-client status sshd >/dev/null 2>&1",
+        VERIFY_TIMEOUT,
+    )
+    .await;
+    matches!(status, Ok(out) if out.exit_code == 0)
+}
+
+/// 读取当前 sshd jail 的封禁名单；读不到按空名单处理（与 apply_fail2ban 同语义）。
+async fn read_fail2ban_bans(sess: &mut SshSession, cancel: &AtomicBool) -> Vec<String> {
+    match run_cmd(
+        sess,
+        cancel,
+        "加固",
+        fail2ban_list_bans_cmd(),
+        VERIFY_TIMEOUT,
+    )
+    .await
+    {
+        Ok(out) => parse_fail2ban_bans(&out.stdout),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 把本地累计的封禁 IP 同步下发到当前服务器（新机器全量、重部署只补差集）。
+///
+/// 写入临时文件后分批 `set sshd banip`；调用方按 [`PREBAN_SYNC_LIMIT`] 决定同步
+/// 还是转后台。分块上传避免上千个 IPv6 把单条 SSH 命令撑爆。
+async fn push_prebans(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    ips: &[String],
+) -> Result<usize, String> {
+    write_line_list(
+        sess,
+        cancel,
+        "加固",
+        FAIL2BAN_PREBAN_PATH,
+        ips,
+        500,
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    // 批量下发：1000 条约 25 秒（逐条调用每条要起一次客户端，要 4 分钟以上），
+    // 按安装级超时给足预算，避免误判失败。
+    run_cmd_ok(
+        sess,
+        cancel,
+        "加固",
+        &fail2ban_preban_cmd(),
+        INSTALL_TIMEOUT,
+    )
+    .await?;
+    Ok(ips.len())
+}
+
+/// 大批量预封禁：上传名单与 worker 脚本，再 setsid 分离启动；部署立即继续。
+///
+/// 10k 条按每批 200 条、批间 2 秒约 6 分钟——不阻塞部署，也不在服务器上形成
+/// CPU 尖峰。worker 结束时自己删文件；下次部署会先停掉旧 worker 再覆盖名单。
+async fn push_prebans_background(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    ips: &[String],
+) -> Result<usize, String> {
+    run_cmd_ok(
+        sess,
+        cancel,
+        "加固",
+        &fail2ban_stop_worker_cmd(),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    write_remote_file(
+        sess,
+        cancel,
+        "加固",
+        FAIL2BAN_PREBAN_SCRIPT,
+        &fail2ban_preban_worker_script(),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    write_line_list(
+        sess,
+        cancel,
+        "加固",
+        FAIL2BAN_PREBAN_PATH,
+        ips,
+        500,
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    run_cmd_ok(
+        sess,
+        cancel,
+        "加固",
+        &fail2ban_start_worker_cmd(),
+        CONFIG_TIMEOUT,
+    )
+    .await?;
+    Ok(ips.len())
 }
 
 /// 取消感知 + 要求退出码为 0。
@@ -1526,10 +1702,118 @@ impl ProdRunner {
         .await?;
         check_cancel(cancel)?;
 
+        // 4.7 加固：fail2ban SSH 爆破防护。
+        //
+        // 与 BBR 相同的失败语义：协议已验证通过，加固失败只记进摘要，不能把一次
+        // 成功部署变成 failed；但结果必须如实上报，不能无声跳过。
+        //
+        // 幂等：复用主入口的上游增删/重部署也会走这条主线。已经配置且生效的机器
+        // 不再重复安装/写配置/重启（只读检查 + 同步封禁名单）；缺失或与当前 SSH
+        // 端口不匹配时才重新应用。
+        let ssh_port = server.port as u16;
+        let fail2ban_ready = fail2ban_is_applied(&mut sess, cancel, ssh_port).await;
+        let fail2ban_result = if fail2ban_ready {
+            let bans = read_fail2ban_bans(&mut sess, cancel).await;
+            Ok((
+                format!("fail2ban 已就绪（sshd 端口 {ssh_port}，未重复配置）"),
+                bans,
+            ))
+        } else {
+            emit_progress("加固", "配置 fail2ban（SSH 爆破防护）", 93);
+            apply_fail2ban(&mut sess, cancel, ssh_port).await
+        };
+        let fail2ban_note = match fail2ban_result {
+            Ok((mut note, server_bans)) => {
+                // 同步回本地：把这台机器已封禁的 IP 并入本地名单，再算出本地有、
+                // 这台机器没有的差集——重部署只补缺的，新机器才是全量。
+                // 数据库锁只包住同步读/写，不能跨 await 持有。
+                let (mut missing, total, max_rowid) = {
+                    let conn = state.db.lock();
+                    if let Err(e) = repos::banned_ips::upsert_many(&conn, &server_bans, server.id) {
+                        note.push_str(&format!("；同步封禁名单失败：{e}"));
+                    }
+                    let all = repos::banned_ips::all_ips(&conn).unwrap_or_default();
+                    let total = all.len();
+                    let have: HashSet<String> = server_bans.iter().cloned().collect();
+                    let missing: Vec<String> =
+                        all.into_iter().filter(|ip| !have.contains(ip)).collect();
+                    let max_rowid = repos::banned_ips::max_rowid(&conn).unwrap_or(0);
+                    (missing, total, max_rowid)
+                };
+                // 跳过本次登录来源 IP：历史名单里万一有操作者自己的 IP，预封禁会
+                // 让新机器部署完立刻连不上（见 ssh_client_ip_cmd 的注释）。
+                let mut skipped_self = false;
+                if let Ok(out) = run_cmd(
+                    &mut sess,
+                    cancel,
+                    "加固",
+                    ssh_client_ip_cmd(),
+                    VERIFY_TIMEOUT,
+                )
+                .await
+                {
+                    let client_ip = out.stdout.trim();
+                    if client_ip.parse::<std::net::IpAddr>().is_ok() {
+                        let before = missing.len();
+                        missing.retain(|ip| ip != client_ip);
+                        skipped_self = missing.len() != before;
+                    }
+                }
+                let mut synced_ok = missing.is_empty();
+                if missing.is_empty() {
+                    note.push_str("；封禁名单已是最新");
+                } else if missing.len() <= PREBAN_SYNC_LIMIT {
+                    match push_prebans(&mut sess, cancel, &missing).await {
+                        Ok(n) => {
+                            synced_ok = true;
+                            note.push_str(&format!("；已同步 {n} 个封禁 IP"));
+                        }
+                        Err(e) => note.push_str(&format!("；封禁同步失败：{e}")),
+                    }
+                } else {
+                    match push_prebans_background(&mut sess, cancel, &missing).await {
+                        Ok(n) => {
+                            synced_ok = true;
+                            // 每 200 条一批、批间 2 秒 + 封禁动作约 5 秒，约 7 秒/批。
+                            let batches = n.div_ceil(200);
+                            let minutes = (batches * 7).div_ceil(60);
+                            note.push_str(&format!(
+                                "；已上传 {n} 个封禁 IP，后台应用（约 {minutes} 分钟）"
+                            ));
+                        }
+                        Err(e) => note.push_str(&format!("；封禁后台同步启动失败：{e}")),
+                    }
+                }
+                if skipped_self {
+                    note.push_str("（跳过本次登录来源 IP）");
+                }
+                if total > missing.len() {
+                    note.push_str(&format!("（本地共 {total} 个）"));
+                }
+                // 游标推进：这批名单已经交给这台机器（同步下发或后台 worker）。
+                // 下发失败时不推进，下一轮轮询会重试。
+                if synced_ok {
+                    let conn = state.db.lock();
+                    if let Err(e) = repos::server_ban_sync::set(&conn, server.id, max_rowid) {
+                        note.push_str(&format!("；写入封禁同步游标失败：{e}"));
+                    }
+                }
+                Some(note)
+            }
+            Err(e) => Some(format!("未启用：{e}")),
+        };
+        check_cancel(cancel)?;
+
         // 5 写回：仅写成功协议节点(含端口验证通过);failed 在成功节点写回后随 error 上报
         // （ok_protocols 已在上方 4.4 守卫处算出，非空已保证）
         emit_progress("写回", "写入节点与部署记录", 95);
-        super::deploy_nodes::writeback(state, &server, &ok_protocols, bbr_note.as_deref())?;
+        super::deploy_nodes::writeback(
+            state,
+            &server,
+            &ok_protocols,
+            bbr_note.as_deref(),
+            fail2ban_note.as_deref(),
+        )?;
         state
             .subs
             .rebuild_config()
@@ -1543,10 +1827,15 @@ impl ProdRunner {
             .await
             .map_err(|e| format!("部署已完成，但更新运行中的客户端失败：{e}"))?;
         if failed_protocols.is_empty() {
-            // BBR 结果并进 100% 文案：用户不点开摘要也能看到
-            let done = match &bbr_note {
-                Some(n) => format!("部署完成（{n}）"),
-                None => "部署完成".to_string(),
+            // BBR / fail2ban 结果并进 100% 文案：用户不点开摘要也能看到
+            let notes: Vec<&str> = [bbr_note.as_deref(), fail2ban_note.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            let done = if notes.is_empty() {
+                "部署完成".to_string()
+            } else {
+                format!("部署完成（{}）", notes.join("；"))
             };
             emit_progress("写回", done.as_str(), 100);
             Ok(())

@@ -128,6 +128,51 @@ pub fn smart_rules() -> Vec<String> {
     ]
 }
 
+/// mihomo 内置 TUN 入站名（`tun` 块没有可覆盖的名字字段）。
+///
+/// 规则用它把「从 TUN 进来的连接」与 `local_proxy` 的 mixed-port 入站
+/// （`DEFAULT-MIXED`）区分开。取值来自控制器 `/connections` 的
+/// `metadata.inboundName`（2026-10-31 实测，mihomo 1.19.10）。
+pub const TUN_INBOUND_NAME: &str = "DEFAULT-TUN";
+
+/// 管理端点（服务器 SSH 端口）在 TUN 入站上的直连规则。
+///
+/// 为什么必须钉：TUN 在 IP 层接管**所有新连接**，应用自己「自我托管主机直连优先」的
+/// 管理拨号也一起进了 mihomo；这些目标都是境外 IP，会落到 `MATCH → 手动选择`，于是
+/// SSH/部署/监控实际走的是用户当前选中的出口。出口未必让过管理端口——2026-10-31
+/// 真机：圣克拉拉与 112 出口封出站 22（同一出口连 github.com:22 也不通），而访问
+/// 22222/57816 正常，监控里三台 22 端口的服务器全部「无法连接」；关掉 TUN 就恢复。
+///
+/// 三条边界：
+/// - 只钉 **TUN 入站**：local_proxy（mixed-port）那条「直连失败改走代理」的回退路径
+///   保持原样，否则 112 这类直连丢包的机器只剩直连可走。
+/// - 只钉管理端口：服务器其它端口仍按用户的分流规则走。
+/// - `no-resolve`：不因本规则让带域名的 TUN 连接多做一次 DNS 解析；IP 字面量目标
+///   本来就不需要解析，域名主地址另由 DOMAIN 规则覆盖。
+pub fn tun_management_direct_rules(servers: &[Server]) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for s in servers {
+        for host in [s.host.trim(), s.host_v6.trim()] {
+            if host.is_empty() {
+                continue;
+            }
+            let matcher = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("IP-CIDR6,{host}/128,no-resolve")
+            } else if host.parse::<std::net::Ipv4Addr>().is_ok() {
+                format!("IP-CIDR,{host}/32,no-resolve")
+            } else {
+                // 域名主地址：TUN 下 fake-ip 会还原出域名，按精确域名匹配
+                format!("DOMAIN,{}", host.to_ascii_lowercase())
+            };
+            out.insert(format!(
+                "AND,((IN-NAME,{TUN_INBOUND_NAME}),(DST-PORT,{}),({matcher})),DIRECT",
+                s.port
+            ));
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// 客户端专属的「钉死走代理」域名，**排在智能分流之前**（只在客户端配置里用，
 /// 导出给别人用的 YAML 不加——那是别人的策略）。
 ///
@@ -573,6 +618,14 @@ pub fn client_yaml_with_tor_upstream(
         root.insert(s(key), value);
     }
     let mut rules: Vec<Value> = Vec::new();
+    // 管理端点直连排在所有分流规则之前：TUN 入站的管理连接必须绕开出口（理由见
+    // [`tun_management_direct_rules`]）。系统代理模式下它们是死规则（没有 TUN 入站），
+    // 而 TUN 是服务在启动之后热加的——所以不看本次 `tun_enabled`，一律先写进去。
+    rules.extend(
+        tun_management_direct_rules(servers)
+            .into_iter()
+            .map(Value::String),
+    );
     // 钉死走代理的域名排最前，免得被下面的直连规则抢走。零节点降级时不加：那时没有
     // proxy-groups，指向不存在的组会让 mihomo 拒绝加载整份配置
     if has_nodes {

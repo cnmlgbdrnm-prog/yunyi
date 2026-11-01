@@ -1,5 +1,7 @@
 # 分享流量管控与 sing-box 订阅 Implementation Plan
 
+> 注：本文档中的服务器地址已脱敏为 203.0.113.0/24 文档示例段；原始实机日志只保留在本地未跟踪目录。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. 执行中回写「执行状态」段。
 
 **Goal Contract**
