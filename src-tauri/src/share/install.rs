@@ -23,6 +23,7 @@ use crate::share::model::*;
 use crate::share::naming::*;
 use crate::share::plan;
 use crate::share::plan::{reserved_share_ports_cmd, tcp_port_probe_cmd, udp_port_probe_cmd};
+use crate::share::ports::{random_start_in, range_candidates};
 use crate::share::{scripts, tls};
 use crate::ssh::SshSession;
 use crate::state::AppState;
@@ -723,18 +724,40 @@ pub struct AllocatedPorts {
     pub pairs: Vec<(u16, u16)>,
 }
 
+/// 一次分享分配使用的随机起点（生产由线程 RNG 生成；测试可直接构造）。
+#[derive(Debug, Clone)]
+pub(crate) struct SharePortStarts {
+    pub http: u16,
+    /// (public, internal)，与 transports 同序。
+    pub pairs: Vec<(u16, u16)>,
+}
+
+fn random_share_starts(transports: &[&str]) -> SharePortStarts {
+    let mut rng = rand::thread_rng();
+    SharePortStarts {
+        http: random_start_in((PORT_RANGE_START, PORT_RANGE_END), &mut rng),
+        pairs: transports
+            .iter()
+            .map(|_| {
+                (
+                    random_start_in((DATA_PORT_START, DATA_PORT_END), &mut rng),
+                    random_start_in((INTERNAL_PORT_START, INTERNAL_PORT_END), &mut rng),
+                )
+            })
+            .collect(),
+    }
+}
+
 async fn find_free_port(
     sess: &mut SshSession,
     cancel: &AtomicBool,
-    cursor: &mut u16,
-    end: u16,
+    range: (u16, u16),
+    start: u16,
     transport: &str,
-    reserved: &HashSet<u16>,
+    excluded: &HashSet<u16>,
 ) -> Result<u16, String> {
-    while *cursor <= end {
-        let port = *cursor;
-        *cursor += 1;
-        if reserved.contains(&port) {
+    for port in range_candidates(range, start) {
+        if excluded.contains(&port) {
             continue;
         }
         let mut free = true;
@@ -764,7 +787,7 @@ async fn find_free_port(
             return Ok(port);
         }
     }
-    Err(format!("端口段到 {end} 已耗尽"))
+    Err(format!("端口段 {}–{} 已耗尽", range.0, range.1))
 }
 
 /// 读取已有分享占用的端口；输出为空表示没有历史分享。
@@ -824,49 +847,65 @@ pub(crate) async fn allocate_cdn_port(
     Err("CDN HTTPS 端口已占用或被已有分享保留，请选择其它端口".into())
 }
 
-/// 订阅端口、公网数据端口、回环内部端口三段各自独立分配；每段都从段首开始，
-/// 实际占用情况由远端 `ss` 探测决定；已停止分享配置过的端口也跳过。
+pub(crate) async fn allocate_share_ports_with_starts(
+    sess: &mut SshSession,
+    cancel: &AtomicBool,
+    transports: &[&str],
+    starts: &SharePortStarts,
+) -> Result<AllocatedPorts, String> {
+    debug_assert_eq!(
+        starts.pairs.len(),
+        transports.len(),
+        "每个 transport 必须有一个随机起点"
+    );
+    let mut excluded = reserved_share_ports(sess, cancel).await?;
+    let http = find_free_port(
+        sess,
+        cancel,
+        (PORT_RANGE_START, PORT_RANGE_END),
+        starts.http,
+        "tcp",
+        &excluded,
+    )
+    .await?;
+    excluded.insert(http);
+    let mut pairs = Vec::with_capacity(transports.len());
+    for (i, transport) in transports.iter().enumerate() {
+        let (public_start, internal_start) = starts.pairs[i];
+        let public = find_free_port(
+            sess,
+            cancel,
+            (DATA_PORT_START, DATA_PORT_END),
+            public_start,
+            transport,
+            &excluded,
+        )
+        .await?;
+        excluded.insert(public);
+        let internal = find_free_port(
+            sess,
+            cancel,
+            (INTERNAL_PORT_START, INTERNAL_PORT_END),
+            internal_start,
+            transport,
+            &excluded,
+        )
+        .await?;
+        excluded.insert(internal);
+        pairs.push((public, internal));
+    }
+    Ok(AllocatedPorts { http, pairs })
+}
+
+/// 订阅端口、公网数据端口、回环内部端口三段各自独立分配；每段从随机起点
+/// 开始探测、段尾回绕；已停止分享配置过的端口与本次已分配端口都跳过。
 pub async fn allocate_share_ports(
     sess: &mut SshSession,
     cancel: &AtomicBool,
     transports: &[&str],
 ) -> Result<AllocatedPorts, String> {
-    let reserved = reserved_share_ports(sess, cancel).await?;
-    let mut http_cursor = PORT_RANGE_START;
-    let http = find_free_port(
-        sess,
-        cancel,
-        &mut http_cursor,
-        PORT_RANGE_END,
-        "tcp",
-        &reserved,
-    )
-    .await?;
-    let mut public_cursor = DATA_PORT_START;
-    let mut internal_cursor = INTERNAL_PORT_START;
-    let mut pairs = Vec::new();
-    for transport in transports {
-        let public = find_free_port(
-            sess,
-            cancel,
-            &mut public_cursor,
-            DATA_PORT_END,
-            transport,
-            &reserved,
-        )
-        .await?;
-        let internal = find_free_port(
-            sess,
-            cancel,
-            &mut internal_cursor,
-            INTERNAL_PORT_END,
-            transport,
-            &reserved,
-        )
-        .await?;
-        pairs.push((public, internal));
-    }
-    Ok(AllocatedPorts { http, pairs })
+    let starts = random_share_starts(transports);
+    allocate_share_ports_with_starts(sess, cancel, transports, &starts).await
 }
 
 /// 回滚一次失败的创建。所有步骤幂等：单元/目录/规则不存在也不算错。
