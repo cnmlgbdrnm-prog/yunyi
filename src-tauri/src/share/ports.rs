@@ -31,10 +31,13 @@ mod tests {
     #[test]
     fn random_start_stays_in_range() {
         let mut rng = StdRng::seed_from_u64(7);
+        let mut distinct = std::collections::HashSet::new();
         for _ in 0..1000 {
             let p = random_start_in((18080, 18180), &mut rng);
             assert!((18080..=18180).contains(&p), "{p}");
+            distinct.insert(p);
         }
+        assert!(distinct.len() > 50, "distinct={}", distinct.len());
     }
 
     #[test]
